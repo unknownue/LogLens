@@ -1,0 +1,8 @@
+# 固定 Rust 工具链版本。
+#
+# 原因：rustc 1.98.0 stable 在编译 windows crate v0.61.x（Tauri 2.11 官方依赖）时
+# 触发 STATUS_STACK_BUFFER_OVERRUN 崩溃；1.97.0 可正常编译。
+# 此文件会让 cargo/rustc 在本项目中自动使用 1.97.0。
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,152 @@
+:root {
+  font-family: "Consolas", "Cascadia Mono", "Courier New", monospace;
+  line-height: 1.4;
+  color: #d4d4d4;
+  background-color: #1e1e1e;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+}
+
+.logviewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background-color: #1e1e1e;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background-color: #252526;
+  border-bottom: 1px solid #333;
+}
+
+.toolbar button {
+  padding: 4px 12px;
+  background: #0e639c;
+  color: #fff;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.toolbar button:hover {
+  background: #1177bb;
+}
+
+.toolbar .path {
+  flex: 1;
+  padding: 4px 8px;
+  background: #1e1e1e;
+  color: #9cdcfe;
+  border: 1px solid #3c3c3c;
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.toolbar .follow {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: #ccc;
+  white-space: nowrap;
+}
+
+.filterbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background-color: #252526;
+  border-bottom: 1px solid #333;
+}
+
+.filterbar input {
+  padding: 4px 8px;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  border: 1px solid #3c3c3c;
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.filterbar .keyword {
+  flex: 1;
+}
+
+.filterbar .regex {
+  flex: 1;
+}
+
+.filterbar button {
+  padding: 4px 12px;
+  background: #0e639c;
+  color: #fff;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.filterbar .status {
+  font-size: 12px;
+  color: #6a9955;
+  white-space: nowrap;
+}
+
+.filterbar .count {
+  font-size: 12px;
+  color: #888;
+  white-space: nowrap;
+}
+
+.list {
+  flex: 1;
+  overflow: auto;
+  position: relative;
+  background-color: #1e1e1e;
+}
+
+.row {
+  display: flex;
+  align-items: flex-start;
+  font-size: 12px;
+  font-family: "Consolas", "Cascadia Mono", "Courier New", monospace;
+  white-space: pre;
+  border-bottom: 1px solid #252525;
+}
+
+.row:hover {
+  background-color: #2a2a2a;
+}
+
+.row .lineno {
+  flex-shrink: 0;
+  width: 64px;
+  padding-right: 12px;
+  text-align: right;
+  color: #858585;
+  user-select: none;
+}
+
+.row .text {
+  flex: 1;
+  color: #d4d4d4;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
