@@ -74,13 +74,45 @@ fn get_lines(
     Ok(session.current_view())
 }
 
+/// 历史行按需加载结果。
+#[derive(serde::Serialize)]
+struct HistoryPayload {
+    lines: Vec<LogLine>,
+    has_more: bool,
+}
+
+/// 加载指定 tab 的更早历史行（前端滚动到顶部时调用）。
+#[tauri::command]
+fn load_history(
+    state: tauri::State<'_, Arc<AppState>>,
+    tab_id: String,
+    rows: u64,
+) -> Result<HistoryPayload, String> {
+    let session = state
+        .get(&tab_id)
+        .ok_or_else(|| format!("tab 不存在: {}", tab_id))?;
+
+    let (history, has_more) = {
+        let mut rd = session.reader.lock();
+        match rd.as_mut() {
+            Some(r) => r
+                .load_history(rows)
+                .map_err(|e| format!("读取历史失败: {}", e))?,
+            None => (Vec::new(), false),
+        }
+    };
+
+    let matched = session.prepend_history(history);
+    Ok(HistoryPayload { lines: matched, has_more })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(AppState::new()))
-        .invoke_handler(tauri::generate_handler![open_log_file, set_filter, close_tab, get_lines])
+        .invoke_handler(tauri::generate_handler![open_log_file, set_filter, close_tab, get_lines, load_history])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use notify::{RecursiveMode, Watcher};
@@ -31,11 +31,21 @@ pub struct TabSession {
     pub filter: Mutex<Filter>,
     /// 单调递增的行偏移（用于给新行分配稳定 file_offset）。
     pub next_offset: AtomicU64,
+    /// 历史行的 file_offset（负值递减，插入头部时使用）。
+    pub history_offset: AtomicI64,
     /// 当前打开的日志文件路径。
     pub file_path: Mutex<Option<PathBuf>>,
+    /// 文件读取器（后台线程与 load_history 命令共用）。
+    pub reader: Mutex<Option<TailReader>>,
     /// 停止信号：置 true 后监控线程退出（关闭 tab 时）。
     pub stop: Arc<AtomicBool>,
 }
+
+/// 每 tab 行数上限：防长时间运行 + 高频日志导致内存无限增长。
+/// 20 万行（约 70 字节/行）≈ 14MB，可接受。
+const MAX_LINES_PER_TAB: usize = 200_000;
+/// 触发裁剪时保留的行数（留 2 万余量，避免每次追加都裁剪 O(n)）。
+const TRIM_TO_LINES: usize = 180_000;
 
 impl TabSession {
     pub fn new() -> Self {
@@ -43,7 +53,9 @@ impl TabSession {
             all_lines: Mutex::new(Vec::new()),
             filter: Mutex::new(Filter::new(FilterSpec::default())),
             next_offset: AtomicU64::new(0),
+            history_offset: AtomicI64::new(-1),
             file_path: Mutex::new(None),
+            reader: Mutex::new(None),
             stop: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -89,12 +101,52 @@ impl TabSession {
                 all.push(LogLine::new(off, text));
             }
         }
+        // 行数有界化：超过上限时裁剪最旧的行（tail 场景丢弃历史最合理）。
+        // 裁剪到 TRIM_TO_LINES 留余量，使裁剪均摊为 O(1)。
+        if all.len() > MAX_LINES_PER_TAB {
+            let excess = all.len() - TRIM_TO_LINES;
+            all.drain(0..excess);
+        }
         matched
     }
 
     /// 清空（截断/轮转/打开新文件时）。
     fn clear(&self) {
         self.all_lines.lock().clear();
+    }
+
+    /// 把更早的历史行插入到已加载行的头部（经过滤返回命中的行）。
+    /// 历史行分配负 file_offset（递减），保证与现有行标识不冲突。
+    pub fn prepend_history(&self, history: Vec<String>) -> Vec<LogLine> {
+        if history.is_empty() {
+            return Vec::new();
+        }
+        let filter = self.filter.lock();
+        let mut all = self.all_lines.lock();
+
+        let mut items: Vec<LogLine> = Vec::with_capacity(history.len());
+        for text in history {
+            let off = self.history_offset.fetch_sub(1, Ordering::SeqCst) as u64;
+            let line = LogLine::new(off, text);
+            items.push(line);
+        }
+
+        let mut matched = Vec::new();
+        for line in &items {
+            if filter.matches(&line.text) {
+                matched.push(line.clone());
+            }
+        }
+
+        // 头部插入历史行（O(n) 移动，n 为窗口上限 20 万，约亚毫秒级）。
+        all.splice(0..0, items);
+
+        // 行数有界化（历史行在最旧端，超出窗口时被自然裁剪）。
+        if all.len() > MAX_LINES_PER_TAB {
+            let excess = all.len() - TRIM_TO_LINES;
+            all.drain(0..excess);
+        }
+        matched
     }
 }
 
@@ -155,6 +207,8 @@ pub fn start_watching_for_session(app: AppHandle, tab_id: String, session: Arc<T
     );
 
     *session.file_path.lock() = Some(path.clone());
+    // reader 存入会话：后台线程与 load_history 命令共用。
+    *session.reader.lock() = Some(reader);
 
     let stop = session.stop.clone();
 
@@ -178,7 +232,6 @@ pub fn start_watching_for_session(app: AppHandle, tab_id: String, session: Arc<T
         }
 
         let file_name = path.file_name().map(|s| s.to_os_string());
-        let mut reader = reader;
 
         // 事件驱动的增量读取 + 定时兜底轮询 + emit 时间片合并。
         // 100ms 为一个周期：期间累积的新行合并成一批 emit，
@@ -214,12 +267,20 @@ pub fn start_watching_for_session(app: AppHandle, tab_id: String, session: Arc<T
                                 notify::event::RenameMode::To,
                             ))
                     {
-                        if let Err(e) = reader.reopen() {
-                            eprintln!("[tail] reopen failed: {}", e);
-                        } else {
-                            session.clear();
-                            pending_lines.clear();
-                            pending_reset = true;
+                        let reopened = {
+                            let mut rd = session.reader.lock();
+                            rd.as_mut().map(|r| r.reopen()).transpose()
+                        };
+                        match reopened {
+                            Ok(Some(())) => {
+                                session.clear();
+                                pending_lines.clear();
+                                pending_reset = true;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                eprintln!("[tail] reopen failed: {}", e);
+                            }
                         }
                     }
                 }
@@ -235,23 +296,27 @@ pub fn start_watching_for_session(app: AppHandle, tab_id: String, session: Arc<T
             }
 
             // 统一 poll 一次，把增量累积到待发批次。
-            match reader.poll() {
-                Ok(events) => {
-                    for e in events {
-                        match e {
-                            TailEvent::Lines(lines) => {
-                                pending_lines.extend(session.append_lines(lines));
-                            }
-                            TailEvent::Reset => {
-                                session.clear();
-                                pending_lines.clear();
-                                pending_reset = true;
+            {
+                let mut rd = session.reader.lock();
+                match rd.as_mut().map(|r| r.poll()).transpose() {
+                    Ok(Some(events)) => {
+                        for e in events {
+                            match e {
+                                TailEvent::Lines(lines) => {
+                                    pending_lines.extend(session.append_lines(lines));
+                                }
+                                TailEvent::Reset => {
+                                    session.clear();
+                                    pending_lines.clear();
+                                    pending_reset = true;
+                                }
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    eprintln!("[tail] poll failed: {}", e);
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("[tail] poll failed: {}", e);
+                    }
                 }
             }
 
@@ -408,5 +473,59 @@ mod tests {
         let t2 = Instant::now();
         let json = serde_json::to_string(&matched).unwrap();
         eprintln!("[perf] serialize {} hits to JSON: {:?}, bytes={}", matched.len(), t2.elapsed(), json.len());
+    }
+
+    /// 性能探针：B4 行数上限——持续追加 30 万行的耗时与最终内存占用。
+    #[test]
+    fn perf_probe_bounded_lines_300k() {
+        use std::time::Instant;
+
+        let s = TabSession::new();
+        let mut total_appended = 0usize;
+        let t = Instant::now();
+        for batch in 0..300 {
+            let mut lines: Vec<String> = Vec::with_capacity(1000);
+            for j in 0..1000 {
+                lines.push(format!(
+                    "2026-01-01 12:00:00.000 [INFO] [module{}] message id={} value={}",
+                    (batch * 1000 + j) % 20,
+                    batch * 1000 + j,
+                    (batch * 1000 + j) * 7
+                ));
+            }
+            total_appended += lines.len();
+            s.append_lines(lines);
+        }
+        let el = t.elapsed();
+
+        let kept = s.all_lines.lock().len();
+        let kept_bytes: usize = s.all_lines.lock().iter().map(|l| l.text.capacity()).sum();
+        eprintln!(
+            "[perf] bounded append {} lines: {:?}, kept={} (cap {}), kept_text_capacity≈{}MB",
+            total_appended,
+            el,
+            kept,
+            MAX_LINES_PER_TAB,
+            kept_bytes / (1024 * 1024)
+        );
+        // 最终行数应落在 [TRIM_TO_LINES, MAX_LINES_PER_TAB] 区间。
+        assert!(kept >= TRIM_TO_LINES && kept <= MAX_LINES_PER_TAB);
+    }
+
+    /// 对比探针：无上限裸 Vec 追加 30 万行（与有界版对比裁剪开销）。
+    #[test]
+    fn perf_probe_unbounded_vec_300k() {
+        use std::time::Instant;
+
+        let mut v: Vec<String> = Vec::with_capacity(300_000);
+        let t = Instant::now();
+        for i in 0..300_000 {
+            v.push(format!("2026-01-01 12:00:00.000 [INFO] [module{}] message id={}", i % 20, i));
+        }
+        eprintln!(
+            "[perf] unbounded Vec push 300k: {:?}, capacity≈{}MB",
+            t.elapsed(),
+            v.capacity() * std::mem::size_of::<String>() / (1024 * 1024)
+        );
     }
 }

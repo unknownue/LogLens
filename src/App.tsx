@@ -49,6 +49,19 @@ const COPY_BTN_WIDTH = 18;
 const LINENO_WIDTH = 56;
 /** 行号列 + 复制按钮列合计宽度（估算文本区宽度时扣除）。 */
 const GUTTER_WIDTH = COPY_BTN_WIDTH + LINENO_WIDTH;
+
+/** 前端行窗口上限：防止长期运行后 lines 数组无限增长、复制成本线性恶化。 */
+const MAX_FRONT_LINES = 300_000;
+/** 触发裁剪时保留的行数（留余量，裁剪均摊）。 */
+const TRIM_FRONT_TO = 250_000;
+
+/** 对 setLines 的结果做窗口化：超过上限丢弃最旧的行。 */
+function clampFrontLines(next: LogLine[]): LogLine[] {
+  if (next.length > MAX_FRONT_LINES) {
+    return next.slice(next.length - TRIM_FRONT_TO);
+  }
+  return next;
+}
 /** Consolas 12px 等宽字体的半角字符近似宽度。 */
 const CHAR_WIDTH = 6.6;
 /** 全角（CJK）字符宽度 = 2 × 半角。 */
@@ -61,6 +74,16 @@ function estimateTextWidth(text: string): number {
     width += ch.charCodeAt(0) > 0xff ? CJK_CHAR_WIDTH : CHAR_WIDTH;
   }
   return width;
+}
+
+/** 估算一行的显示高度（用于历史 prepend 后的像素锚定）。 */
+function estimateRowHeight(text: string, wrap: boolean, containerWidth: number): number {
+  if (!wrap) {
+    return LINE_HEIGHT;
+  }
+  const textWidth = estimateTextWidth(text);
+  const rows = Math.max(1, Math.ceil(textWidth / Math.max(containerWidth - GUTTER_WIDTH, 100)));
+  return rows * LINE_HEIGHT;
 }
 
 /** 转义正则特殊字符。 */
@@ -174,7 +197,11 @@ function LogTab({ tabId, path, active, onClose }: {
       if (!autoRefreshRef.current) {
         return;
       }
-      setLines((prev) => (reset ? newLines : [...prev, ...newLines]));
+      setLines((prev) => clampFrontLines(reset ? newLines : [...prev, ...newLines]));
+      if (reset) {
+        // 视图整体替换（新文件/过滤）后，允许重新加载历史。
+        setHasMoreHistory(true);
+      }
 
       if (!reset && newLines.length > 0) {
         const offsets = newLines.map((l) => l.file_offset);
@@ -204,7 +231,7 @@ function LogTab({ tabId, path, active, onClose }: {
     invoke<LogLine[]>("get_lines", { tabId })
       .then((view) => {
         if (!cancelled) {
-          setLines(view);
+          setLines(clampFrontLines(view));
           setStatus(`已打开，共 ${view.length} 行`);
         }
       })
@@ -237,6 +264,52 @@ function LogTab({ tabId, path, active, onClose }: {
       return () => cancelAnimationFrame(raf);
     }
   }, [active]);
+
+  // ---- 历史行按需加载（滚动到顶部时向后端请求更早的历史段） ----
+  const [hasMoreHistory, setHasMoreHistory] = useState(true);
+  const loadingHistoryRef = useRef(false);
+
+  const loadMoreHistory = useCallback(async () => {
+    if (loadingHistoryRef.current || !hasMoreHistory) {
+      return;
+    }
+    loadingHistoryRef.current = true;
+    try {
+      const res = await invoke<{ lines: LogLine[]; has_more: boolean }>("load_history", {
+        tabId,
+        rows: 2000,
+      });
+      setHasMoreHistory(res.has_more);
+      if (res.lines.length === 0) {
+        return;
+      }
+      // 像素锚定：prepend 历史行后，把滚动位置往下推新增内容的高度，
+      // 保持用户当前正在看的行位置不变。
+      const oldScrollTop = listRef.current?.scrollTop ?? 0;
+      const containerWidth = listRef.current?.clientWidth ?? 800;
+      const newHeight = res.lines.reduce(
+        (sum, l) => sum + estimateRowHeight(l.text, wrapLines, containerWidth),
+        0
+      );
+      setLines((prev) => clampFrontLines([...res.lines, ...prev]));
+      requestAnimationFrame(() => {
+        if (listRef.current) {
+          listRef.current.scrollTop = oldScrollTop + newHeight;
+        }
+      });
+    } catch {
+      // 静默失败：下次滚动到顶会重试。
+    } finally {
+      loadingHistoryRef.current = false;
+    }
+  }, [tabId, hasMoreHistory, wrapLines]);
+
+  const onListScroll = useCallback(() => {
+    const el = listRef.current;
+    if (el && el.scrollTop < 200) {
+      void loadMoreHistory();
+    }
+  }, [loadMoreHistory]);
 
   const toggleWrapLines = useCallback((next: boolean) => {
     setWrapLines(next);
@@ -347,7 +420,7 @@ function LogTab({ tabId, path, active, onClose }: {
         <span className="count">{lines.length} 行</span>
       </div>
 
-      <div className={`list ${wrapLines ? "wrap" : "nowrap"}`} ref={listRef}>
+      <div className={`list ${wrapLines ? "wrap" : "nowrap"}`} ref={listRef} onScroll={onListScroll}>
         <div
           className="list-inner"
           style={{

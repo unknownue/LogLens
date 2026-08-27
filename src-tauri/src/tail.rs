@@ -18,6 +18,8 @@ pub struct TailReader {
     pending: Vec<u8>,
     /// 文件当前大小（用于检测 truncate / 轮转）。
     last_size: u64,
+    /// 已加载内容的最早字节偏移（历史按需加载的游标）。
+    history_start: u64,
     /// 是否首次打开（首次应从尾部加载而非从头）。
     first_open: bool,
 }
@@ -38,6 +40,7 @@ impl TailReader {
             offset: 0,
             pending: Vec::new(),
             last_size: 0,
+            history_start: 0,
             first_open: true,
         }
     }
@@ -68,6 +71,7 @@ impl TailReader {
         file.read_to_end(&mut buf)?;
 
         self.offset = size;
+        self.history_start = start; // 历史加载游标 = 尾部加载起点
         self.first_open = false;
         self.file = Some(file);
 
@@ -77,6 +81,37 @@ impl TailReader {
             lines.remove(0);
         }
         Ok(lines)
+    }
+
+    /// 向前读取一段更早的历史行（按需加载）。
+    /// 返回 (完整行列表, 是否还有更早的历史)。
+    pub fn load_history(&mut self, rows: u64) -> std::io::Result<(Vec<String>, bool)> {
+        if self.history_start == 0 {
+            return Ok((Vec::new(), false)); // 已到文件头
+        }
+        let file = match self.file.as_mut() {
+            Some(f) => f,
+            None => return Ok((Vec::new(), false)),
+        };
+
+        let approx = (rows.saturating_mul(256)).max(8192);
+        let read_start = self.history_start.saturating_sub(approx);
+        let read_len = self.history_start - read_start;
+
+        file.seek(SeekFrom::Start(read_start))?;
+        let mut buf = vec![0u8; read_len as usize];
+        file.read_exact(&mut buf)?;
+
+        let mut lines = split_lines(&buf);
+        // 丢弃首行（read_start 落在行中间时不完整；read_start==0 时保留）。
+        if read_start > 0 && !lines.is_empty() {
+            lines.remove(0);
+        }
+        // 丢弃末行（history_start 落在行中间时，末行延伸到已加载区域，不完整）。
+        lines.pop();
+
+        self.history_start = read_start;
+        Ok((lines, read_start > 0))
     }
 
     /// 读取自上次 offset 以来的新内容，返回新完整行；检测到截断返回 Reset。
@@ -139,6 +174,8 @@ impl TailReader {
         let size = self.file.as_ref().unwrap().metadata()?.len();
         self.offset = size;
         self.last_size = size;
+        // 轮转后是新文件：历史从新文件头开始（可加载新文件更早内容）。
+        self.history_start = size;
         Ok(())
     }
 }
@@ -286,5 +323,94 @@ mod tests {
             }
         }
         assert_eq!(all, vec!["line4".to_string(), "line5".to_string()]);
+    }
+
+    /// 历史按需加载：init_tail 后向前加载更早的行。
+    #[test]
+    fn load_history_reads_earlier_lines() {
+        use std::io::Write;
+
+        // 2000 行日志（每行 ~50 字节，约 100KB，远超 init_tail 的 8KB 下限）。
+        let mut content = String::new();
+        for i in 0..2000 {
+            content.push_str(&format!("history-line-{:04} with some payload text\n", i));
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_path_buf();
+
+        let mut reader = TailReader::new(path.clone());
+        // init_tail 只读尾部一段（约 8KB+）。
+        let initial = reader.init_tail(10).unwrap();
+        assert!(initial.len() < 2000, "只应加载尾部一部分，实际 {}", initial.len());
+        assert!(initial.len() >= 10);
+        // 尾部加载应从倒数第 N 行开始，不是文件头。
+        assert!(!initial[0].starts_with("history-line-0000"));
+
+        // 向前加载一段历史。
+        let (hist, has_more) = reader.load_history(10).unwrap();
+        assert!(!hist.is_empty());
+        assert!(has_more, "应还有更早的历史");
+
+        // 持续向前加载直到文件头。
+        let mut total = initial.len() + hist.len();
+        let mut guard = 0;
+        loop {
+            let (h, more) = reader.load_history(10).unwrap();
+            total += h.len();
+            if !more {
+                break;
+            }
+            guard += 1;
+            assert!(guard < 500, "加载次数过多: {}", guard);
+        }
+        // 总行数应接近 2000（首尾边界行可能被丢弃，允许少量损失）。
+        assert!(total >= 1900, "历史总行数 {} 应接近 2000", total);
+    }
+
+    /// 性能探针：B6 历史加载——20 万行大文件向前翻页加载的耗时。
+    #[test]
+    fn perf_probe_load_history_200k() {
+        use std::io::Write;
+        use std::time::Instant;
+
+        // 写 20 万行（~10MB）临时文件。
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut buf = String::with_capacity(64);
+            for i in 0..200_000 {
+                buf.clear();
+                buf.push_str(&format!("history-line-{:06} with some payload text\n", i));
+                f.write_all(buf.as_bytes()).unwrap();
+            }
+            f.flush().unwrap();
+        }
+        let path = f.path().to_path_buf();
+
+        let mut reader = TailReader::new(path.clone());
+        let initial = reader.init_tail(1000).unwrap();
+        eprintln!("[perf] init_tail 200k file: {} lines loaded", initial.len());
+
+        // 逐段加载全部历史，测耗时。
+        let t = Instant::now();
+        let mut total = initial.len();
+        let mut batches = 0usize;
+        loop {
+            let (h, more) = reader.load_history(2000).unwrap();
+            total += h.len();
+            batches += 1;
+            if !more {
+                break;
+            }
+        }
+        eprintln!(
+            "[perf] load_history 200k file: {} batches, {} total lines in {:?} (avg {:?}/batch)",
+            batches,
+            total,
+            t.elapsed(),
+            t.elapsed() / batches as u32
+        );
+        assert!(total >= 190_000, "total={}", total);
     }
 }
