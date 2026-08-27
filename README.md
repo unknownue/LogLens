@@ -42,20 +42,32 @@ Rust 工具链安装在**仓库外部**、仅本地使用，不写入系统/用�
 
 ## 构建与运行
 
+本项目是 **Tauri 2 桌面应用**（Rust 后端 + WebView2 前端），**不是纯前端应用**：文件监控、增量读取、过滤等核心逻辑都在 Rust 后端（`src-tauri/`），前端只是展示层。
+
+三种启动方式（在项目根 `E:\Workspace` 执行）：
+
 ```powershell
-# 先激活本地 Rust 工具链
-. E:\Workspace\env\activate-rust.ps1
+# 1. 直接运行 release 可执行文件（推荐）：前端已内嵌，无编译、无 HTTP 服务，秒开
+make logviewer
 
-# 开发模式（启动 Vite + 编译 Rust + 打开窗口）
-pnpm tauri dev
+# 2. 重新构建 release（前端打包 + Rust 编译，源码变更后执行一次）
+make logviewer-build
 
-# 仅前端
-pnpm dev
-# 仅后端测试
-cd src-tauri && cargo test --lib
-# 打包
-pnpm tauri build
+# 3. 开发模式：起 Vite dev server（5173 端口）+ 前端热更新，供开发调试
+make logviewer-dev
 ```
+
+手动命令（等价操作）：
+
+```powershell
+. E:\Workspace\env\activate-rust.ps1      # 激活本地 Rust 工具链
+
+pnpm tauri build --no-bundle               # 构建 release（前端内嵌，无 HTTP）
+pnpm tauri dev                             # 开发模式（启动 Vite dev server）
+cd src-tauri && cargo test --lib           # 仅后端测试
+```
+
+> **为什么开发模式会起 HTTP 服务**：`pnpm tauri dev` 为支持前端热更新，会启动 Vite dev server（5173 端口），窗口的 WebView2 从它加载前端。这是开发便利，非部署形态。`make logviewer`（release）则把前端打包进 exe，运行时**无任何 HTTP 服务**。
 
 > ⚠️ **端口说明**：Vite dev server 用 **5173**（HMR 5174），而非 Tauri 默认的 1420/1421。
 > 原因：本机 Windows 的 TCP 排除端口范围 `1401-2000`（WSL2 动态端口保留）导致 1420 无法绑定（EACCES）。

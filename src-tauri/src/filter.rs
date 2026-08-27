@@ -146,4 +146,20 @@ mod tests {
         let f = Filter::new(spec);
         assert!(f.matches("any"));
     }
+
+    #[test]
+    fn keyword_with_spaces_matches_exact_phrase() {
+        // 带空格的关键词应作为「完整短语」做子串匹配，而非被拆成多个词。
+        let spec = FilterSpec {
+            keywords: vec!["database error".to_string()],
+            regex: None,
+            case_sensitive: false,
+        };
+        let f = Filter::new(spec);
+        assert!(f.matches("2026/01/01 a database error occurred"));
+        assert!(f.matches("DATABASE ERROR found"));
+        // 单独的 database 或 error（非连续短语）不应命中。
+        assert!(!f.matches("database is healthy"));
+        assert!(!f.matches("an error happened"));
+    }
 }

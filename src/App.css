@@ -25,6 +25,122 @@ body,
   background-color: #1e1e1e;
 }
 
+/* ===== tab 栏 ===== */
+.tabbar {
+  display: flex;
+  align-items: stretch;
+  background-color: #252526;
+  border-bottom: 1px solid #333;
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex-shrink: 0;
+}
+
+.tabbar .tabs {
+  display: flex;
+  align-items: stretch;
+}
+
+.tabbar .tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+  color: #bbb;
+  font-size: 12px;
+  border-right: 1px solid #333;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.tabbar .tab:hover {
+  background-color: #2a2a2a;
+}
+
+.tabbar .tab.active {
+  background-color: #1e1e1e;
+  color: #fff;
+  border-top: 2px solid #0e639c;
+}
+
+.tabbar .tab .tab-title {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tabbar .tab-close {
+  background: transparent;
+  border: none;
+  color: #888;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 2px;
+  line-height: 1;
+}
+
+.tabbar .tab-close:hover {
+  color: #fff;
+}
+
+.tabbar .tab-add {
+  background: transparent;
+  border: none;
+  color: #8ab4f8;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 6px 14px;
+  white-space: nowrap;
+}
+
+.tabbar .tab-add:hover {
+  background-color: #2a2a2a;
+}
+
+.tabbar .tab-add:disabled {
+  color: #666;
+  cursor: default;
+}
+
+/* ===== tab 内容 ===== */
+.tab-panel {
+  flex: 1;
+  min-height: 0;
+  /* 默认由内联 style 控制 display：激活 tab 为 flex，非激活为 none（保留组件状态） */
+}
+
+.tab-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  color: #888;
+}
+
+.empty .open-first {
+  padding: 8px 20px;
+  background: #0e639c;
+  color: #fff;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.empty .open-first:hover {
+  background: #1177bb;
+}
+
 .toolbar {
   display: flex;
   align-items: center;
@@ -32,6 +148,7 @@ body,
   padding: 8px 12px;
   background-color: #252526;
   border-bottom: 1px solid #333;
+  flex-shrink: 0;
 }
 
 .toolbar button {
@@ -47,15 +164,30 @@ body,
   background: #1177bb;
 }
 
-.toolbar .path {
+.toolbar .tab-path {
   flex: 1;
   padding: 4px 8px;
-  background: #1e1e1e;
   color: #9cdcfe;
-  border: 1px solid #3c3c3c;
-  border-radius: 3px;
-  font-family: inherit;
   font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.toolbar .tab-close {
+  background: transparent;
+  color: #888;
+  padding: 2px 6px;
+  font-size: 12px;
+}
+
+.toolbar .tab-close:hover {
+  background: transparent;
+  color: #fff;
+}
+
+.toolbar .toolbar-spacer {
+  flex: 0;
 }
 
 .toolbar .follow {
@@ -74,6 +206,7 @@ body,
   padding: 6px 12px;
   background-color: #252526;
   border-bottom: 1px solid #333;
+  flex-shrink: 0;
 }
 
 .filterbar input {
@@ -91,6 +224,10 @@ body,
 }
 
 .filterbar .regex {
+  flex: 1;
+}
+
+.filterbar .highlight {
   flex: 1;
 }
 
@@ -122,31 +259,142 @@ body,
   background-color: #1e1e1e;
 }
 
+/* 自动换行模式：不显示水平滚动条 */
+.list.wrap {
+  overflow-x: hidden;
+}
+
+/* 不换行模式：显示水平滚动条 */
+.list.nowrap {
+  overflow-x: auto;
+}
+
+.list-inner {
+  position: relative;
+}
+
 .row {
   display: flex;
   align-items: flex-start;
   font-size: 12px;
   font-family: "Consolas", "Cascadia Mono", "Courier New", monospace;
-  white-space: pre;
   border-bottom: 1px solid #252525;
+  /* 高亮淡出的过渡（配合 .highlight 的移除） */
+  transition: background-color 0.5s ease;
+}
+
+/* 换行模式：长行自动折行，text 填满剩余宽度 */
+.row.wrap .text {
+  white-space: pre-wrap;
+  word-break: break-all;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* 不换行模式：单行不折行，超出部分靠水平滚动条查看 */
+.row.nowrap .text {
+  white-space: pre;
+  word-break: normal;
+  overflow-wrap: normal;
+  flex: 0 0 auto;
 }
 
 .row:hover {
   background-color: #2a2a2a;
 }
 
+/* 自动刷新新增行的高亮（约 1s 后 class 移除，背景经 transition 平滑淡出） */
+.row.highlight {
+  background-color: #3a3520;
+}
+
+.row.highlight:hover {
+  background-color: #4a4328;
+}
+
+.row .copy-btn {
+  flex-shrink: 0;
+  width: 18px;
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  background-color: #1e1e1e;
+  color: #888;
+  cursor: pointer;
+  font-size: 12px;
+  /* 默认隐藏，悬浮到行时显示 */
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  /* 不换行模式水平滚动时固定在左侧 */
+  position: sticky;
+  left: 0;
+}
+
+.row:hover .copy-btn,
+.row .copy-btn:focus {
+  opacity: 1;
+}
+
+.row .copy-btn:hover {
+  color: #fff;
+}
+
+.row:hover .copy-btn {
+  background-color: #2a2a2a;
+}
+
+.row.highlight .copy-btn {
+  background-color: #3a3520;
+}
+
+.row.highlight:hover .copy-btn {
+  background-color: #4a4328;
+}
+
 .row .lineno {
   flex-shrink: 0;
-  width: 64px;
-  padding-right: 12px;
+  width: 48px;
+  padding-right: 8px;
   text-align: right;
   color: #858585;
   user-select: none;
+  /* 不换行模式水平滚动时，行号列固定在复制按钮右侧（实色背景遮挡滚动文本） */
+  position: sticky;
+  left: 18px;
+  background-color: #1e1e1e;
+}
+
+.row:hover .lineno {
+  background-color: #2a2a2a;
+}
+
+.row.highlight .lineno {
+  background-color: #3a3520;
+}
+
+.row.highlight:hover .lineno {
+  background-color: #4a4328;
 }
 
 .row .text {
-  flex: 1;
   color: #d4d4d4;
-  white-space: pre-wrap;
-  word-break: break-all;
 }
+
+/* 关键词高亮（正文中的 <mark>）：不同关键词循环使用 8 色调色板 */
+.row .text .kw-mark {
+  color: #1e1e1e;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+.row .text .kw-c0 { background-color: #e6b422; } /* 金黄 */
+.row .text .kw-c1 { background-color: #f08c28; } /* 橙 */
+.row .text .kw-c2 { background-color: #e05252; } /* 红 */
+.row .text .kw-c3 { background-color: #6fbf4c; } /* 绿 */
+.row .text .kw-c4 { background-color: #4c9aff; } /* 蓝 */
+.row .text .kw-c5 { background-color: #b06fe0; } /* 紫 */
+.row .text .kw-c6 { background-color: #3fc5b7; } /* 青 */
+.row .text .kw-c7 { background-color: #e06fa8; } /* 粉 */

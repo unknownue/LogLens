@@ -251,4 +251,40 @@ mod tests {
         // 只应返回新增的 second/third，而非 first。
         assert_eq!(all, vec!["second".to_string(), "third".to_string()]);
     }
+
+    /// 模拟真实场景：init_tail 后用「另一个独立句柄」追加（类似另一个进程写日志），
+    /// 验证 poll 能否通过 metadata().len() 看到新大小并读回增量。
+    #[test]
+    fn poll_after_init_tail_sees_external_append() {
+        use std::io::Write;
+
+        // 先写初始内容（用第一个句柄，写完关闭）。
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"line1\nline2\nline3\n").unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_path_buf();
+
+        // TailReader 独立打开 + init_tail（模拟应用启动）。
+        let mut reader = TailReader::new(path.clone());
+        let initial = reader.init_tail(1000).unwrap();
+        assert_eq!(initial, vec!["line1".to_string(), "line2".to_string(), "line3".to_string()]);
+
+        // 模拟另一个进程：用 append 模式打开独立句柄追加。
+        {
+            let mut appender = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            appender.write_all(b"line4\nline5\n").unwrap();
+            appender.flush().unwrap();
+            // appender drop 关闭
+        }
+
+        // poll 应能看到新大小并读回 line4/line5。
+        let evts = reader.poll().unwrap();
+        let mut all = Vec::new();
+        for e in evts {
+            if let TailEvent::Lines(l) = e {
+                all.extend(l);
+            }
+        }
+        assert_eq!(all, vec!["line4".to_string(), "line5".to_string()]);
+    }
 }

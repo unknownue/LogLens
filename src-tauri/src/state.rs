@@ -1,10 +1,11 @@
 //! 共享状态与后台文件监控线程。
 //!
-//! 结构：AppState 持有 Mutex 日志缓冲与过滤条件；后台线程用 notify 监听文件变化，
-//! 轮询 TailReader 增量读取，经 Filter 过滤后通过 Tauri AppHandle emit 给前端。
+//! 多 tab：每个 tab 对应一个 TabSession（独立日志缓冲、过滤、文件监控线程），
+//! AppState 用 HashMap<tab_id, TabSession> 管理所有会话。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use notify::{RecursiveMode, Watcher};
@@ -14,15 +15,17 @@ use tauri::{AppHandle, Emitter};
 use crate::filter::{Filter, FilterSpec};
 use crate::tail::{LogLine, TailEvent, TailReader};
 
-/// 传给前端的一批行事件负载。
+/// 传给前端的一批行事件负载（带 tab_id 用于前端路由到对应 tab）。
 #[derive(Clone, serde::Serialize)]
 pub struct LinesPayload {
+    pub tab_id: String,
     pub lines: Vec<LogLine>,
     pub reset: bool,
 }
 
-pub struct AppState {
-    /// 全部已加载行（原文，用于过滤条件变化时重扫）。仅保留文本 + offset。
+/// 单个 tab 的会话状态。
+pub struct TabSession {
+    /// 全部已加载行（原文，用于过滤条件变化时重扫）。
     pub all_lines: Mutex<Vec<LogLine>>,
     /// 当前过滤条件。
     pub filter: Mutex<Filter>,
@@ -30,15 +33,18 @@ pub struct AppState {
     pub next_offset: AtomicU64,
     /// 当前打开的日志文件路径。
     pub file_path: Mutex<Option<PathBuf>>,
+    /// 停止信号：置 true 后监控线程退出（关闭 tab 时）。
+    pub stop: Arc<AtomicBool>,
 }
 
-impl AppState {
+impl TabSession {
     pub fn new() -> Self {
         Self {
             all_lines: Mutex::new(Vec::new()),
             filter: Mutex::new(Filter::new(FilterSpec::default())),
             next_offset: AtomicU64::new(0),
             file_path: Mutex::new(None),
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -47,7 +53,7 @@ impl AppState {
         self.next_offset.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// 设置过滤条件并重扫已加载行，返回新的命中集（带 file_offset 稳定定位）。
+    /// 设置过滤条件并重扫已加载行，返回新的命中集。
     pub fn apply_filter(&self, spec: FilterSpec) -> Vec<LogLine> {
         let mut filter = self.filter.lock();
         let new_filter = Filter::new(spec);
@@ -57,6 +63,13 @@ impl AppState {
         };
         *filter = new_filter;
         result
+    }
+
+    /// 返回当前过滤后的视图（用于前端挂载时拉取，弥补挂载前错过的事件）。
+    pub fn current_view(&self) -> Vec<LogLine> {
+        let filter = self.filter.lock();
+        let lines = self.all_lines.lock();
+        lines.iter().filter(|l| filter.matches(&l.text)).cloned().collect()
     }
 
     /// 追加新行（经过滤），返回命中的行。
@@ -71,7 +84,7 @@ impl AppState {
                 matched.push(line.clone());
                 all.push(line);
             } else {
-                // 未命中也要保留到 all_lines（供过滤条件变化重扫），但用分配后的 offset 占位。
+                // 未命中也要保留到 all_lines（供过滤条件变化重扫）。
                 let off = self.alloc_offset();
                 all.push(LogLine::new(off, text));
             }
@@ -79,14 +92,52 @@ impl AppState {
         matched
     }
 
-    /// 清空（截断/轮转时）。
+    /// 清空（截断/轮转/打开新文件时）。
     fn clear(&self) {
         self.all_lines.lock().clear();
     }
 }
 
-/// 初始化文件监控：返回后台线程 JoinHandle 与初始尾部行。
-pub fn start_watching(app: AppHandle, state: Arc<AppState>, path: PathBuf) {
+/// 全局状态：管理所有 tab 的会话。
+pub struct AppState {
+    sessions: Mutex<HashMap<String, Arc<TabSession>>>,
+}
+
+impl AppState {
+    pub fn new() -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 获取或创建指定 tab 的会话。
+    pub fn get_or_create(&self, tab_id: &str) -> Arc<TabSession> {
+        let mut sessions = self.sessions.lock();
+        sessions
+            .entry(tab_id.to_string())
+            .or_insert_with(|| Arc::new(TabSession::new()))
+            .clone()
+    }
+
+    /// 获取指定 tab 的会话（不存在返回 None）。
+    pub fn get(&self, tab_id: &str) -> Option<Arc<TabSession>> {
+        self.sessions.lock().get(tab_id).cloned()
+    }
+
+    /// 关闭指定 tab：置停止信号并移除会话。
+    pub fn close(&self, tab_id: &str) {
+        let session = self.sessions.lock().remove(tab_id);
+        if let Some(s) = session {
+            s.stop.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// 为指定 tab 的会话启动文件监控（命令层先 get_or_create 会话）。
+pub fn start_watching_for_session(app: AppHandle, tab_id: String, session: Arc<TabSession>, path: PathBuf) {
+    // 打开新文件：清空该 tab 旧文件的残留状态。
+    session.clear();
+
     // 先加载初始尾部。
     let mut reader = TailReader::new(path.clone());
     let initial = match reader.init_tail(1000) {
@@ -96,10 +147,16 @@ pub fn start_watching(app: AppHandle, state: Arc<AppState>, path: PathBuf) {
             Vec::new()
         }
     };
-    let matched = state.append_lines(initial);
-    let _ = app.emit("log-lines", LinesPayload { lines: matched, reset: false });
+    let matched = session.append_lines(initial);
+    // reset=true：告知前端这是全新加载，替换现有视图而非追加。
+    let _ = app.emit(
+        "log-lines",
+        LinesPayload { tab_id: tab_id.clone(), lines: matched, reset: true },
+    );
 
-    *state.file_path.lock() = Some(path.clone());
+    *session.file_path.lock() = Some(path.clone());
+
+    let stop = session.stop.clone();
 
     // 后台线程：notify 监听 + 轮询 TailReader。
     std::thread::spawn(move || {
@@ -123,12 +180,16 @@ pub fn start_watching(app: AppHandle, state: Arc<AppState>, path: PathBuf) {
         let file_name = path.file_name().map(|s| s.to_os_string());
         let mut reader = reader;
 
-        // 事件累积 + 节流：按时间片批量推送。
+        // 事件驱动的增量读取 + 定时兜底轮询。
         loop {
-            let event = rx.recv();
+            // 关闭 tab：退出线程。
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let event = rx.recv_timeout(std::time::Duration::from_millis(500));
             match event {
                 Ok(Ok(ev)) => {
-                    // 只关心目标文件自身的事件（或父目录里的同名 create）。
                     let relevant = ev.paths.iter().any(|p| {
                         match &file_name {
                             Some(n) => p.file_name().map(|f| f == n).unwrap_or(false),
@@ -149,49 +210,156 @@ pub fn start_watching(app: AppHandle, state: Arc<AppState>, path: PathBuf) {
                         if let Err(e) = reader.reopen() {
                             eprintln!("[tail] reopen failed: {}", e);
                         } else {
-                            state.clear();
+                            session.clear();
                             let _ = app.emit(
                                 "log-lines",
-                                LinesPayload { lines: Vec::new(), reset: true },
+                                LinesPayload { tab_id: tab_id.clone(), lines: Vec::new(), reset: true },
                             );
-                        }
-                    }
-
-                    match reader.poll() {
-                        Ok(events) => {
-                            let mut matched = Vec::new();
-                            let mut reset = false;
-                            for e in events {
-                                match e {
-                                    TailEvent::Lines(lines) => {
-                                        matched.extend(state.append_lines(lines));
-                                    }
-                                    TailEvent::Reset => {
-                                        state.clear();
-                                        reset = true;
-                                    }
-                                }
-                            }
-                            if reset || !matched.is_empty() {
-                                let _ = app.emit(
-                                    "log-lines",
-                                    LinesPayload { lines: matched, reset },
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[tail] poll failed: {}", e);
                         }
                     }
                 }
                 Ok(Err(e)) => {
                     eprintln!("[watch] error: {}", e);
                 }
-                Err(_) => {
-                    // channel closed => watcher dropped => exit thread.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // 定时兜底：无事件也 poll 一次。
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     break;
+                }
+            }
+
+            // 统一 poll 一次。
+            match reader.poll() {
+                Ok(events) => {
+                    let mut matched = Vec::new();
+                    let mut reset = false;
+                    for e in events {
+                        match e {
+                            TailEvent::Lines(lines) => {
+                                matched.extend(session.append_lines(lines));
+                            }
+                            TailEvent::Reset => {
+                                session.clear();
+                                reset = true;
+                            }
+                        }
+                    }
+                    if reset || !matched.is_empty() {
+                        let _ = app.emit(
+                            "log-lines",
+                            LinesPayload { tab_id: tab_id.clone(), lines: matched, reset },
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[tail] poll failed: {}", e);
                 }
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_with(lines: Vec<&str>) -> Arc<TabSession> {
+        let s = TabSession::new();
+        let owned: Vec<String> = lines.into_iter().map(|l| l.to_string()).collect();
+        s.append_lines(owned);
+        Arc::new(s)
+    }
+
+    #[test]
+    fn apply_filter_with_space_keyword_returns_phrase_matches() {
+        let s = session_with(vec![
+            "2026/01/01 INFO all good",
+            "2026/01/01 ERROR a database error occurred",
+            "2026/01/01 WARN database is healthy",
+            "2026/01/01 ERROR DATABASE ERROR fatal",
+            "2026/01/01 INFO an error happened",
+        ]);
+
+        let spec = FilterSpec {
+            keywords: vec!["database error".to_string()],
+            regex: None,
+            case_sensitive: false,
+        };
+        let matched = s.apply_filter(spec);
+        let texts: Vec<&str> = matched.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec![
+            "2026/01/01 ERROR a database error occurred",
+            "2026/01/01 ERROR DATABASE ERROR fatal",
+        ]);
+    }
+
+    #[test]
+    fn apply_filter_empty_keywords_returns_all() {
+        let s = session_with(vec!["aaa", "bbb"]);
+        let matched = s.apply_filter(FilterSpec::default());
+        assert_eq!(matched.len(), 2);
+    }
+
+    #[test]
+    fn after_filter_new_lines_are_still_filtered() {
+        let s = session_with(vec!["ERROR db error", "INFO ok"]);
+
+        let spec = FilterSpec {
+            keywords: vec!["error".to_string()],
+            regex: None,
+            case_sensitive: false,
+        };
+        let matched = s.apply_filter(spec);
+        assert_eq!(matched.len(), 1);
+
+        let newly = s.append_lines(vec![
+            "ERROR another db error".to_string(),
+            "INFO still ok".to_string(),
+            "ERROR third error".to_string(),
+        ]);
+        assert_eq!(newly.len(), 2);
+        let texts: Vec<&str> = newly.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec![
+            "ERROR another db error",
+            "ERROR third error",
+        ]);
+    }
+
+    #[test]
+    fn tabs_are_isolated() {
+        // 两个 tab 互不影响。
+        let s1 = session_with(vec!["aaa one"]);
+        let s2 = session_with(vec!["bbb two"]);
+
+        // 只在 s1 设置过滤，s2 不受影响。
+        let spec = FilterSpec {
+            keywords: vec!["one".to_string()],
+            regex: None,
+            case_sensitive: false,
+        };
+        let m1 = s1.apply_filter(spec.clone());
+        assert_eq!(m1.len(), 1);
+
+        // s2 未设置过滤，应全命中。
+        let m2 = s2.apply_filter(FilterSpec::default());
+        assert_eq!(m2.len(), 1);
+        assert_eq!(m2[0].text, "bbb two");
+    }
+
+    #[test]
+    fn current_view_returns_filtered_lines() {
+        let s = session_with(vec!["ERROR e1", "INFO i1", "ERROR e2"]);
+        // 未过滤：全量。
+        assert_eq!(s.current_view().len(), 3);
+        // 过滤 error 后：只剩 2 行。
+        let spec = FilterSpec {
+            keywords: vec!["error".to_string()],
+            regex: None,
+            case_sensitive: false,
+        };
+        s.apply_filter(spec);
+        let view = s.current_view();
+        assert_eq!(view.len(), 2);
+    }
 }
