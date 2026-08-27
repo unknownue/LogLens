@@ -1,7 +1,7 @@
 [package]
-name = "tauri-logviewer"
+name = "loglens"
 version = "0.1.0"
-description = "A Tauri App"
+description = "LogLens — 大日志实时查看器（tail-follow + 过滤 + 稀疏虚拟滚动）"
 authors = ["you"]
 edition = "2021"
 
@@ -11,7 +11,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "tauri_logviewer_lib"
+name = "loglens_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -27,15 +27,28 @@ notify = "6"
 regex = "1"
 aho-corasick = "1"
 parking_lot = "0.12"
+tracing = "0.1"
+tracing-tracy = { version = "0.11", optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
+
+[features]
+# 性能分析：接入 Tracy 采样器（https://github.com/wolfpld/tracy）。
+# 构建：cargo build --features tracy（或 pnpm tauri build --no-bundle -- --features tracy）
+# 运行：先启动 Tracy GUI capture server，再设环境变量 TRACY=1 启动应用。
+# 默认关闭：无 tracy 客户端时不会尝试连接，零运行时开销（span 为空操作）。
+tracy = ["dep:tracing-tracy", "dep:tracing-subscriber"]
 
 [dev-dependencies]
 tempfile = "3"
 
-# release 编译优化：LTO + 单 codegen 单元提升运行时性能、strip 减小体积。
-# 代价：release 构建时间增加（一次性）。
+# release 编译优化（发布版）：以一次性更长的构建时间为代价，换取运行时性能
+# 与二进制体积的最佳状态。
 [profile.release]
-lto = true
-codegen-units = 1
-strip = true
-opt-level = 3
+opt-level = 3          # 最高优化等级：日志增量读取/过滤/序列化是 CPU 热点
+lto = true             # fat LTO，跨 crate 内联
+codegen-units = 1      # 单 codegen 单元，内联与去重最充分
+strip = true           # 剥离符号 + 调试信息，显著减小 exe
+panic = "abort"        # panic 直接终止：去掉 unwind 落地垫，体积更小、指令更紧凑
+                       #（tauri 命令不 catch_unwind，unwind 也无收益）
+incremental = false    # 关闭增量缓存，保证干净的全量优化
 

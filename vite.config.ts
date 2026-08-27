@@ -36,4 +36,12 @@ export default defineConfig(async () => ({
       ignored: ["**/src-tauri/**"],
     },
   },
+  // 发布构建参数：WebView2 随 Edge 常青更新（本项目要求 Win10 1809+），
+  // 以 Chrome 107 为转译下限即可，避免向更老浏览器转译造成产物体积膨胀；
+  // 生产包不产出 sourcemap。
+  build: {
+    target: "chrome107",
+    minify: "esbuild",
+    sourcemap: false,
+  },
 }));

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -7,7 +7,11 @@ import "./App.css";
 
 /** 一行日志（与后端 LogLine 对应）。 */
 interface LogLine {
+  /** 稳定行标识（后端单调分配；历史行为负数）。必须全局唯一：用作 React key
+   *  与虚拟滚动测量缓存的 key，碰撞会导致相邻行重叠。 */
   file_offset: number;
+  /** 该行在文件中的真实行号（1-based）。行号列优先显示它。 */
+  file_line: number;
   text: string;
 }
 
@@ -16,6 +20,26 @@ interface LinesPayload {
   tab_id: string;
   lines: LogLine[];
   reset: boolean;
+  /** 文件当前总行数（实时，随追加增长）。 */
+  total_lines: number;
+  /** 平均行长（字节/行，来自后端行索引）：占位行高度与滚动条比例的估算依据。 */
+  avg_line_len?: number | null;
+}
+
+/** 后端 jump_to_line 命令的返回负载。 */
+interface JumpPayload {
+  /** 窗口内经过滤的命中行（整体替换前端视图）。 */
+  lines: LogLine[];
+  /** 目标行在 lines 中的下标（滚动定位用）。 */
+  target_index: number;
+  /** 目标行是否出现在过滤后的视图中。 */
+  target_visible: boolean;
+  /** 文件总行数。 */
+  total_lines: number;
+  /** 窗口起点之前是否还有更早的历史。 */
+  has_more: boolean;
+  /** 窗口第一行的文件行号（1-based）。 */
+  first_line_no: number;
 }
 
 /** 一个 tab 的元信息。 */
@@ -23,6 +47,38 @@ interface TabInfo {
   id: string;
   title: string;
   path: string;
+  /** 打开失败（如恢复上次会话时文件已被删除）时的错误信息；成功打开为 undefined。 */
+  openError?: string;
+}
+
+// ==================== 文件记忆（重启恢复上次打开的文件） ====================
+
+/** localStorage 中保存的标签页列表。 */
+interface SavedTabs {
+  paths: string[];
+  /** 上次激活的 tab 下标。 */
+  active: number;
+}
+
+/** 读取上次会话的标签页（无数据/损坏时返回 null）。 */
+function readSavedTabs(): SavedTabs | null {
+  try {
+    const raw = localStorage.getItem("lv-tabs");
+    if (!raw) {
+      return null;
+    }
+    const v = JSON.parse(raw) as Partial<SavedTabs>;
+    if (!v || !Array.isArray(v.paths)) {
+      return null;
+    }
+    const paths = v.paths.filter((p): p is string => typeof p === "string" && p.length > 0);
+    if (paths.length === 0) {
+      return null;
+    }
+    return { paths, active: typeof v.active === "number" ? v.active : paths.length - 1 };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -41,8 +97,29 @@ function nextTabId(): string {
   return `tab-${tabSeq}`;
 }
 
-/** 行高估算常量：font-size 12px × line-height 1.4 + 1px border ≈ 18px。 */
-const LINE_HEIGHT = 18;
+// 性能统计（仅 DEV 构建）：挂到 window.__lvPerf，便于浏览器控制台观察热点。
+// 计数在每次打开页面时重置。
+declare global {
+  interface Window {
+    __lvPerf?: {
+      estimateCalls: number;
+      estimateMs: number;
+      getItemKeyCalls: number;
+      renders: number;
+      scrollEvents: number;
+    };
+  }
+}
+if (import.meta.env.DEV) {
+  window.__lvPerf = {
+    estimateCalls: 0,
+    estimateMs: 0,
+    getItemKeyCalls: 0,
+    renders: 0,
+    scrollEvents: 0,
+  };
+}
+
 /** 复制按钮列宽。 */
 const COPY_BTN_WIDTH = 18;
 /** 行号列宽度（48px）+ padding-right（8px）。 */
@@ -62,34 +139,357 @@ function clampFrontLines(next: LogLine[]): LogLine[] {
   }
   return next;
 }
-/** Consolas 12px 等宽字体的半角字符近似宽度。 */
-const CHAR_WIDTH = 6.6;
-/** 全角（CJK）字符宽度 = 2 × 半角。 */
-const CJK_CHAR_WIDTH = 13.2;
+
+// ==================== 稀疏虚拟列表（无过滤态） ====================
+//
+// 滚动条按文件总行数映射全文件；已加载内容存于「段缓存」（blockIdx → 行数组，
+// 未加载位为 null，渲染成占位行）。滚动到未加载区域时按块向 get_range 拉取，
+// 双向皆可，中段浏览只需一次请求；远离视口的块会被淘汰以控制内存。
+// 过滤生效时回落到旧「窗口模型」（lines 数组 + load_history 向上加载）。
+
+/** 稀疏段缓存中一个块的行数。 */
+const SPARSE_BLOCK_LINES = 10_000;
+/** 可视区外的预取块数（每侧）。 */
+const SPARSE_PREFETCH_BLOCKS = 1;
+/** 淘汰时保留视口两侧的块数。 */
+const SPARSE_KEEP_BLOCKS = 2;
+/** 块拉取的最大并发数：快速拖动时保证终点视口的块优先到达。 */
+const SPARSE_MAX_INFLIGHT = 4;
+/** 段缓存类型：blockIdx → 块内行数组（null = 未加载）。 */
+type SparseSegments = Map<number, (LogLine | null)[]>;
+
+/** 由行号计算块号（file_line 1-based）。 */
+function blockIndexOf(fileLine: number): number {
+  return Math.floor((fileLine - 1) / SPARSE_BLOCK_LINES);
+}
+
+/** 按行号取块内下标（0-based）。 */
+function posInBlock(fileLine: number): number {
+  return (fileLine - 1) % SPARSE_BLOCK_LINES;
+}
+
+/** 取虚拟列表 index（0-based 文件行）对应的已加载行；undefined/null = 未加载。 */
+function segLineAt(
+  segments: SparseSegments,
+  index: number
+): LogLine | null | undefined {
+  const block = segments.get(Math.floor(index / SPARSE_BLOCK_LINES));
+  return block ? block[index % SPARSE_BLOCK_LINES] : undefined;
+}
+
+/** 把新行合并进段缓存（返回新 Map，触发重渲染）。 */
+function mergeSegments(prev: SparseSegments, newLines: LogLine[]): SparseSegments {
+  if (newLines.length === 0) {
+    return prev;
+  }
+  const next = new Map(prev);
+  for (const l of newLines) {
+    if (l == null || !Number.isFinite(l.file_line)) {
+      continue;
+    }
+    const bi = blockIndexOf(l.file_line);
+    let block = next.get(bi);
+    if (!block) {
+      block = new Array<LogLine | null>(SPARSE_BLOCK_LINES).fill(null);
+      next.set(bi, block);
+    }
+    block[posInBlock(l.file_line)] = l;
+  }
+  return next;
+}
+
+/** 段缓存中已加载的行数（状态栏显示用）。 */
+function segLoadedCount(segments: SparseSegments): number {
+  let n = 0;
+  for (const block of segments.values()) {
+    for (const l of block) {
+      if (l) {
+        n += 1;
+      }
+    }
+  }
+  return n;
+}
+
+/** 块是否已完整加载：块内所有「应存在的行」（行号 ≤ 文件总行数）都非 null。
+ *  注意不能用「块存在」判断——初始尾部事件会预填末块的一部分，
+ *  若只按存在性跳过拉取，该块其余区域会成为永久占位符。 */
+function blockComplete(segments: SparseSegments, b: number, totalLines: number): boolean {
+  const arr = segments.get(b);
+  if (!arr) {
+    return false;
+  }
+  const start = b * SPARSE_BLOCK_LINES;
+  const want = Math.min(SPARSE_BLOCK_LINES, totalLines - start);
+  if (want <= 0) {
+    return false;
+  }
+  for (let i = 0; i < want; i++) {
+    if (!arr[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** 行高估算参数（随字体大小缩放，等宽字体近似）。 */
+interface RowMetrics {
+  /** 单行显示高度：font-size × 1.4 + 1px border。 */
+  lineHeight: number;
+  /** 半角字符近似宽度：font-size × 0.55。 */
+  charWidth: number;
+  /** 全角（CJK）字符宽度：font-size × 1.1。 */
+  cjkWidth: number;
+}
+
+/**
+ * 单行最大显示字符数：超长行截断显示（如 71 万字符的行若完整折行会高达
+ * ~6400 行 / 10 万像素，导致渲染卡顿、估算偏差放大 → 相邻行重叠）。
+ * 截断后行高有界，估算与渲染一致，重叠消除；复制按钮仍复制完整原文。
+ */
+const MAX_LINE_CHARS = 2000;
+
+/** 返回一行的显示文本（超长截断），估算与渲染共用保证一致。 */
+function displayTextOf(text: string, lang: Lang): string {
+  if (text.length <= MAX_LINE_CHARS) {
+    return text;
+  }
+  return text.slice(0, MAX_LINE_CHARS) + MESSAGES[lang].truncateMark;
+}
+
+/** 由字体大小计算行高估算参数。 */
+function metricsForFontSize(fontSize: number): RowMetrics {
+  // 关键：行框高度按浏览器 1/64px 网格取整（Chromium 行为）。
+  // 例如 12px × 1.4 = 16.8 → 实测行框 16.796875（= 1075/64）。
+  // 若估算直接用 16.8，每行实测与估算永远差 ~0.003px → 虚拟滚动的
+  // resizeItem 对每行都触发一次「测量缓存版本号 ++」→ 每次滚动都引发
+  // 对全部未测量行的全量重估算（性能放大十倍以上）。对齐取整后 delta==0，
+  // 只有折行数估算确实有偏差的行才会触发重算。
+  const lineBox = Math.round(fontSize * 1.4 * 64) / 64;
+  return {
+    lineHeight: lineBox + 1,
+    charWidth: fontSize * 0.55,
+    cjkWidth: fontSize * 1.1,
+  };
+}
 
 /** 估算一行文本的像素宽度（等宽字体近似）。 */
-function estimateTextWidth(text: string): number {
+function estimateTextWidth(text: string, m: RowMetrics): number {
   let width = 0;
   for (const ch of text) {
-    width += ch.charCodeAt(0) > 0xff ? CJK_CHAR_WIDTH : CHAR_WIDTH;
+    width += ch.charCodeAt(0) > 0xff ? m.cjkWidth : m.charWidth;
   }
   return width;
 }
 
 /** 估算一行的显示高度（用于历史 prepend 后的像素锚定）。 */
-function estimateRowHeight(text: string, wrap: boolean, containerWidth: number): number {
+function estimateRowHeight(
+  text: string,
+  wrap: boolean,
+  containerWidth: number,
+  m: RowMetrics,
+  lang: Lang
+): number {
   if (!wrap) {
-    return LINE_HEIGHT;
+    return m.lineHeight;
   }
-  const textWidth = estimateTextWidth(text);
+  const textWidth = estimateTextWidth(displayTextOf(text, lang), m);
   const rows = Math.max(1, Math.ceil(textWidth / Math.max(containerWidth - GUTTER_WIDTH, 100)));
-  return rows * LINE_HEIGHT;
+  return rows * m.lineHeight;
 }
 
 /** 转义正则特殊字符。 */
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+
+/** 复制文本到剪贴板（clipboard API + 旧 execCommand 兜底，WebView2 兼容）。 */
+async function copyTextToClipboard(text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    document.body.removeChild(ta);
+  }
+}
+
+// ==================== 多语言（zh / en） ====================
+
+type Lang = "zh" | "en";
+
+/** 界面文案字典：所有 UI 字符串集中于此，便于中英文切换与维护。 */
+interface Messages {
+  notOpened: string;
+  openedLines: (n: number) => string;
+  loadFailed: (e: string) => string;
+  followTail: string;
+  autoRefresh: string;
+  wrapLines: string;
+  gotoTop: string;
+  gotoBottom: string;
+  jump: string;
+  gotoTopTitle: string;
+  gotoBottomTitle: string;
+  jumpTitle: string;
+  jumpPlaceholder: string;
+  jumpPlaceholderRange: (n: number) => string;
+  keywordPlaceholder: string;
+  regexPlaceholder: string;
+  highlightPlaceholder: string;
+  applyFilter: string;
+  countLines: (n: number) => string;
+  countLinesOfTotal: (n: number, total: number) => string;
+  totalLinesTitle: string;
+  invalidLine: string;
+  jumpFailed: (e: string) => string;
+  jumpSuccess: (line: number, first: number) => string;
+  jumpFilteredHidden: (line: number) => string;
+  topReached: string;
+  bottomReached: string;
+  refreshResumed: string;
+  refreshPaused: string;
+  refreshFailed: (e: string) => string;
+  filterFailed: (e: string) => string;
+  lineCopied: string;
+  viewCopied: (n: number) => string;
+  closeTabToolbarTitle: string;
+  closeTabTitle: string;
+  openTab: string;
+  openTabTitle: string;
+  openDialogName: string;
+  openFailed: string;
+  fontSizeSmaller: string;
+  fontSizeBigger: string;
+  switchToLight: string;
+  switchToDark: string;
+  switchLangTitle: (current: Lang) => string;
+  copyViewTitle: string;
+  copyViewOk: string;
+  copyViewErr: string;
+  copyLineTitle: string;
+  noFileOpened: string;
+  openFirst: string;
+  opening: string;
+  pathPlaceholder: string;
+  truncateMark: string;
+}
+
+const MESSAGES: Record<Lang, Messages> = {
+  zh: {
+    notOpened: "未打开文件",
+    openedLines: (n) => `已打开，共 ${n} 行`,
+    loadFailed: (e) => `加载失败: ${e}`,
+    followTail: "跟随尾部",
+    autoRefresh: "自动刷新",
+    wrapLines: "自动换行",
+    gotoTop: "置顶",
+    gotoBottom: "置底",
+    jump: "跳转",
+    gotoTopTitle: "置顶：跳到文件第 1 行",
+    gotoBottomTitle: "置底：跳到文件最后一行",
+    jumpTitle: "跳转到文件第 N 行（目标行会被定位到视图中央）",
+    jumpPlaceholder: "跳转到行号",
+    jumpPlaceholderRange: (n) => `行号 1-${n}`,
+    keywordPlaceholder: "关键词（含空格作为完整短语匹配）",
+    regexPlaceholder: "正则（可选，多条件 OR 如 error|warn）",
+    highlightPlaceholder: "高亮关键词（空格分隔多个，实时生效）",
+    applyFilter: "过滤",
+    countLines: (n) => `${n} 行`,
+    countLinesOfTotal: (n, total) => `${n} / ${total} 行`,
+    totalLinesTitle: "文件总行数（实时）",
+    invalidLine: "请输入 ≥ 1 的整数行号",
+    jumpFailed: (e) => `跳转失败: ${e}`,
+    jumpSuccess: (line, first) => `已跳转到文件第 ${line} 行（窗口起点为第 ${first} 行）`,
+    jumpFilteredHidden: (line) => `第 ${line} 行被过滤隐藏，已定位到最近的匹配行`,
+    topReached: "已置顶（文件第 1 行）",
+    bottomReached: "已置底（跟随尾部）",
+    refreshResumed: "已恢复自动刷新",
+    refreshPaused: "已暂停自动刷新",
+    refreshFailed: (e) => `刷新失败: ${e}`,
+    filterFailed: (e) => `过滤失败: ${e}`,
+    lineCopied: "已复制该行",
+    viewCopied: (n) => `已复制当前视图（${n} 行）`,
+    closeTabToolbarTitle: "关闭此 tab",
+    closeTabTitle: "关闭 tab",
+    openTab: "+ 打开日志",
+    openTabTitle: "打开新日志文件",
+    openDialogName: "日志文件",
+    openFailed: "打开失败",
+    fontSizeSmaller: "减小字体",
+    fontSizeBigger: "增大字体",
+    switchToLight: "切换到浅色主题",
+    switchToDark: "切换到深色主题",
+    switchLangTitle: (cur) => (cur === "zh" ? "Switch to English" : "切换为中文"),
+    copyViewTitle: "复制当前正文（若使用过滤，则复制过滤后的内容）",
+    copyViewOk: "已复制",
+    copyViewErr: "复制失败",
+    copyLineTitle: "复制此行",
+    noFileOpened: "未打开任何日志文件",
+    openFirst: "打开日志文件",
+    opening: "打开中…",
+    pathPlaceholder: "（未打开文件）",
+    truncateMark: " …(行过长已截断，点左侧复制按钮获取全文)",
+  },
+  en: {
+    notOpened: "No file opened",
+    openedLines: (n) => `Opened, ${n} lines`,
+    loadFailed: (e) => `Load failed: ${e}`,
+    followTail: "Follow tail",
+    autoRefresh: "Auto refresh",
+    wrapLines: "Word wrap",
+    gotoTop: "Top",
+    gotoBottom: "Bottom",
+    jump: "Go",
+    gotoTopTitle: "Top: jump to file line 1",
+    gotoBottomTitle: "Bottom: jump to the last line",
+    jumpTitle: "Jump to file line N (target line is centered in the view)",
+    jumpPlaceholder: "Jump to line",
+    jumpPlaceholderRange: (n) => `Line 1-${n}`,
+    keywordPlaceholder: "Keyword (spaces match the whole phrase)",
+    regexPlaceholder: "Regex (optional, OR conditions like error|warn)",
+    highlightPlaceholder: "Highlight keywords (space-separated, live)",
+    applyFilter: "Filter",
+    countLines: (n) => `${n} lines`,
+    countLinesOfTotal: (n, total) => `${n} / ${total} lines`,
+    totalLinesTitle: "Total lines in file (live)",
+    invalidLine: "Enter an integer line number ≥ 1",
+    jumpFailed: (e) => `Jump failed: ${e}`,
+    jumpSuccess: (line, first) => `Jumped to file line ${line} (window starts at line ${first})`,
+    jumpFilteredHidden: (line) => `Line ${line} is hidden by the filter; located the nearest match`,
+    topReached: "Top (file line 1)",
+    bottomReached: "Bottom (following tail)",
+    refreshResumed: "Auto refresh resumed",
+    refreshPaused: "Auto refresh paused",
+    refreshFailed: (e) => `Refresh failed: ${e}`,
+    filterFailed: (e) => `Filter failed: ${e}`,
+    lineCopied: "Line copied",
+    viewCopied: (n) => `View copied (${n} lines)`,
+    closeTabToolbarTitle: "Close this tab",
+    closeTabTitle: "Close tab",
+    openTab: "+ Open log",
+    openTabTitle: "Open a new log file",
+    openDialogName: "Log files",
+    openFailed: "Failed to open",
+    fontSizeSmaller: "Decrease font size",
+    fontSizeBigger: "Increase font size",
+    switchToLight: "Switch to light theme",
+    switchToDark: "Switch to dark theme",
+    switchLangTitle: (cur) => (cur === "zh" ? "Switch to English" : "切换为中文"),
+    copyViewTitle: "Copy the current view (filtered content when a filter is active)",
+    copyViewOk: "Copied",
+    copyViewErr: "Copy failed",
+    copyLineTitle: "Copy this line",
+    noFileOpened: "No log file opened",
+    openFirst: "Open log file",
+    opening: "Opening…",
+    pathPlaceholder: "(no file opened)",
+    truncateMark: " …(line truncated; click the copy button for the full text)",
+  },
+};
 
 /** 解析高亮关键词输入：空格分隔多个关键词。 */
 function parseHighlightKeywords(input: string): string[] {
@@ -135,13 +535,32 @@ function splitByMatcher(text: string, matcher: HighlightMatcher): HighlightPart[
 }
 
 /** 单个日志 tab：独立的状态（行、过滤、滚动、高亮）与事件监听。 */
-function LogTab({ tabId, path, active, onClose }: {
+function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, registerCopy, reportTotal }: {
   tabId: string;
   path: string;
+  /** 打开失败信息（恢复会话时文件已不存在等）；有值时工具栏显示警告。 */
+  openError?: string;
   active: boolean;
+  fontSize: number;
+  lang: Lang;
   onClose: () => void;
+  /** 注册「复制当前视图」函数：激活时注册、失活/卸载时注销（App 右上角按钮用）。 */
+  registerCopy: (tabId: string, fn: (() => Promise<string>) | null) => void;
+  /** 上报本 tab 的文件总行数（激活时实时同步给 App 右上角显示）。 */
+  reportTotal: (tabId: string, total: number | null) => void;
 }) {
+  const t = MESSAGES[lang];
   const [lines, setLines] = useState<LogLine[]>([]);
+  // ---- 稀疏虚拟列表（无过滤态）状态 ----
+  const [segments, setSegments] = useState<SparseSegments>(() => new Map());
+  const [avgLineLen, setAvgLineLen] = useState<number | null>(null);
+  /** 过滤是否已生效：true = 旧窗口模型；false = 稀疏模型。 */
+  const [filterActive, setFilterActive] = useState(false);
+  const filterActiveRef = useRef(false);
+  filterActiveRef.current = filterActive;
+  const segmentsRef = useRef<SparseSegments>(segments);
+  segmentsRef.current = segments;
+  const lastEvictRef = useRef(0);
   const [keywordInput, setKeywordInput] = useState("");
   const [regexInput, setRegexInput] = useState("");
   // 高亮关键词（输入框原始文本 + 解析后的列表，实时生效）。
@@ -155,37 +574,308 @@ function LogTab({ tabId, path, active, onClose }: {
   const [followTail, setFollowTail] = useState(true);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [wrapLines, setWrapLines] = useState(true);
-  const [status, setStatus] = useState("未打开文件");
+  // ---- 跳转到指定行 ----
+  const [jumpInput, setJumpInput] = useState("");
+  const [jumping, setJumping] = useState(false);
+  const [totalLines, setTotalLines] = useState<number | null>(null);
+  const totalLinesRef = useRef<number | null>(totalLines);
+  totalLinesRef.current = totalLines;
+  // 待执行的跳转定位请求：在 lines 替换**提交之后**由 effect 消费，
+  // 避免 scrollToIndex 在新内容提交前执行（该库的 reconcile 会固化
+  // 首次计算的偏移，若首次基于旧视图计算，落点就错到别处）。
+  const [jumpRequest, setJumpRequest] = useState<{ target: number } | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const autoRefreshRef = useRef(autoRefresh);
   autoRefreshRef.current = autoRefresh;
   const [highlightOffsets, setHighlightOffsets] = useState<Set<number>>(new Set());
+  // 标记「本轮 lines 增长来自历史 prepend」，期间抑制尾部跟随滚动。
+  const suppressFollowRef = useRef(false);
+  // 跳转定位的用户滚动保护：程序写入时间戳与最近一次用户滚动时间戳。
+  const lastProgrammaticWriteRef = useRef(0);
+  const lastUserScrollRef = useRef(0);
+
+  // 行高估算参数（随字体大小变化）。用 useMemo 稳定引用：
+  // 否则每次渲染都是新对象，estimateSize 的 useCallback 依赖会失效。
+  const metrics = useMemo(() => metricsForFontSize(fontSize), [fontSize]);
+
+  // 渲染计数（仅 DEV）：每次 LogTab 渲染递增，观察滚动时的重渲染频率。
+  useEffect(() => {
+    if (import.meta.env.DEV && window.__lvPerf) {
+      window.__lvPerf.renders++;
+    }
+  });
+
+  // estimateSize / getItemKey 必须用 useCallback 稳定引用：
+  // 虚拟滚动的 getMeasurements 以 getItemKey 的引用为 memo 依赖；
+  // 若每次渲染都新建闭包，纯滚动渲染也会触发 O(总行数×行长) 的全量重算，
+  // 表现为大数据量下滚动卡顿（每次滚动上百万次字符宽度估算）。
+  //
+  // 每行估算高度缓存：键为 file_offset，值为 { 宽度桶, 高度 }。
+  // 估算只在行首次出现（或宽度桶变化）时做一次字符遍历，之后全是 O(1) 命中。
+  // 这样即使「追加/前插新数据 → 全量重建测量数组」，也只是 Map 查找而非逐字符扫描。
+  const estimateCacheRef = useRef<Map<number, { bucket: number; height: number }>>(new Map());
+  // 换行模式 / 字体大小 / 语言变化时，估算基准失效，清空缓存重建。
+  useEffect(() => {
+    estimateCacheRef.current.clear();
+  }, [wrapLines, fontSize, lang]);
+
+  // 占位行高度：用后端平均行长估算（滚动条比例与真实内容量大致成正比，
+  // 块加载后实测高度逐步修正）。不可用时退化为单行高。
+  const placeholderHeight = useCallback(() => {
+    if (!wrapLines || avgLineLen == null) {
+      return metrics.lineHeight;
+    }
+    const width = Math.max((listRef.current?.clientWidth ?? 800) - GUTTER_WIDTH, 100);
+    const estWidth = avgLineLen * metrics.charWidth;
+    const rows = Math.max(1, Math.ceil(estWidth / width));
+    return rows * metrics.lineHeight;
+  }, [wrapLines, avgLineLen, metrics]);
+
+  const estimateSize = useCallback(
+    (index: number) => {
+      const perf = window.__lvPerf;
+      const t0 = perf ? performance.now() : 0;
+      if (perf) {
+        perf.estimateCalls++;
+      }
+      let result: number;
+      if (!wrapLines) {
+        result = metrics.lineHeight; // 不换行：固定单行高
+      } else {
+        // 稀疏模型：按文件行号取行；未加载 → 占位高度（O(1)，不逐字符估算）。
+        const line = filterActiveRef.current
+          ? lines[index]
+          : segLineAt(segmentsRef.current, index);
+        if (!line) {
+          result = placeholderHeight();
+        } else {
+          // 宽度分桶（32px）：窗口宽度小幅变化不重算；桶变化时才重新估算。
+          const width = (listRef.current?.clientWidth ?? 800) - GUTTER_WIDTH;
+          const bucket = Math.round(width / 32);
+          const cache = estimateCacheRef.current;
+          // 防止长时间运行后缓存无限增长（前端行窗口裁剪后旧行仍留在缓存）。
+          if (cache.size > 400_000) {
+            cache.clear();
+          }
+          const cached = cache.get(line.file_offset);
+          if (cached && cached.bucket === bucket) {
+            result = cached.height;
+          } else {
+            // 用截断后的显示文本估算（与渲染一致，避免极长行估算偏差放大）。
+            const textWidth = estimateTextWidth(displayTextOf(line.text, lang), metrics);
+            const rows = Math.max(1, Math.ceil(textWidth / Math.max(width, 100)));
+            result = rows * metrics.lineHeight;
+            cache.set(line.file_offset, { bucket, height: result });
+          }
+        }
+      }
+      if (perf) {
+        perf.estimateMs += performance.now() - t0;
+      }
+      return result;
+    },
+    [lines, segments, wrapLines, metrics, lang, placeholderHeight]
+  );
+
+  // 用稳定的 file_offset 作 key：测量缓存在重渲染/追加后仍命中。
+  // 稀疏模型 key = 文件行号 index（稳定不漂移）；旧窗口模型 key = file_offset。
+  const getItemKey = useCallback(
+    (index: number) => {
+      if (window.__lvPerf) {
+        window.__lvPerf.getItemKeyCalls++;
+      }
+      return filterActiveRef.current ? (lines[index]?.file_offset ?? index) : index;
+    },
+    [lines]
+  );
 
   const virtualizer = useVirtualizer({
-    count: lines.length,
+    count: filterActive ? lines.length : (totalLines ?? 0),
     getScrollElement: () => listRef.current,
-    // 精确估算行高：等宽字体下按文本长度估算折行数，接近实测值，
-    // 避免向上滚动进入未测量区域时「估算 vs 实测」偏差导致总高度突变、滚动条漂移。
-    estimateSize: (index) => {
-      if (!wrapLines) {
-        return LINE_HEIGHT; // 不换行：固定单行高
-      }
-      const line = lines[index];
-      if (!line) {
-        return LINE_HEIGHT;
-      }
-      const containerWidth = (listRef.current?.clientWidth ?? 800) - GUTTER_WIDTH;
-      const textWidth = estimateTextWidth(line.text);
-      const rows = Math.max(1, Math.ceil(textWidth / Math.max(containerWidth, 100)));
-      return rows * LINE_HEIGHT;
-    },
-    // 用稳定的 file_offset 作 key：测量缓存在重渲染/追加后仍命中。
-    getItemKey: (index) => lines[index]?.file_offset ?? index,
+    estimateSize,
+    getItemKey,
     overscan: 30,
     measureElement: (el) => el.getBoundingClientRect().height,
-    // 用 rAF 批量合并 ResizeObserver 测量更新，减少滚动时的布局抖动。
-    useAnimationFrameWithResizeObserver: true,
+    // 该 fork 默认 useFlushSync=true：同步 notify（发生在 React 提交阶段的
+    // measureElement ref 回调里）会在渲染中调用 flushSync，触发
+    // "flushSync was called from inside a lifecycle method" 并破坏同批次的
+    // 状态更新（实测：过滤 reset 被当成追加，视图行数错误累积）。
+    // 关闭后走正常异步 rerender，行为不变且无该错误。
+    useFlushSync: false,
   });
+
+  // ---- 稀疏块加载：距离优先调度 + rAF 合并 + 淘汰（双向均可） ----
+
+  const inflightRef = useRef<Set<number>>(new Set());
+  /** 本帧是否已排入调度。 */
+  const fetchScheduledRef = useRef(false);
+
+  /** 拉取一个块（1 万行）；并发上限由调度器控制，避免拖动时几十个块挤占 IPC。 */
+  const fetchBlock = useCallback(
+    async (b: number) => {
+      // 完整加载过才跳过；部分填充（尾部事件预填的末块）仍需拉取补齐。
+      const skipReason = inflightRef.current.has(b)
+        ? "inflight"
+        : blockComplete(segmentsRef.current, b, totalLinesRef.current ?? 0)
+          ? "complete"
+          : null;
+      if (skipReason) {
+        return;
+      }
+      inflightRef.current.add(b);
+      try {
+        const res = await invoke<LogLine[]>("get_range", {
+          tabId,
+          startLine: b * SPARSE_BLOCK_LINES + 1,
+          count: SPARSE_BLOCK_LINES,
+        });
+        setSegments((prev) => mergeSegments(prev, res));
+      } catch {
+        // 静默失败：下次滚动到该块会重试。
+      } finally {
+        inflightRef.current.delete(b);
+        // 本块完成后重排一轮：并发占满时被让位的块、以及拖动结束后
+        // 没有新 scroll 事件的场景，都靠这里把剩余的缺失块补齐。
+        if (!fetchScheduledRef.current) {
+          fetchScheduledRef.current = true;
+          requestAnimationFrame(runFetchTickRef.current);
+        }
+      }
+    },
+    [tabId]
+  );
+
+  /** 每帧一次的块调度：在 rAF 里读虚拟列表项（此时 React 已提交新的 scrollOffset），
+   *  计算视口所需块、按距离优先拉取并淘汰远块。
+   *
+   *  关键教训：scroll 事件处理里同步读 `getVirtualItems()` 可能拿到 React 尚未提交的
+   *  陈旧 scrollOffset（程序性 scrollToEnd 只产生一次 scroll 事件，之后没有新事件
+   *  来纠正 → 视口块永远不被拉取）。因此这里先校验 items 与 DOM scrollTop 的一致性，
+   *  不一致则顺延下一帧重试（最多 3 次）。 */
+  const runFetchTick = useCallback(() => {
+    fetchScheduledRef.current = false;
+    if (filterActiveRef.current || totalLines == null || totalLines <= 0) {
+      return;
+    }
+    const items = virtualizer.getVirtualItems();
+    if (items.length === 0) {
+      return;
+    }
+    // items 与 DOM 滚动位置一致性校验：不一致说明虚拟列表还没跟上本次滚动。
+    const el = listRef.current;
+    if (el) {
+      const first = items[0];
+      const last = items[items.length - 1];
+      const covered =
+        el.scrollTop >= first.start - 64 &&
+        el.scrollTop + el.clientHeight <= last.start + last.size + 64;
+      if (!covered) {
+        if (tickRetryRef.current < 3) {
+          tickRetryRef.current += 1;
+          fetchScheduledRef.current = true;
+          requestAnimationFrame(runFetchTickRef.current);
+          return;
+        }
+      }
+    }
+    tickRetryRef.current = 0;
+
+    const firstIdx = items[0].index;
+    const lastIdx = items[items.length - 1].index;
+    const center = Math.floor(
+      items[Math.floor(items.length / 2)].index / SPARSE_BLOCK_LINES
+    );
+    const firstBlock = Math.max(0, Math.floor(firstIdx / SPARSE_BLOCK_LINES) - SPARSE_PREFETCH_BLOCKS);
+    const lastBlock = Math.min(
+      Math.floor((totalLines - 1) / SPARSE_BLOCK_LINES),
+      Math.floor(lastIdx / SPARSE_BLOCK_LINES) + SPARSE_PREFETCH_BLOCKS
+    );
+    // 收集缺失块，按距视口中心块的距离排序（终点视口的块优先）。
+    const missing: number[] = [];
+    for (let b = firstBlock; b <= lastBlock; b++) {
+      if (
+        !inflightRef.current.has(b) &&
+        !blockComplete(segmentsRef.current, b, totalLines)
+      ) {
+        missing.push(b);
+      }
+    }
+    missing.sort((a, b) => Math.abs(a - center) - Math.abs(b - center));
+
+    let slots = SPARSE_MAX_INFLIGHT - inflightRef.current.size;
+    if (slots <= 0) {
+      // 在途块已不在视口附近 → 放弃认领，腾出并发位给当前视口
+      // （响应仍会合并进段缓存，稍后被淘汰；可能重复拉取一次，幂等无害）。
+      for (const b of [...inflightRef.current]) {
+        if (b < firstBlock - SPARSE_KEEP_BLOCKS || b > lastBlock + SPARSE_KEEP_BLOCKS) {
+          inflightRef.current.delete(b);
+          slots += 1;
+        }
+      }
+      if (slots <= 0) {
+        return;
+      }
+    }
+    for (const b of missing.slice(0, slots)) {
+      void fetchBlock(b);
+    }
+    // 淘汰：限频，保留视口两侧各 SPARSE_KEEP_BLOCKS 个块（在途块不淘汰）。
+    const now = Date.now();
+    if (now - lastEvictRef.current > 500) {
+      lastEvictRef.current = now;
+      setSegments((prev) => {
+        let changed = false;
+        for (const key of prev.keys()) {
+          if (key < firstBlock - SPARSE_KEEP_BLOCKS || key > lastBlock + SPARSE_KEEP_BLOCKS) {
+            changed = true;
+            break;
+          }
+        }
+        if (!changed) {
+          return prev;
+        }
+        const next = new Map(prev);
+        for (const key of prev.keys()) {
+          if (
+            (key < firstBlock - SPARSE_KEEP_BLOCKS || key > lastBlock + SPARSE_KEEP_BLOCKS) &&
+            !inflightRef.current.has(key)
+          ) {
+            next.delete(key);
+          }
+        }
+        return next;
+      });
+    }
+  }, [totalLines, virtualizer, fetchBlock]);
+
+  // 供 fetchBlock 在完成后自触发重排（fetchBlock 的依赖是稳定的，需经 ref 取最新 tick）。
+  const runFetchTickRef = useRef<() => void>(() => {});
+  runFetchTickRef.current = runFetchTick;
+  /** items 与 DOM 不一致时的顺延重试计数。 */
+  const tickRetryRef = useRef(0);
+
+  /** 请求块调度（每帧合并一次；scroll 事件 / 跟随效应 / 块完成共用入口）。 */
+  const scheduleFetchTick = useCallback(() => {
+    if (fetchScheduledRef.current) {
+      return;
+    }
+    fetchScheduledRef.current = true;
+    tickRetryRef.current = 0;
+    requestAnimationFrame(runFetchTickRef.current);
+  }, []);
+
+  /** 滚动后确保视口块加载（转发到调度；计算统一在 rAF 里做）。 */
+  const ensureVisibleBlocks = useCallback(() => {
+    scheduleFetchTick();
+  }, [scheduleFetchTick]);
+
+  // 字体大小变化时：在渲染 DOM 更新前同步清空行高缓存，
+  // 之后行元素 resize → ResizeObserver 用新字体下的真实高度重建缓存。
+  const prevFontSizeRef = useRef(fontSize);
+  if (prevFontSizeRef.current !== fontSize) {
+    prevFontSizeRef.current = fontSize;
+    virtualizer.measure();
+  }
 
   // 只监听本 tab 的事件。
   useEffect(() => {
@@ -197,10 +887,21 @@ function LogTab({ tabId, path, active, onClose }: {
       if (!autoRefreshRef.current) {
         return;
       }
-      setLines((prev) => clampFrontLines(reset ? newLines : [...prev, ...newLines]));
-      if (reset) {
-        // 视图整体替换（新文件/过滤）后，允许重新加载历史。
-        setHasMoreHistory(true);
+      // 实时总行数：每次事件都会携带（随追加增长；轮转后归零重计）。
+      setTotalLines(event.payload.total_lines);
+      if (event.payload.avg_line_len != null) {
+        setAvgLineLen(event.payload.avg_line_len);
+      }
+      if (filterActiveRef.current) {
+        // 旧窗口模型：追加/替换 lines 数组。
+        setLines((prev) => clampFrontLines(reset ? newLines : [...prev, ...newLines]));
+        if (reset) {
+          // 视图整体替换（新文件/过滤）后，允许重新加载历史。
+          setHasMoreHistory(true);
+        }
+      } else {
+        // 稀疏模型：合并进段缓存；reset（轮转/新文件）时清空重建。
+        setSegments((prev) => mergeSegments(reset ? new Map() : prev, newLines));
       }
 
       if (!reset && newLines.length > 0) {
@@ -224,21 +925,32 @@ function LogTab({ tabId, path, active, onClose }: {
     };
   }, [tabId]);
 
-  // 挂载时主动向后端拉取当前视图：新建 tab 时后端可能在组件挂载前就 emit 了初始行，
-  // 该事件会被错过；这里兜底拉取一次，保证首次打开即显示日志正文。
+  // 挂载时主动向后端拉取当前视图与总行数：新建 tab 时后端可能在组件挂载前
+  // 就 emit 了初始行，该事件会被错过；这里兜底拉取一次，保证首次打开即显示。
   useEffect(() => {
     let cancelled = false;
     invoke<LogLine[]>("get_lines", { tabId })
       .then((view) => {
-        if (!cancelled) {
+        if (cancelled) {
+          return;
+        }
+        if (filterActiveRef.current) {
           setLines(clampFrontLines(view));
-          setStatus(`已打开，共 ${view.length} 行`);
+        } else {
+          setSegments((prev) => mergeSegments(prev, view));
         }
       })
-      .catch((e) => {
-        if (!cancelled) {
-          setStatus(`加载失败: ${e}`);
+      .catch(() => {
+        /* 静默失败：视图由 log-lines 事件兜底 */
+      });
+    invoke<number>("get_total_lines", { tabId })
+      .then((n) => {
+        if (!cancelled && Number.isFinite(n)) {
+          setTotalLines(n);
         }
+      })
+      .catch(() => {
+        /* 忽略：总行数也可由 log-lines 事件携带 */
       });
     return () => {
       cancelled = true;
@@ -247,13 +959,83 @@ function LogTab({ tabId, path, active, onClose }: {
 
   // 尾部跟随。
   useEffect(() => {
-    if (followTail && lines.length > 0) {
+    // 历史 prepend 引起的行数变化不触发跟随（由 loadMoreHistory 的锚定接管）。
+    const hasContent = filterActiveRef.current ? lines.length > 0 : (totalLines ?? 0) > 0;
+    if (followTail && hasContent && !suppressFollowRef.current) {
       const raf = requestAnimationFrame(() => {
         virtualizer.scrollToEnd();
+        if (!filterActiveRef.current) {
+          ensureVisibleBlocks(); // 尾部块未加载时立即拉取
+        }
       });
       return () => cancelAnimationFrame(raf);
     }
-  }, [lines.length, followTail]);
+  }, [lines.length, totalLines, followTail, virtualizer, ensureVisibleBlocks]);
+
+  // 高亮指定行 1s（与追加行的淡出高亮机制一致）：
+  // 跳转/置顶/置底后高亮落点行，便于快速定位。
+  const flashLine = useCallback((offset: number | null | undefined) => {
+    if (offset == null) {
+      return;
+    }
+    setHighlightOffsets((prev) => {
+      const next = new Set(prev);
+      next.add(offset);
+      return next;
+    });
+    window.setTimeout(() => {
+      setHighlightOffsets((prev) => {
+        const next = new Set(prev);
+        next.delete(offset);
+        return next;
+      });
+    }, 1000);
+  }, []);
+
+  // 跳转定位：在 lines 替换**提交之后**执行（effect 时机保证新视图已在 DOM）。
+  // scrollToIndex 的 reconcile 只追「首次计算」的固定偏移，不会按 index 重算；
+  // 而视口上方行的首测补偿会持续微调 scrollTop。因此这里做收敛式重居中：
+  // 每次按当前实测位置重算居中偏移，偏差 >2px 则重写，居中即停（最多 6 次）。
+  // 用户滚动保护：程序写入后 120ms 内的 scroll 事件视为回读；其余视为用户
+  // 滚动，之后 500ms 内不再干预。
+  useEffect(() => {
+    if (!jumpRequest) {
+      return;
+    }
+    const { target } = jumpRequest;
+    const listCount = filterActiveRef.current ? lines.length : (totalLines ?? 0);
+    if (target >= 0 && target < listCount) {
+      const attemptRecenter = (left: number) => {
+        const el = listRef.current;
+        if (!el || left <= 0) {
+          return;
+        }
+        // 用户最近滚过 → 放弃干预。
+        if (Date.now() - lastUserScrollRef.current < 500) {
+          return;
+        }
+        const off = virtualizer.getOffsetForIndex(target, "center");
+        if (off && Math.abs(el.scrollTop - off[0]) <= 2) {
+          return; // 已精确居中，无需再动
+        }
+        lastProgrammaticWriteRef.current = Date.now();
+        virtualizer.scrollToIndex(target, { align: "center" });
+        window.setTimeout(() => attemptRecenter(left - 1), 250);
+      };
+      lastProgrammaticWriteRef.current = Date.now();
+      virtualizer.scrollToIndex(target, { align: "center" });
+      if (!filterActiveRef.current) {
+        ensureVisibleBlocks(); // 稀疏：目标块未加载时立即拉取
+      }
+      window.setTimeout(() => attemptRecenter(6), 250);
+      // 高亮落点行 1s（行渲染后自动套用 .highlight，移除时经 CSS 过渡淡出）。
+      const targetLine = filterActiveRef.current
+        ? lines[target]
+        : segLineAt(segmentsRef.current, target);
+      flashLine(targetLine?.file_offset);
+    }
+    setJumpRequest(null);
+  }, [jumpRequest, lines, virtualizer, flashLine, totalLines, ensureVisibleBlocks]);
 
   // tab 从隐藏变为显示时，重新测量虚拟滚动（display:none 期间尺寸为 0）。
   useEffect(() => {
@@ -270,7 +1052,8 @@ function LogTab({ tabId, path, active, onClose }: {
   const loadingHistoryRef = useRef(false);
 
   const loadMoreHistory = useCallback(async () => {
-    if (loadingHistoryRef.current || !hasMoreHistory) {
+    // 仅旧窗口模型（过滤态）使用向上历史加载；稀疏模型走 get_range 块加载。
+    if (filterActiveRef.current === false || loadingHistoryRef.current || !hasMoreHistory) {
       return;
     }
     loadingHistoryRef.current = true;
@@ -288,50 +1071,218 @@ function LogTab({ tabId, path, active, onClose }: {
       const oldScrollTop = listRef.current?.scrollTop ?? 0;
       const containerWidth = listRef.current?.clientWidth ?? 800;
       const newHeight = res.lines.reduce(
-        (sum, l) => sum + estimateRowHeight(l.text, wrapLines, containerWidth),
+        (sum, l) => sum + estimateRowHeight(l.text, wrapLines, containerWidth, metrics, lang),
         0
       );
+      suppressFollowRef.current = true; // 抑制本轮尾部跟随
       setLines((prev) => clampFrontLines([...res.lines, ...prev]));
       requestAnimationFrame(() => {
         if (listRef.current) {
+          lastProgrammaticWriteRef.current = Date.now();
           listRef.current.scrollTop = oldScrollTop + newHeight;
         }
+        // 注意：不调用 virtualizer.measure()——它会清空行高缓存，
+        // 而已渲染行的 ResizeObserver 不会因缓存清空重新触发，
+        // 导致这些行停留在估算高度（估算与实际折行有偏差时会出现重叠）。
+        // measurements 会随 count 变化自然重建，getItemKey(file_offset) 保证旧行缓存命中。
+        // 下一帧解除抑制（覆盖尾部跟随 effect 的执行窗口）。
+        requestAnimationFrame(() => {
+          suppressFollowRef.current = false;
+        });
       });
     } catch {
       // 静默失败：下次滚动到顶会重试。
     } finally {
       loadingHistoryRef.current = false;
     }
-  }, [tabId, hasMoreHistory, wrapLines]);
+  }, [tabId, hasMoreHistory, wrapLines, fontSize, lang]);
+
+  // ---- 滚轮：稀疏模型下按「文件行数」滚动，滚轮与滚动条严格成比例 ----
+  // 原生滚轮按固定像素走（~100px/格），而滚动条映射全文件（几百万像素），
+  // 两者天然脱节。这里接管滚轮：把 delta 换算成行数 × 平均行高，
+  // thumb 移动量 = 行数 / 总行数，与内容位置一一对应。
+  // 视口中心行已加载 → 3 行/格（精细阅读）；未加载 → 放大步长快速穿越占位区。
+  /** 最近一次用户主动滚动（滚轮/拖动）的时间戳：交互期间锚定纠正不介入。 */
+  const lastUserInputRef = useRef(0);
+  /** 空闲纠正定时器：交互停止 350ms 后强制一次提交，让布局效应在空闲时收敛锚点。 */
+  const idleCorrectTimerRef = useRef<number | null>(null);
+  const [, setCorrectionTick] = useState(0);
+  const scheduleIdleCorrection = useCallback(() => {
+    if (idleCorrectTimerRef.current != null) {
+      window.clearTimeout(idleCorrectTimerRef.current);
+    }
+    idleCorrectTimerRef.current = window.setTimeout(() => {
+      idleCorrectTimerRef.current = null;
+      setCorrectionTick((n) => n + 1); // 空闲后强制提交一次，触发布局效应重跑
+    }, 350);
+  }, []);
+  useEffect(() => {
+    return () => {
+      if (idleCorrectTimerRef.current != null) {
+        window.clearTimeout(idleCorrectTimerRef.current);
+      }
+    };
+  }, []);
+  const wheelScrollHandler = useCallback(
+    (e: WheelEvent) => {
+      if (filterActiveRef.current) {
+        return; // 旧窗口模型保持原生滚轮
+      }
+      // 横向滚动（不换行模式的水平平移）交给原生处理，不拦截。
+      if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+        return;
+      }
+      const el = listRef.current;
+      if (!el) {
+        return;
+      }
+      const totalLinesNow = totalLinesRef.current ?? 0;
+      const totalSize = virtualizer.getTotalSize();
+      if (totalLinesNow <= 0 || totalSize <= 0) {
+        return;
+      }
+      lastUserInputRef.current = Date.now(); // 用户正在交互：压制锚定纠正
+      scheduleIdleCorrection(); // 交互停止后补一次空闲纠正
+      const pxPerLine = totalSize / totalLinesNow;
+      const items = virtualizer.getVirtualItems();
+      const centerIdx = items.length > 0 ? items[Math.floor(items.length / 2)].index : 0;
+      const centerLoaded = segLineAt(segmentsRef.current, centerIdx) != null;
+      let linesPerNotch = centerLoaded
+        ? 3
+        : Math.min(200, Math.max(10, Math.round(totalLinesNow / 15_000)));
+      if (e.shiftKey || e.ctrlKey) {
+        // 按住 Shift/Ctrl：粗粒度快速翻越（~0.4% 文件/格）。
+        linesPerNotch = Math.max(linesPerNotch, Math.min(2000, Math.round(totalLinesNow / 250)));
+      }
+      // deltaMode: 0=像素, 1=行, 2=页 → 统一换算为「格」。
+      let notches = e.deltaY;
+      if (e.deltaMode === 0) {
+        notches = e.deltaY / 100;
+      } else if (e.deltaMode === 2) {
+        notches = e.deltaY * (el.clientHeight / 100);
+      }
+      e.preventDefault();
+      const delta = notches * linesPerNotch * pxPerLine;
+      // 自己写滚动位置：视为程序写入，避免与跳转重居中互相打架。
+      lastProgrammaticWriteRef.current = Date.now();
+      el.scrollTop = Math.max(0, Math.min(el.scrollTop + delta, el.scrollHeight - el.clientHeight));
+    },
+    [virtualizer, scheduleIdleCorrection]
+  );
+
+  // React 的 onWheel 在根容器上是 passive 监听，无法 preventDefault；
+  // 这里手动挂非 passive 原生监听。
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el) {
+      return;
+    }
+    el.addEventListener("wheel", wheelScrollHandler, { passive: false });
+    return () => el.removeEventListener("wheel", wheelScrollHandler);
+  }, [wheelScrollHandler]);
+
+  // ---- 滚动锚定：块加载使行高由占位估算变为实测后，总高会变化； ----
+  // 把「首可见行及其相对视口顶部的偏移」钉回原位，消除滚动条漂移与内容跳动。
+  const anchorRef = useRef<{ index: number; offset: number } | null>(null);
+  const lastTotalSizeRef = useRef(0);
+
+  /** 记录当前锚点（每次 scroll 事件调用；仅稀疏模型）。 */
+  const updateAnchor = useCallback(() => {
+    if (filterActiveRef.current) {
+      return;
+    }
+    const el = listRef.current;
+    if (!el) {
+      return;
+    }
+    const items = virtualizer.getVirtualItems();
+    if (items.length === 0) {
+      return;
+    }
+    const first = items[0];
+    anchorRef.current = { index: first.index, offset: first.start - el.scrollTop };
+  }, [virtualizer]);
+
+  // 提交后若总高变化且用户已停止交互：回写 scrollTop，让锚点行回到同一视口位置。
+  // 关键：用户正在滚轮/拖动期间绝不回写（否则和用户的手打架，thumb 被拽回、
+  // 滚轮被抵消）；空闲 350ms 后才做一次收敛式纠正。
+  useLayoutEffect(() => {
+    if (filterActiveRef.current || followTail) {
+      return;
+    }
+    if (Date.now() - lastUserInputRef.current < 350) {
+      return;
+    }
+    // 程序性滚动（跳转/置顶/置底/跟随）刚发生不久：不与其重居中打架。
+    if (Date.now() - lastProgrammaticWriteRef.current < 350) {
+      return;
+    }
+    const size = virtualizer.getTotalSize();
+    const prev = lastTotalSizeRef.current;
+    lastTotalSizeRef.current = size;
+    if (prev === 0 || Math.abs(size - prev) <= 0.5) {
+      return;
+    }
+    const el = listRef.current;
+    const anchor = anchorRef.current;
+    if (!el || !anchor) {
+      return;
+    }
+    const item = virtualizer.getVirtualItems().find((vi) => vi.index === anchor.index);
+    if (item) {
+      const want = item.start - anchor.offset;
+      if (Math.abs(el.scrollTop - want) > 1) {
+        lastProgrammaticWriteRef.current = Date.now();
+        el.scrollTop = want;
+      }
+    }
+  });
 
   const onListScroll = useCallback(() => {
-    const el = listRef.current;
-    if (el && el.scrollTop < 200) {
-      void loadMoreHistory();
+    if (window.__lvPerf) {
+      window.__lvPerf.scrollEvents++;
     }
-  }, [loadMoreHistory]);
+    const el = listRef.current;
+    if (el) {
+      // 程序写入后 120ms 内的 scroll 事件视为回读；其余视为用户滚动。
+      if (Date.now() - lastProgrammaticWriteRef.current > 120) {
+        lastUserScrollRef.current = Date.now();
+        // 用户主动滚动（thumb 拖动等）：记录交互时间，压制锚定纠正。
+        lastUserInputRef.current = Date.now();
+        scheduleIdleCorrection();
+      }
+      if (filterActiveRef.current) {
+        if (el.scrollTop < 200) {
+          void loadMoreHistory();
+        }
+      } else {
+        updateAnchor();
+        ensureVisibleBlocks();
+      }
+    }
+  }, [loadMoreHistory, ensureVisibleBlocks, updateAnchor, scheduleIdleCorrection]);
 
   const toggleWrapLines = useCallback((next: boolean) => {
+    // 先同步清空行高缓存，再切换 CSS：
+    // setWrapLines 触发 DOM 变化后，ResizeObserver 会用真实高度重新填充缓存。
+    // 若反过来（先切换、rAF 里再 measure），measure 会晚于 ResizeObserver 回调，
+    // 把刚测好的真实高度清掉且无新 resize 触发重测，行停留在估算值上 → 重叠。
+    virtualizer.measure();
     setWrapLines(next);
-    requestAnimationFrame(() => {
-      virtualizer.measure();
-    });
   }, [virtualizer]);
 
   const toggleAutoRefresh = useCallback(
     async (next: boolean) => {
       setAutoRefresh(next);
-      if (next) {
+      // 仅旧窗口模型（过滤态）需要恢复过滤；稀疏模型的事件本就全量。
+      if (next && filterActiveRef.current) {
         try {
           const keywords = tokenizeKeywordInput(keywordInput);
           const regex = regexInput.trim() || null;
           await invoke("set_filter", { tabId, keywords, regex, caseSensitive: false });
-          setStatus("已恢复自动刷新");
-        } catch (e) {
-          setStatus(`刷新失败: ${e}`);
+        } catch {
+          /* 静默失败 */
         }
-      } else {
-        setStatus("已暂停自动刷新");
       }
     },
     [tabId, keywordInput, regexInput]
@@ -340,12 +1291,51 @@ function LogTab({ tabId, path, active, onClose }: {
   const applyFilter = useCallback(async () => {
     const keywords = tokenizeKeywordInput(keywordInput);
     const regex = regexInput.trim() || null;
-    try {
-      await invoke("set_filter", { tabId, keywords, regex, caseSensitive: false });
-    } catch (e) {
-      setStatus(`过滤失败: ${e}`);
+    const hasSpec = keywords.length > 0 || regex != null;
+    if (!hasSpec && !filterActiveRef.current) {
+      return; // 稀疏且无过滤条件：无需操作
     }
-  }, [tabId, keywordInput, regexInput]);
+    try {
+      if (!hasSpec) {
+        // 清空过滤：回到稀疏模型，锚定在当前视口位置（保持阅读位置）。
+        const items = virtualizer.getVirtualItems();
+        const first = items.length > 0 ? lines[items[0].index] : undefined;
+        const anchorLine = first?.file_line ?? 1;
+        await invoke("set_filter", { tabId, keywords, regex, caseSensitive: false });
+        setFilterActive(false);
+        setSegments(new Map());
+        setJumpRequest({ target: Math.max(0, anchorLine - 1) });
+      } else if (!filterActiveRef.current) {
+        // 稀疏 → 旧窗口：先按当前锚点物化跳转窗口（后端 all_lines），再应用过滤。
+        const items = virtualizer.getVirtualItems();
+        const anchor = items.length > 0 ? items[0].index + 1 : 1;
+        const j = await invoke<JumpPayload>("jump_to_line", { tabId, lineNo: anchor });
+        const matched = await invoke<LogLine[]>("set_filter", {
+          tabId,
+          keywords,
+          regex,
+          caseSensitive: false,
+        });
+        setLines(clampFrontLines(matched));
+        setHasMoreHistory(j.has_more);
+        setFilterActive(true);
+        setFollowTail(false);
+        const targetIdx = matched.findIndex((l) => l.file_line >= anchor);
+        setJumpRequest({ target: targetIdx >= 0 ? targetIdx : Math.max(matched.length - 1, 0) });
+      } else {
+        // 旧窗口模型内更新过滤：返回值即重扫结果（log-lines reset 事件与之等价）。
+        const matched = await invoke<LogLine[]>("set_filter", {
+          tabId,
+          keywords,
+          regex,
+          caseSensitive: false,
+        });
+        setLines(clampFrontLines(matched));
+      }
+    } catch {
+      /* 静默失败 */
+    }
+  }, [tabId, keywordInput, regexInput, lines, virtualizer]);
 
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") {
@@ -353,45 +1343,181 @@ function LogTab({ tabId, path, active, onClose }: {
     }
   };
 
+  // 跳转执行：lineNo 为文件行号（1-based；0 = 最后一行）。
+  // 后端定位并加载窗口，整体替换视图；过滤条件继续生效，
+  // 向上滚动仍可加载更早历史。
+  const performJump = useCallback(
+    async (lineNo: number) => {
+      if (jumping) {
+        return;
+      }
+      setJumping(true);
+      try {
+        // 注意：Tauri 把 Rust 参数 snake_case 自动映射为 camelCase，
+        // line_no 对应 IPC 键 lineNo（其余命令同理：tab_id → tabId）。
+        const res = await invoke<JumpPayload>("jump_to_line", { tabId, lineNo });
+        // 先关闭尾部跟随：避免下一次追加把视图拉回尾部（与跳转的阅读场景兼容）。
+        setFollowTail(false);
+        setTotalLines(res.total_lines);
+        if (filterActiveRef.current) {
+          setLines(clampFrontLines(res.lines));
+          setHasMoreHistory(res.has_more);
+          const target = Math.min(
+            Math.max(res.target_index, 0),
+            Math.max(res.lines.length - 1, 0)
+          );
+          setJumpRequest({ target });
+        } else {
+          // 稀疏模型：窗口行合并进段缓存，目标定位用文件行号。
+          setSegments((prev) => mergeSegments(prev, res.lines));
+          const abs = (lineNo === 0 ? res.total_lines : lineNo) - 1;
+          setJumpRequest({ target: Math.max(0, Math.min(abs, Math.max(res.total_lines - 1, 0))) });
+        }
+      } catch {
+        /* 静默失败：跳转状态由视图是否变化体现 */
+      } finally {
+        setJumping(false);
+      }
+    },
+    [tabId, jumping]
+  );
+
+  // 输入框跳转：解析行号并调用 performJump。
+  const jumpToLine = useCallback(async () => {
+    const n = Number(jumpInput);
+    if (!Number.isInteger(n) || n < 1) {
+      return;
+    }
+    setJumpInput("");
+    void performJump(n);
+  }, [jumpInput, performJump]);
+
+  // 置顶：文件头已加载则直接滚动（保留已加载内容），否则跳转到第 1 行。
+  const gotoTop = useCallback(() => {
+    setFollowTail(false);
+    if (!filterActiveRef.current) {
+      // 稀疏：滚动条映射全文件，直接滚到第 0 行即可，块按需加载。
+      virtualizer.scrollToIndex(0, { align: "start" });
+      ensureVisibleBlocks();
+      flashLine(segLineAt(segmentsRef.current, 0)?.file_offset);
+      return;
+    }
+    if (lines[0]?.file_line === 1) {
+      virtualizer.scrollToIndex(0, { align: "start" });
+      flashLine(lines[0]?.file_offset);
+    } else {
+      void performJump(1);
+    }
+  }, [lines, virtualizer, performJump, flashLine, ensureVisibleBlocks]);
+
+  // 置底：已加载到文件尾则直接滚动并恢复跟随，否则跳转到最后一行。
+  const gotoBottom = useCallback(() => {
+    if (!filterActiveRef.current) {
+      // 稀疏：滚到文件末行，恢复尾部跟随。
+      setFollowTail(true);
+      virtualizer.scrollToEnd();
+      ensureVisibleBlocks();
+      return;
+    }
+    const last = lines[lines.length - 1];
+    if (totalLines != null && last && last.file_line === totalLines) {
+      setFollowTail(true);
+      virtualizer.scrollToEnd();
+      flashLine(last.file_offset);
+    } else {
+      void performJump(0).then(() => setFollowTail(true));
+    }
+  }, [lines, totalLines, virtualizer, performJump, flashLine, ensureVisibleBlocks]);
+
   // 复制一行文本到剪贴板。
   const copyLine = useCallback(async (text: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
-      setStatus("已复制该行");
-    } catch {
-      // fallback：旧 execCommand 方式。
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      document.body.removeChild(ta);
-      setStatus("已复制该行");
-    }
+    await copyTextToClipboard(text);
   }, []);
+
+  // 复制当前视图：旧窗口模型复制 lines（过滤后的已加载视图）；
+  // 稀疏模型复制段缓存中已加载的行（按文件行号顺序）。不带头行号。
+  const copyViewText = useCallback(async () => {
+    let text: string;
+    if (filterActiveRef.current) {
+      text = lines.map((l) => l.text).join("\n");
+    } else {
+      const blocks = [...segmentsRef.current.keys()].sort((a, b) => a - b);
+      const parts: string[] = [];
+      for (const b of blocks) {
+        const block = segmentsRef.current.get(b)!;
+        for (const l of block) {
+          if (l) {
+            parts.push(l.text);
+          }
+        }
+      }
+      text = parts.join("\n");
+    }
+    await copyTextToClipboard(text);
+    return text;
+  }, [lines]);
+
+  // 激活时向 App 注册复制函数（供右上角按钮调用）。
+  useEffect(() => {
+    if (active) {
+      registerCopy(tabId, copyViewText);
+      return () => registerCopy(tabId, null);
+    }
+  }, [active, tabId, copyViewText, registerCopy]);
+
+  // 激活时把文件总行数实时同步给 App（窗口右上角显示）。
+  useEffect(() => {
+    if (active) {
+      reportTotal(tabId, totalLines);
+      return () => reportTotal(tabId, null);
+    }
+  }, [active, tabId, totalLines, reportTotal]);
 
   return (
     <div className="tab-content">
       <div className="toolbar">
-        <span className="tab-path" title={path}>
-          {path || "（未打开文件）"}
+        <span className={`tab-path${openError ? " open-error" : ""}`} title={openError ?? path}>
+          {openError ? <span className="path-warn">⚠ </span> : null}
+          {path || t.pathPlaceholder}
         </span>
-        <button className="tab-close" onClick={onClose} title="关闭此 tab">
+        <button className="tab-close" onClick={onClose} title={t.closeTabToolbarTitle}>
           ✕
         </button>
         <span className="toolbar-spacer" />
         <label className="follow">
           <input type="checkbox" checked={followTail} onChange={(e) => setFollowTail(e.target.checked)} />
-          跟随尾部
+          {t.followTail}
         </label>
         <label className="follow">
           <input type="checkbox" checked={autoRefresh} onChange={(e) => toggleAutoRefresh(e.target.checked)} />
-          自动刷新
+          {t.autoRefresh}
         </label>
         <label className="follow">
           <input type="checkbox" checked={wrapLines} onChange={(e) => toggleWrapLines(e.target.checked)} />
-          自动换行
+          {t.wrapLines}
         </label>
+        <button onClick={gotoTop} title={t.gotoTopTitle}>
+          {t.gotoTop}
+        </button>
+        <button onClick={gotoBottom} title={t.gotoBottomTitle}>
+          {t.gotoBottom}
+        </button>
+        <input
+          className="jump"
+          value={jumpInput}
+          onChange={(e) => setJumpInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              void jumpToLine();
+            }
+          }}
+          placeholder={totalLines != null ? t.jumpPlaceholderRange(totalLines) : t.jumpPlaceholder}
+          inputMode="numeric"
+          title={t.jumpTitle}
+        />
+        <button onClick={() => void jumpToLine()} disabled={jumping} title={t.jumpTitle}>
+          {jumping ? "…" : t.jump}
+        </button>
       </div>
 
       <div className="filterbar">
@@ -400,24 +1526,27 @@ function LogTab({ tabId, path, active, onClose }: {
           value={keywordInput}
           onChange={(e) => setKeywordInput(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="关键词（含空格作为完整短语匹配）"
+          placeholder={t.keywordPlaceholder}
         />
         <input
           className="regex"
           value={regexInput}
           onChange={(e) => setRegexInput(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="正则（可选，多条件 OR 如 error|warn）"
+          placeholder={t.regexPlaceholder}
         />
         <input
           className="highlight"
           value={highlightInput}
           onChange={(e) => setHighlightInput(e.target.value)}
-          placeholder="高亮关键词（空格分隔多个，实时生效）"
+          placeholder={t.highlightPlaceholder}
         />
-        <button onClick={applyFilter}>过滤</button>
-        <span className="status">{status}</span>
-        <span className="count">{lines.length} 行</span>
+        <button onClick={applyFilter}>{t.applyFilter}</button>
+        <span className="count">
+          {totalLines != null
+            ? t.countLinesOfTotal(filterActive ? lines.length : segLoadedCount(segments), totalLines)
+            : t.countLines(lines.length)}
+        </span>
       </div>
 
       <div className={`list ${wrapLines ? "wrap" : "nowrap"}`} ref={listRef} onScroll={onListScroll}>
@@ -431,11 +1560,39 @@ function LogTab({ tabId, path, active, onClose }: {
           }}
         >
           {virtualizer.getVirtualItems().map((vi) => {
-            const line = lines[vi.index];
+            const line = filterActive ? lines[vi.index] : segLineAt(segments, vi.index);
+            if (!line) {
+              // 稀疏模型：未加载区域渲染占位行。行高显式固定为估算值
+              // （与 estimateSize 同源），实测不改变总高 → 滚动条稳定。
+              return (
+                <div
+                  key={vi.key}
+                  data-index={vi.index}
+                  ref={virtualizer.measureElement}
+                  className={`row placeholder ${wrapLines ? "wrap" : "nowrap"}`}
+                  style={{
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    width: wrapLines ? "100%" : "max-content",
+                    minWidth: "100%",
+                    height: `${placeholderHeight()}px`,
+                    overflow: "hidden",
+                    transform: `translateY(${vi.start}px)`,
+                  }}
+                >
+                  <span className="lineno">{vi.index + 1}</span>
+                  <span className="text">⋯</span>
+                </div>
+              );
+            }
             const highlighted = highlightOffsets.has(line.file_offset);
+            // 用截断后的显示文本渲染（与估算一致）；复制按钮仍复制完整原文。
+            const displayText = displayTextOf(line.text, lang);
+            const truncated = displayText !== line.text;
             const textParts = highlightMatcher
-              ? splitByMatcher(line.text, highlightMatcher)
-              : [line.text];
+              ? splitByMatcher(displayText, highlightMatcher)
+              : [displayText];
             return (
               <div
                 key={vi.key}
@@ -453,7 +1610,7 @@ function LogTab({ tabId, path, active, onClose }: {
               >
                 <button
                   className="copy-btn"
-                  title="复制此行"
+                  title={t.copyLineTitle}
                   onClick={(e) => {
                     e.stopPropagation();
                     void copyLine(line.text);
@@ -464,8 +1621,8 @@ function LogTab({ tabId, path, active, onClose }: {
                     <path d="M10.5 5.5V3.5a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2" stroke="currentColor" strokeWidth="1.2" fill="none" />
                   </svg>
                 </button>
-                <span className="lineno">{vi.index + 1}</span>
-                <span className="text">
+                <span className="lineno">{line.file_line ?? vi.index + 1}</span>
+                <span className={`text${truncated ? " truncated" : ""}`}>
                   {textParts.map((part, i) =>
                     typeof part === "string" ? (
                       <span key={i}>{part}</span>
@@ -488,28 +1645,209 @@ export default function App() {
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [opening, setOpening] = useState(false);
 
+  // ---- 文件记忆：保存当前标签页（在恢复完成前不写入，避免空列表覆盖存档） ----
+  const restoredRef = useRef(false);
+
+  // 保存：任何标签变化（打开/关闭/切换激活）都写入 localStorage。
+  useEffect(() => {
+    if (!restoredRef.current) {
+      return;
+    }
+    try {
+      localStorage.setItem(
+        "lv-tabs",
+        JSON.stringify({
+          paths: tabs.map((t) => t.path),
+          active: tabs.findIndex((t) => t.id === activeTabId),
+        })
+      );
+    } catch {
+      /* localStorage 不可用时静默 */
+    }
+  }, [tabs, activeTabId]);
+
+  // 恢复：挂载时读上次会话，重建标签页并重新打开文件。
+  useEffect(() => {
+    const saved = readSavedTabs();
+    restoredRef.current = true; // 先标记完成，避免后续保存被跳过
+    if (!saved || saved.paths.length === 0) {
+      return;
+    }
+    const list: TabInfo[] = saved.paths.map((p) => {
+      const id = nextTabId();
+      return { id, title: p.split(/[\\/]/).pop() || p, path: p };
+    });
+    setTabs(list);
+    setActiveTabId(list[saved.active]?.id ?? list[list.length - 1]?.id ?? null);
+    for (const t of list) {
+      // 逐个打开；文件已删除等失败情况记录到 tab，界面显示 ⚠ 提示。
+      void invoke("open_log_file", { tabId: t.id, path: t.path }).catch((e) => {
+        setTabs((prev) =>
+          prev.map((x) => (x.id === t.id ? { ...x, openError: String(e) } : x))
+        );
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 主题（dark/light），持久化到 localStorage。
+  const [theme, setTheme] = useState<"dark" | "light">(() => {
+    try {
+      return localStorage.getItem("lv-theme") === "light" ? "light" : "dark";
+    } catch {
+      return "dark";
+    }
+  });
+
+  // 日志字体大小（10–20px），持久化。
+  const [fontSize, setFontSize] = useState(() => {
+    try {
+      const v = Number(localStorage.getItem("lv-fontsize"));
+      return v >= 10 && v <= 20 ? v : 12;
+    } catch {
+      return 12;
+    }
+  });
+
+  // 界面语言（zh/en），持久化；默认中文。
+  const [lang, setLang] = useState<Lang>(() => {
+    try {
+      return localStorage.getItem("lv-lang") === "en" ? "en" : "zh";
+    } catch {
+      return "zh";
+    }
+  });
+
+  const appT = MESSAGES[lang];
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    try {
+      localStorage.setItem("lv-theme", theme);
+    } catch {
+      /* ignore */
+    }
+  }, [theme]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("lv-fontsize", String(fontSize));
+    } catch {
+      /* ignore */
+    }
+  }, [fontSize]);
+
+  useEffect(() => {
+    document.documentElement.lang = lang;
+    try {
+      localStorage.setItem("lv-lang", lang);
+    } catch {
+      /* ignore */
+    }
+  }, [lang]);
+
+  const toggleTheme = useCallback(() => {
+    setTheme((t) => (t === "dark" ? "light" : "dark"));
+  }, []);
+
+  const toggleLang = useCallback(() => {
+    setLang((l) => (l === "zh" ? "en" : "zh"));
+  }, []);
+
+  const changeFontSize = useCallback((delta: number) => {
+    setFontSize((f) => Math.min(20, Math.max(10, f + delta)));
+  }, []);
+
+  // ---- 右上角「复制当前视图」按钮 ----
+  // 活动 tab 通过 registerCopy 注册自己的复制函数；
+  // 注销时仅清除「仍指向本 tab」的注册，避免切换 tab 时误清新 tab 的注册。
+  const copyViewRef = useRef<{ tabId: string; fn: () => Promise<string> } | null>(null);
+  const [copyReady, setCopyReady] = useState(false);
+  const [copyFeedback, setCopyFeedback] = useState<"idle" | "ok" | "err">("idle");
+
+  const registerCopy = useCallback(
+    (tabId: string, fn: (() => Promise<string>) | null) => {
+      if (fn) {
+        copyViewRef.current = { tabId, fn };
+      } else if (copyViewRef.current?.tabId === tabId) {
+        copyViewRef.current = null;
+      }
+      setCopyReady(copyViewRef.current != null);
+    },
+    []
+  );
+
+  // ---- 右上角「文件总行数」显示 ----
+  // 活动 tab 通过 reportTotal 实时上报；注销时仅清除「仍指向本 tab」的上报。
+  const [activeTotal, setActiveTotal] = useState<number | null>(null);
+  const totalTabRef = useRef<string | null>(null);
+  const reportTotal = useCallback((tabId: string, total: number | null) => {
+    if (total != null) {
+      totalTabRef.current = tabId;
+      setActiveTotal(total);
+    } else if (totalTabRef.current === tabId) {
+      totalTabRef.current = null;
+      setActiveTotal(null);
+    }
+  }, []);
+
+  const handleCopyView = useCallback(async () => {
+    const reg = copyViewRef.current;
+    if (!reg) {
+      return;
+    }
+    try {
+      await reg.fn();
+      setCopyFeedback("ok");
+    } catch {
+      setCopyFeedback("err");
+    }
+    window.setTimeout(() => setCopyFeedback("idle"), 1200);
+  }, []);
+
   // 打开新文件：新建一个 tab。
+  /** 打开指定路径（对话框选中后 / 自动化钩子 / 会话恢复共用）。 */
+  const openPath = useCallback(async (selected: string) => {
+    const id = nextTabId();
+    const name = selected.split(/[\\/]/).pop() || selected;
+    // 先建 tab，再让后端打开文件。
+    setTabs((prev) => [...prev, { id, title: name, path: selected }]);
+    setActiveTabId(id);
+    try {
+      await invoke("open_log_file", { tabId: id, path: selected });
+    } catch (e) {
+      // 打开失败：错误标记到该 tab（工具栏显示 ⚠，悬停看原因）。
+      setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, openError: String(e) } : t)));
+    }
+  }, []);
+
   const handleOpen = useCallback(async () => {
     setOpening(true);
     try {
       const selected = await open({
         multiple: false,
-        filters: [{ name: "日志文件", extensions: ["log", "txt", "*"] }],
+        filters: [{ name: appT.openDialogName, extensions: ["log", "txt", "*"] }],
       });
       if (typeof selected === "string") {
-        const id = nextTabId();
-        const name = selected.split(/[\\/]/).pop() || selected;
-        // 先建 tab，再让后端打开文件。
-        setTabs((prev) => [...prev, { id, title: name, path: selected }]);
-        setActiveTabId(id);
-        await invoke("open_log_file", { tabId: id, path: selected });
+        await openPath(selected);
       }
     } catch (e) {
-      console.error("打开失败", e);
+      console.error(appT.openFailed, e);
     } finally {
       setOpening(false);
     }
-  }, []);
+  }, [appT, openPath]);
+
+  // 自动化/调试钩子：绕过系统文件对话框直接打开文件（供 E2E 测试驱动 UI）。
+  useEffect(() => {
+    const w = window as unknown as { __lvOpenPath?: (path: string) => void };
+    w.__lvOpenPath = (path: string) => {
+      void openPath(path);
+    };
+    return () => {
+      delete w.__lvOpenPath;
+    };
+  }, [openPath]);
 
   const closeTab = useCallback(
     (id: string) => {
@@ -526,7 +1864,10 @@ export default function App() {
   );
 
   return (
-    <div className="logviewer">
+    <div
+      className="loglens"
+      style={{ "--log-font-size": `${fontSize}px` } as React.CSSProperties}
+    >
       <div className="tabbar">
         <div className="tabs">
           {tabs.map((t) => (
@@ -542,14 +1883,81 @@ export default function App() {
                   e.stopPropagation();
                   closeTab(t.id);
                 }}
-                title="关闭 tab"
+                title={appT.closeTabTitle}
               >
                 ✕
               </button>
             </div>
           ))}
-          <button className="tab-add" onClick={handleOpen} disabled={opening} title="打开新日志文件">
-            {opening ? "…" : "+ 打开日志"}
+          <button className="tab-add" onClick={handleOpen} disabled={opening} title={appT.openTabTitle}>
+            {opening ? "…" : appT.openTab}
+          </button>
+        </div>
+        <div className="tabbar-right">
+          <span className="total-lines" title={appT.totalLinesTitle}>
+            {activeTotal != null ? appT.countLines(activeTotal) : ""}
+          </span>
+          <button
+            className="icon-btn"
+            onClick={() => changeFontSize(-1)}
+            title={appT.fontSizeSmaller}
+            disabled={fontSize <= 10}
+          >
+            A-
+          </button>
+          <span className="font-label">{fontSize}px</span>
+          <button
+            className="icon-btn"
+            onClick={() => changeFontSize(1)}
+            title={appT.fontSizeBigger}
+            disabled={fontSize >= 20}
+          >
+            A+
+          </button>
+          <button
+            className="icon-btn copy-view"
+            onClick={() => void handleCopyView()}
+            disabled={!copyReady}
+            title={
+              copyFeedback === "ok"
+                ? appT.copyViewOk
+                : copyFeedback === "err"
+                  ? appT.copyViewErr
+                  : appT.copyViewTitle
+            }
+          >
+            {copyFeedback === "ok" ? (
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                <path d="M2.5 8.5L6 12L13.5 4" stroke="currentColor" strokeWidth="1.6" />
+              </svg>
+            ) : copyFeedback === "err" ? (
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                <path d="M8 3V9" stroke="currentColor" strokeWidth="1.6" />
+                <circle cx="8" cy="12" r="1" fill="currentColor" />
+              </svg>
+            ) : (
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                <rect x="5.5" y="5.5" width="9" height="9" rx="1" stroke="currentColor" strokeWidth="1.2" />
+                <path d="M10.5 5.5V3.5a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2" stroke="currentColor" strokeWidth="1.2" fill="none" />
+              </svg>
+            )}
+          </button>
+          <button
+            className="icon-btn lang-toggle"
+            onClick={toggleLang}
+            title={appT.switchLangTitle(lang)}
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+              <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="1.2" />
+              <path d="M2 8h12M8 2c-4.5 3-4.5 9 0 12M8 2c4.5 3 4.5 9 0 12" stroke="currentColor" strokeWidth="1.2" />
+            </svg>
+          </button>
+          <button
+            className="icon-btn"
+            onClick={toggleTheme}
+            title={theme === "dark" ? appT.switchToLight : appT.switchToDark}
+          >
+            {theme === "dark" ? "☀" : "☾"}
           </button>
         </div>
       </div>
@@ -565,17 +1973,22 @@ export default function App() {
               <LogTab
                 tabId={t.id}
                 path={t.path}
+                openError={t.openError}
                 active={t.id === activeTabId}
+                fontSize={fontSize}
+                lang={lang}
                 onClose={() => closeTab(t.id)}
+                registerCopy={registerCopy}
+                reportTotal={reportTotal}
               />
             </div>
           ))}
         </>
       ) : (
         <div className="empty">
-          <p>未打开任何日志文件</p>
+          <p>{appT.noFileOpened}</p>
           <button className="open-first" onClick={handleOpen} disabled={opening}>
-            {opening ? "打开中…" : "打开日志文件"}
+            {opening ? appT.opening : appT.openFirst}
           </button>
         </div>
       )}

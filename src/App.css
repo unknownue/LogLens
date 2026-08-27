@@ -1,8 +1,57 @@
+/* ===== 主题变量（dark 默认 / light 覆盖） ===== */
+:root {
+  --bg: #1e1e1e;
+  --bg-bar: #252526;
+  --bg-hover: #2a2a2a;
+  --border: #333333;
+  --border-light: #3c3c3c;
+  --text: #d4d4d4;
+  --text-bright: #ffffff;
+  --text-dim: #888888;
+  --text-faint: #cccccc;
+  --text-muted: #bbbbbb;
+  --path: #9cdcfe;
+  --accent: #0e639c;
+  --accent-hover: #1177bb;
+  --accent-soft: #8ab4f8;
+  --status: #6a9955;
+  --row-border: #252525;
+  --row-hover: #2a2a2a;
+  --row-highlight: #3a3520;
+  --row-highlight-hover: #4a4328;
+  --lineno: #858585;
+  /* 日志字体大小（App 内联覆盖） */
+  --log-font-size: 12px;
+}
+
+:root[data-theme="light"] {
+  --bg: #ffffff;
+  --bg-bar: #f0f0f0;
+  --bg-hover: #e6e6e6;
+  --border: #d5d5d5;
+  --border-light: #c9c9c9;
+  --text: #1a1a1a;
+  --text-bright: #000000;
+  --text-dim: #6e6e6e;
+  --text-faint: #444444;
+  --text-muted: #555555;
+  --path: #005f9e;
+  --accent: #0e639c;
+  --accent-hover: #1177bb;
+  --accent-soft: #0b6bb8;
+  --status: #3a7d44;
+  --row-border: #ececec;
+  --row-hover: #f2f2f2;
+  --row-highlight: #fff3c4;
+  --row-highlight-hover: #ffe9a0;
+  --lineno: #a0a0a0;
+}
+
 :root {
   font-family: "Consolas", "Cascadia Mono", "Courier New", monospace;
   line-height: 1.4;
-  color: #d4d4d4;
-  background-color: #1e1e1e;
+  color: var(--text);
+  background-color: var(--bg);
 }
 
 * {
@@ -18,19 +67,19 @@ body,
   width: 100%;
 }
 
-.logviewer {
+.loglens {
   display: flex;
   flex-direction: column;
   height: 100%;
-  background-color: #1e1e1e;
+  background-color: var(--bg);
 }
 
 /* ===== tab 栏 ===== */
 .tabbar {
   display: flex;
   align-items: stretch;
-  background-color: #252526;
-  border-bottom: 1px solid #333;
+  background-color: var(--bg-bar);
+  border-bottom: 1px solid var(--border);
   overflow-x: auto;
   overflow-y: hidden;
   flex-shrink: 0;
@@ -47,21 +96,21 @@ body,
   gap: 6px;
   padding: 6px 12px;
   cursor: pointer;
-  color: #bbb;
+  color: var(--text-muted);
   font-size: 12px;
-  border-right: 1px solid #333;
+  border-right: 1px solid var(--border);
   white-space: nowrap;
   user-select: none;
 }
 
 .tabbar .tab:hover {
-  background-color: #2a2a2a;
+  background-color: var(--bg-hover);
 }
 
 .tabbar .tab.active {
-  background-color: #1e1e1e;
-  color: #fff;
-  border-top: 2px solid #0e639c;
+  background-color: var(--bg);
+  color: var(--text-bright);
+  border-top: 2px solid var(--accent);
 }
 
 .tabbar .tab .tab-title {
@@ -73,7 +122,7 @@ body,
 .tabbar .tab-close {
   background: transparent;
   border: none;
-  color: #888;
+  color: var(--text-dim);
   cursor: pointer;
   font-size: 12px;
   padding: 0 2px;
@@ -81,13 +130,13 @@ body,
 }
 
 .tabbar .tab-close:hover {
-  color: #fff;
+  color: var(--text-bright);
 }
 
 .tabbar .tab-add {
   background: transparent;
   border: none;
-  color: #8ab4f8;
+  color: var(--accent-soft);
   cursor: pointer;
   font-size: 12px;
   padding: 6px 14px;
@@ -95,18 +144,73 @@ body,
 }
 
 .tabbar .tab-add:hover {
-  background-color: #2a2a2a;
+  background-color: var(--bg-hover);
 }
 
 .tabbar .tab-add:disabled {
-  color: #666;
+  color: var(--text-dim);
   cursor: default;
+}
+
+/* tab 栏右侧：主题切换 + 字体大小控制 */
+.tabbar .tabbar-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  flex-shrink: 0;
+}
+
+.tabbar .tabbar-right .icon-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 4px 6px;
+  border-radius: 3px;
+  line-height: 1;
+}
+
+.tabbar .tabbar-right .icon-btn:hover {
+  color: var(--text-bright);
+  background-color: var(--bg-hover);
+}
+
+.tabbar .tabbar-right .icon-btn:disabled {
+  color: var(--text-dim);
+  opacity: 0.4;
+  cursor: default;
+  background: transparent;
+}
+
+.tabbar .tabbar-right .font-label {
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 0 4px;
+  min-width: 24px;
+  text-align: center;
+  user-select: none;
+}
+
+/* 右上角：文件总行数（实时） */
+.tabbar .total-lines {
+  align-self: center;
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 0 8px;
+  white-space: nowrap;
+  user-select: none;
+  min-width: 32px;
+  text-align: right;
 }
 
 /* ===== tab 内容 ===== */
 .tab-panel {
   flex: 1;
   min-height: 0;
+  min-width: 0; /* 防止工具栏/过滤条的最小内容宽度把布局撑出窗口 */
   /* 默认由内联 style 控制 display：激活 tab 为 flex，非激活为 none（保留组件状态） */
 }
 
@@ -115,6 +219,7 @@ body,
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
 }
 
 .empty {
@@ -124,12 +229,12 @@ body,
   align-items: center;
   justify-content: center;
   gap: 16px;
-  color: #888;
+  color: var(--text-dim);
 }
 
 .empty .open-first {
   padding: 8px 20px;
-  background: #0e639c;
+  background: var(--accent);
   color: #fff;
   border: none;
   border-radius: 3px;
@@ -138,7 +243,7 @@ body,
 }
 
 .empty .open-first:hover {
-  background: #1177bb;
+  background: var(--accent-hover);
 }
 
 .toolbar {
@@ -146,44 +251,60 @@ body,
   align-items: center;
   gap: 8px;
   padding: 8px 12px;
-  background-color: #252526;
-  border-bottom: 1px solid #333;
+  background-color: var(--bg-bar);
+  border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
 
 .toolbar button {
   padding: 4px 12px;
-  background: #0e639c;
+  background: var(--accent);
   color: #fff;
   border: none;
   border-radius: 3px;
   cursor: pointer;
+  white-space: nowrap;
 }
 
 .toolbar button:hover {
-  background: #1177bb;
+  background: var(--accent-hover);
+}
+
+.toolbar button:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .toolbar .tab-path {
   flex: 1;
+  min-width: 0; /* 允许收缩到省略号，避免长路径把工具栏撑出窗口 */
   padding: 4px 8px;
-  color: #9cdcfe;
+  color: var(--path);
   font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+/* 打开失败（如恢复会话时文件已被删除）：路径前加警告标记 */
+.toolbar .tab-path .path-warn {
+  color: #e6b422;
+}
+.toolbar .tab-path.open-error {
+  color: var(--text-dim);
+  font-style: italic;
+}
+
 .toolbar .tab-close {
   background: transparent;
-  color: #888;
+  color: var(--text-dim);
   padding: 2px 6px;
   font-size: 12px;
 }
 
 .toolbar .tab-close:hover {
   background: transparent;
-  color: #fff;
+  color: var(--text-bright);
 }
 
 .toolbar .toolbar-spacer {
@@ -195,7 +316,7 @@ body,
   align-items: center;
   gap: 4px;
   font-size: 12px;
-  color: #ccc;
+  color: var(--text-faint);
   white-space: nowrap;
 }
 
@@ -204,19 +325,20 @@ body,
   align-items: center;
   gap: 8px;
   padding: 6px 12px;
-  background-color: #252526;
-  border-bottom: 1px solid #333;
+  background-color: var(--bg-bar);
+  border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
 
 .filterbar input {
   padding: 4px 8px;
-  background: #1e1e1e;
-  color: #d4d4d4;
-  border: 1px solid #3c3c3c;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border-light);
   border-radius: 3px;
   font-family: inherit;
   font-size: 12px;
+  min-width: 80px; /* 可收缩到 80px，避免三个输入框的最小尺寸把布局撑出窗口 */
 }
 
 .filterbar .keyword {
@@ -231,32 +353,52 @@ body,
   flex: 1;
 }
 
+/* 工具栏中的跳转行号输入框：固定宽度不参与弹性布局 */
+.toolbar .jump {
+  width: 104px;
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border-light);
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 12px;
+}
+
 .filterbar button {
   padding: 4px 12px;
-  background: #0e639c;
+  background: var(--accent);
   color: #fff;
   border: none;
   border-radius: 3px;
   cursor: pointer;
+  flex-shrink: 0;
+}
+
+.filterbar button:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .filterbar .status {
   font-size: 12px;
-  color: #6a9955;
+  color: var(--status);
   white-space: nowrap;
 }
 
 .filterbar .count {
   font-size: 12px;
-  color: #888;
+  color: var(--text-dim);
   white-space: nowrap;
 }
 
 .list {
   flex: 1;
+  min-width: 0;
   overflow: auto;
   position: relative;
-  background-color: #1e1e1e;
+  background-color: var(--bg);
 }
 
 /* 自动换行模式：不显示水平滚动条 */
@@ -276,9 +418,9 @@ body,
 .row {
   display: flex;
   align-items: flex-start;
-  font-size: 12px;
+  font-size: var(--log-font-size);
   font-family: "Consolas", "Cascadia Mono", "Courier New", monospace;
-  border-bottom: 1px solid #252525;
+  border-bottom: 1px solid var(--row-border);
   /* 高亮淡出的过渡（配合 .highlight 的移除） */
   transition: background-color 0.5s ease;
 }
@@ -300,16 +442,16 @@ body,
 }
 
 .row:hover {
-  background-color: #2a2a2a;
+  background-color: var(--row-hover);
 }
 
 /* 自动刷新新增行的高亮（约 1s 后 class 移除，背景经 transition 平滑淡出） */
 .row.highlight {
-  background-color: #3a3520;
+  background-color: var(--row-highlight);
 }
 
 .row.highlight:hover {
-  background-color: #4a4328;
+  background-color: var(--row-highlight-hover);
 }
 
 .row .copy-btn {
@@ -321,8 +463,8 @@ body,
   justify-content: center;
   padding: 0;
   border: none;
-  background-color: #1e1e1e;
-  color: #888;
+  background-color: var(--bg);
+  color: var(--text-dim);
   cursor: pointer;
   font-size: 12px;
   /* 默认隐藏，悬浮到行时显示 */
@@ -339,19 +481,19 @@ body,
 }
 
 .row .copy-btn:hover {
-  color: #fff;
+  color: var(--text-bright);
 }
 
 .row:hover .copy-btn {
-  background-color: #2a2a2a;
+  background-color: var(--row-hover);
 }
 
 .row.highlight .copy-btn {
-  background-color: #3a3520;
+  background-color: var(--row-highlight);
 }
 
 .row.highlight:hover .copy-btn {
-  background-color: #4a4328;
+  background-color: var(--row-highlight-hover);
 }
 
 .row .lineno {
@@ -359,31 +501,52 @@ body,
   width: 48px;
   padding-right: 8px;
   text-align: right;
-  color: #858585;
+  color: var(--lineno);
   user-select: none;
   /* 不换行模式水平滚动时，行号列固定在复制按钮右侧（实色背景遮挡滚动文本） */
   position: sticky;
   left: 18px;
-  background-color: #1e1e1e;
+  background-color: var(--bg);
 }
 
 .row:hover .lineno {
-  background-color: #2a2a2a;
+  background-color: var(--row-hover);
 }
 
 .row.highlight .lineno {
-  background-color: #3a3520;
+  background-color: var(--row-highlight);
 }
 
 .row.highlight:hover .lineno {
-  background-color: #4a4328;
+  background-color: var(--row-highlight-hover);
 }
 
 .row .text {
-  color: #d4d4d4;
+  color: var(--text);
 }
 
-/* 关键词高亮（正文中的 <mark>）：不同关键词循环使用 8 色调色板 */
+/* 稀疏虚拟列表：未加载区域的占位行（省略号提示，块到达后替换为真实行） */
+.row.placeholder {
+  opacity: 0.35;
+  cursor: default;
+}
+.row.placeholder:hover {
+  background-color: transparent;
+}
+.row.placeholder:hover .lineno {
+  background-color: var(--bg);
+}
+.row.placeholder .text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* 超长行截断提示样式 */
+.row .text.truncated {
+  font-style: italic;
+}
+
+/* 关键词高亮（正文中的 <mark>）：不同关键词循环使用 8 色调色板（两主题通用） */
 .row .text .kw-mark {
   color: #1e1e1e;
   border-radius: 2px;

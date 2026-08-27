@@ -1,17 +1,35 @@
 //! Tauri 后端入口：注册命令、初始化后台日志监控。
 
 mod filter;
+mod index;
 mod state;
 mod tail;
 
 use std::sync::Arc;
 
 use filter::FilterSpec;
-use state::{start_watching_for_session, AppState, LinesPayload};
+use state::{start_watching_for_session, AppState, JumpPayload, LinesPayload};
 use tail::LogLine;
 use tauri::Emitter;
+use tracing::instrument;
+
+/// 初始化 Tracy 采样：仅 `tracy` feature 且环境变量 `TRACY=1` 时启用。
+/// 平时为零开销（无 subscriber，所有 span 为空操作）。
+#[cfg(feature = "tracy")]
+fn init_tracy() {
+    if std::env::var("TRACY").map(|v| v == "1").unwrap_or(false) {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::Registry;
+        let subscriber = Registry::default().with(tracing_tracy::TracyLayer::default());
+        let _ = tracing::subscriber::set_global_default(subscriber);
+        eprintln!("[perf] Tracy 采样已启用（请先运行 Tracy capture server）");
+    }
+}
+#[cfg(not(feature = "tracy"))]
+fn init_tracy() {}
 
 /// 打开日志文件并开始 tail-follow（针对指定 tab）。
+#[instrument(skip(app, state), fields(tab_id = %tab_id, path = %path))]
 #[tauri::command]
 fn open_log_file(
     app: tauri::AppHandle,
@@ -48,9 +66,11 @@ fn set_filter(
         .get(&tab_id)
         .ok_or_else(|| format!("tab 不存在: {}", tab_id))?;
     let matched = session.apply_filter(spec);
+    let total_lines = session.ensure_total_lines().unwrap_or(0);
+    let avg_line_len = session.avg_line_len();
     let _ = app.emit(
         "log-lines",
-        LinesPayload { tab_id, lines: matched.clone(), reset: true },
+        LinesPayload { tab_id, lines: matched.clone(), reset: true, total_lines, avg_line_len },
     );
     Ok(matched)
 }
@@ -82,6 +102,7 @@ struct HistoryPayload {
 }
 
 /// 加载指定 tab 的更早历史行（前端滚动到顶部时调用）。
+#[instrument(skip(state), fields(tab_id = %tab_id, rows = rows))]
 #[tauri::command]
 fn load_history(
     state: tauri::State<'_, Arc<AppState>>,
@@ -92,27 +113,83 @@ fn load_history(
         .get(&tab_id)
         .ok_or_else(|| format!("tab 不存在: {}", tab_id))?;
 
-    let (history, has_more) = {
+    let (history, has_more, first_line_no) = {
         let mut rd = session.reader.lock();
         match rd.as_mut() {
             Some(r) => r
                 .load_history(rows)
                 .map_err(|e| format!("读取历史失败: {}", e))?,
-            None => (Vec::new(), false),
+            None => (Vec::new(), false, 0),
         }
     };
 
-    let matched = session.prepend_history(history);
+    let matched = session.prepend_history(history, first_line_no);
     Ok(HistoryPayload { lines: matched, has_more })
+}
+
+/// 按文件行号区间读取原始行（1-based `start_line` 起，至多 `count` 行）。
+/// 稀疏虚拟列表使用：滚动到未加载区域时按块加载，双向（向上/向下）均可，
+/// 使滚动条与全文件成比例、中段浏览只需一次请求。
+#[instrument(skip(state), fields(tab_id = %tab_id, start_line, count))]
+#[tauri::command]
+fn get_range(
+    state: tauri::State<'_, Arc<AppState>>,
+    tab_id: String,
+    start_line: u64,
+    count: u64,
+) -> Result<Vec<LogLine>, String> {
+    let session = state
+        .get(&tab_id)
+        .ok_or_else(|| format!("tab 不存在: {}", tab_id))?;
+    session.get_range(start_line, count)
+}
+
+/// 获取指定 tab 当前的文件总行数（懒计算并缓存；随追加实时增长）。
+#[instrument(skip(state), fields(tab_id = %tab_id))]
+#[tauri::command]
+fn get_total_lines(
+    state: tauri::State<'_, Arc<AppState>>,
+    tab_id: String,
+) -> Result<u64, String> {
+    let session = state
+        .get(&tab_id)
+        .ok_or_else(|| format!("tab 不存在: {}", tab_id))?;
+    session.ensure_total_lines()
+}
+
+/// 跳转到文件第 `line_no` 行（1-based）：加载其附近窗口并替换前端视图。
+/// 与现有功能兼容：过滤条件继续生效（返回过滤后的窗口）、向上滚动仍可
+/// 继续加载更早历史、尾部追加不受影响。
+#[instrument(skip(state), fields(tab_id = %tab_id, line = line_no))]
+#[tauri::command]
+fn jump_to_line(
+    state: tauri::State<'_, Arc<AppState>>,
+    tab_id: String,
+    line_no: u64,
+) -> Result<JumpPayload, String> {
+    let session = state
+        .get(&tab_id)
+        .ok_or_else(|| format!("tab 不存在: {}", tab_id))?;
+    session.jump_to_line(line_no)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    init_tracy();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(AppState::new()))
-        .invoke_handler(tauri::generate_handler![open_log_file, set_filter, close_tab, get_lines, load_history])
+        .invoke_handler(tauri::generate_handler![
+            open_log_file,
+            set_filter,
+            close_tab,
+            get_lines,
+            load_history,
+            get_range,
+            jump_to_line,
+            get_total_lines
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
