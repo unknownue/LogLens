@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -79,18 +79,31 @@ function parseHighlightKeywords(input: string): string[] {
 /** 高亮片段的两种类型：普通文本 | 命中关键词（携带关键词索引用于取色）。 */
 type HighlightPart = string | { kw: string; colorIndex: number };
 
-/**
- * 把一行文本按多个关键词切分为高亮片段（大小写不敏感）。
- * 返回数组：普通文本为 string，命中关键词为 { kw, colorIndex } 对象。
- */
-function splitByKeywords(text: string, keywords: string[]): HighlightPart[] {
+/** 预编译的高亮器：正则 + 小写关键词表（避免每行渲染时重复构建正则）。 */
+interface HighlightMatcher {
+  re: RegExp;
+  lowerKeywords: string[];
+}
+
+/** 由关键词列表构建高亮匹配器（大小写不敏感）。 */
+function buildHighlightMatcher(keywords: string[]): HighlightMatcher | null {
   if (keywords.length === 0) {
-    return [text];
+    return null;
   }
   const escaped = keywords.map(escapeRegex);
-  const re = new RegExp(`(${escaped.join("|")})`, "gi");
-  const parts = text.split(re);
-  const lowerKeywords = keywords.map((k) => k.toLowerCase());
+  return {
+    re: new RegExp(`(${escaped.join("|")})`, "gi"),
+    lowerKeywords: keywords.map((k) => k.toLowerCase()),
+  };
+}
+
+/**
+ * 用预编译的高亮匹配器把一行文本切分为高亮片段。
+ * 返回数组：普通文本为 string，命中关键词为 { kw, colorIndex } 对象。
+ */
+function splitByMatcher(text: string, matcher: HighlightMatcher): HighlightPart[] {
+  const parts = text.split(matcher.re);
+  const { lowerKeywords } = matcher;
   return parts.map((part) => {
     const lower = part.toLowerCase();
     const idx = lowerKeywords.findIndex((k) => k === lower);
@@ -111,6 +124,11 @@ function LogTab({ tabId, path, active, onClose }: {
   // 高亮关键词（输入框原始文本 + 解析后的列表，实时生效）。
   const [highlightInput, setHighlightInput] = useState("");
   const highlightKeywords = parseHighlightKeywords(highlightInput);
+  // 预编译高亮匹配器：只在关键词变化时重建正则（避免每行渲染重复 new RegExp）。
+  const highlightMatcher = useMemo(
+    () => buildHighlightMatcher(highlightKeywords),
+    [highlightInput]
+  );
   const [followTail, setFollowTail] = useState(true);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [wrapLines, setWrapLines] = useState(true);
@@ -142,6 +160,8 @@ function LogTab({ tabId, path, active, onClose }: {
     getItemKey: (index) => lines[index]?.file_offset ?? index,
     overscan: 30,
     measureElement: (el) => el.getBoundingClientRect().height,
+    // 用 rAF 批量合并 ResizeObserver 测量更新，减少滚动时的布局抖动。
+    useAnimationFrameWithResizeObserver: true,
   });
 
   // 只监听本 tab 的事件。
@@ -340,7 +360,9 @@ function LogTab({ tabId, path, active, onClose }: {
           {virtualizer.getVirtualItems().map((vi) => {
             const line = lines[vi.index];
             const highlighted = highlightOffsets.has(line.file_offset);
-            const textParts = splitByKeywords(line.text, highlightKeywords);
+            const textParts = highlightMatcher
+              ? splitByMatcher(line.text, highlightMatcher)
+              : [line.text];
             return (
               <div
                 key={vi.key}

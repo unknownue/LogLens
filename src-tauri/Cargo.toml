@@ -31,3 +31,11 @@ parking_lot = "0.12"
 [dev-dependencies]
 tempfile = "3"
 
+# release 编译优化：LTO + 单 codegen 单元提升运行时性能、strip 减小体积。
+# 代价：release 构建时间增加（一次性）。
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3
+

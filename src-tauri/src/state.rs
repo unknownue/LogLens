@@ -180,14 +180,21 @@ pub fn start_watching_for_session(app: AppHandle, tab_id: String, session: Arc<T
         let file_name = path.file_name().map(|s| s.to_os_string());
         let mut reader = reader;
 
-        // 事件驱动的增量读取 + 定时兜底轮询。
+        // 事件驱动的增量读取 + 定时兜底轮询 + emit 时间片合并。
+        // 100ms 为一个周期：期间累积的新行合并成一批 emit，
+        // 高频日志时大幅减少 IPC 事件次数与前端渲染频率。
+        const POLL_INTERVAL_MS: u64 = 100;
+        let mut pending_lines: Vec<LogLine> = Vec::new();
+        let mut pending_reset = false;
+        let mut last_flush = std::time::Instant::now();
+
         loop {
             // 关闭 tab：退出线程。
             if stop.load(Ordering::SeqCst) {
                 break;
             }
 
-            let event = rx.recv_timeout(std::time::Duration::from_millis(500));
+            let event = rx.recv_timeout(std::time::Duration::from_millis(POLL_INTERVAL_MS));
             match event {
                 Ok(Ok(ev)) => {
                     let relevant = ev.paths.iter().any(|p| {
@@ -211,10 +218,8 @@ pub fn start_watching_for_session(app: AppHandle, tab_id: String, session: Arc<T
                             eprintln!("[tail] reopen failed: {}", e);
                         } else {
                             session.clear();
-                            let _ = app.emit(
-                                "log-lines",
-                                LinesPayload { tab_id: tab_id.clone(), lines: Vec::new(), reset: true },
-                            );
+                            pending_lines.clear();
+                            pending_reset = true;
                         }
                     }
                 }
@@ -229,32 +234,39 @@ pub fn start_watching_for_session(app: AppHandle, tab_id: String, session: Arc<T
                 }
             }
 
-            // 统一 poll 一次。
+            // 统一 poll 一次，把增量累积到待发批次。
             match reader.poll() {
                 Ok(events) => {
-                    let mut matched = Vec::new();
-                    let mut reset = false;
                     for e in events {
                         match e {
                             TailEvent::Lines(lines) => {
-                                matched.extend(session.append_lines(lines));
+                                pending_lines.extend(session.append_lines(lines));
                             }
                             TailEvent::Reset => {
                                 session.clear();
-                                reset = true;
+                                pending_lines.clear();
+                                pending_reset = true;
                             }
                         }
-                    }
-                    if reset || !matched.is_empty() {
-                        let _ = app.emit(
-                            "log-lines",
-                            LinesPayload { tab_id: tab_id.clone(), lines: matched, reset },
-                        );
                     }
                 }
                 Err(e) => {
                     eprintln!("[tail] poll failed: {}", e);
                 }
+            }
+
+            // 到时间片则合并 flush 一批。
+            if (pending_reset || !pending_lines.is_empty())
+                && last_flush.elapsed() >= std::time::Duration::from_millis(POLL_INTERVAL_MS)
+            {
+                let payload = LinesPayload {
+                    tab_id: tab_id.clone(),
+                    lines: std::mem::take(&mut pending_lines),
+                    reset: pending_reset,
+                };
+                pending_reset = false;
+                last_flush = std::time::Instant::now();
+                let _ = app.emit("log-lines", payload);
             }
         }
     });
@@ -361,5 +373,40 @@ mod tests {
         s.apply_filter(spec);
         let view = s.current_view();
         assert_eq!(view.len(), 2);
+    }
+
+    /// 性能探针：10 万行的 apply_filter 重扫（含 clone）+ JSON 序列化成本。
+    #[test]
+    fn perf_probe_apply_filter_100k() {
+        use std::time::Instant;
+
+        let s = TabSession::new();
+        let mut all: Vec<String> = Vec::with_capacity(100_000);
+        for i in 0..100_000 {
+            all.push(format!(
+                "2026-01-01 12:00:00.000 [{}] [module{}] message id={} value={}",
+                ["INFO", "DEBUG", "WARN", "ERROR"][i % 4],
+                i % 20,
+                i,
+                i * 7
+            ));
+        }
+        s.append_lines(all);
+
+        // 重扫（含 clone 命中行）。
+        let spec = FilterSpec {
+            keywords: vec!["error".to_string()],
+            regex: None,
+            case_sensitive: false,
+        };
+        let t = Instant::now();
+        let matched = s.apply_filter(spec);
+        let el = t.elapsed();
+        eprintln!("[perf] apply_filter 100k (25k hits, incl clone): {:?}, hits={}", el, matched.len());
+
+        // JSON 序列化（emit 成本）。
+        let t2 = Instant::now();
+        let json = serde_json::to_string(&matched).unwrap();
+        eprintln!("[perf] serialize {} hits to JSON: {:?}, bytes={}", matched.len(), t2.elapsed(), json.len());
     }
 }
