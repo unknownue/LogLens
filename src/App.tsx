@@ -376,6 +376,16 @@ interface Messages {
   opening: string;
   pathPlaceholder: string;
   truncateMark: string;
+  viewBody: string;
+  viewBodyTitle: string;
+  noLineSelected: string;
+  viewBodyClose: string;
+  viewBodyCopy: string;
+  viewBodyCount: (n: number) => string;
+  viewBodySizeSmall: string;
+  viewBodySizeMedium: string;
+  viewBodySizeLarge: string;
+  viewBodySizeMax: string;
 }
 
 const MESSAGES: Record<Lang, Messages> = {
@@ -433,6 +443,16 @@ const MESSAGES: Record<Lang, Messages> = {
     opening: "打开中…",
     pathPlaceholder: "（未打开文件）",
     truncateMark: " …(行过长已截断，点左侧复制按钮获取全文)",
+    viewBody: "提取",
+    viewBodyTitle: "查看选中行的完整正文内容（点击行后或拖选多行文字后使用）",
+    noLineSelected: "请先点击选中一行，或拖选多行文字",
+    viewBodyClose: "关闭",
+    viewBodyCopy: "复制全文",
+    viewBodyCount: (n) => `共 ${n} 行`,
+    viewBodySizeSmall: "小",
+    viewBodySizeMedium: "中",
+    viewBodySizeLarge: "大",
+    viewBodySizeMax: "最大",
   },
   en: {
     notOpened: "No file opened",
@@ -488,6 +508,16 @@ const MESSAGES: Record<Lang, Messages> = {
     opening: "Opening…",
     pathPlaceholder: "(no file opened)",
     truncateMark: " …(line truncated; click the copy button for the full text)",
+    viewBody: "Extract",
+    viewBodyTitle: "View the full body of the selected line(s) (click a line or drag-select multiple)",
+    noLineSelected: "Click a line first, or drag-select multiple lines",
+    viewBodyClose: "Close",
+    viewBodyCopy: "Copy all",
+    viewBodyCount: (n) => `${n} lines`,
+    viewBodySizeSmall: "Small",
+    viewBodySizeMedium: "Medium",
+    viewBodySizeLarge: "Large",
+    viewBodySizeMax: "Max",
   },
 };
 
@@ -596,6 +626,26 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
   const autoRefreshRef = useRef(autoRefresh);
   autoRefreshRef.current = autoRefresh;
   const [highlightOffsets, setHighlightOffsets] = useState<Set<number>>(new Set());
+  // ---- 查看正文：记录最近一次点选的行，及模态框显示内容 ----
+  const [lastClickedLine, setLastClickedLine] = useState<LogLine | null>(null);
+  const [viewerLines, setViewerLines] = useState<LogLine[] | null>(null);
+  const [viewerFeedback, setViewerFeedback] = useState<"idle" | "ok" | "err">("idle");
+  // ---- 正文查看器模态框尺寸（可拖拽调整 / 预设按钮） ----
+  /** 默认宽度（相对窗口宽度，92% 上限 900px）。 */
+  const defaultModalWidth = () =>
+    Math.min(900, typeof window !== "undefined" ? window.innerWidth * 0.92 : 900);
+  /** 默认高度（相对窗口高度，80% 上限 720px）。 */
+  const defaultModalHeight = () =>
+    Math.min(720, typeof window !== "undefined" ? window.innerHeight * 0.8 : 720);
+  const [modalSize, setModalSize] = useState<{ width: number; height: number }>(() => ({
+    width: defaultModalWidth(),
+    height: defaultModalHeight(),
+  }));
+  const modalSizeRef = useRef(modalSize);
+  modalSizeRef.current = modalSize;
+  /** 模态框最小尺寸（防止拖到不可用）。 */
+  const MODAL_MIN_W = 360;
+  const MODAL_MIN_H = 200;
   // 标记「本轮 lines 增长来自历史 prepend」，期间抑制尾部跟随滚动。
   const suppressFollowRef = useRef(false);
   // 跳转定位的用户滚动保护：程序写入时间戳与最近一次用户滚动时间戳。
@@ -1618,6 +1668,172 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
     await copyTextToClipboard(text);
   }, []);
 
+  // 构建「按 file_offset → LogLine」的查找表：合并旧窗口模型 lines 与稀疏段缓存，
+  // 供选中行正文提取使用（稀疏模型下远离视口的块可能被淘汰，此时只能取已加载行）。
+  const loadedLinesById = useMemo(() => {
+    const map = new Map<number, LogLine>();
+    for (const l of lines) {
+      if (l != null && Number.isFinite(l.file_offset)) {
+        map.set(l.file_offset, l);
+      }
+    }
+    for (const block of segments.values()) {
+      for (const l of block) {
+        if (l != null && Number.isFinite(l.file_offset)) {
+          map.set(l.file_offset, l);
+        }
+      }
+    }
+    return map;
+  }, [lines, segments]);
+
+  // 记录最近一次「非折叠文字选区」所在的列表容器及其选中的 offset 集合。
+  // 点选「查看正文」按钮会转移焦点、可能清空 window.getSelection()，
+  // 因此用 selectionchange 实时把选区离线保存，点击时无需再读实时选区。
+  const lastSelectionRef = useRef<Set<number> | null>(null);
+  // 与 ref 同步的 state 镜像：驱动「查看正文」按钮的启用状态。
+  const [hasSelection, setHasSelection] = useState(false);
+  useEffect(() => {
+    const onSelChange = () => {
+      const sel = document.getSelection();
+      if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+        lastSelectionRef.current = null;
+        setHasSelection(false);
+        return;
+      }
+      const container = listRef.current;
+      if (!container) {
+        return;
+      }
+      const offsets = new Set<number>();
+      let contained = false;
+      for (let i = 0; i < sel.rangeCount; i++) {
+        const range = sel.getRangeAt(i);
+        if (!container.contains(range.commonAncestorContainer)) {
+          continue; // 选区不在日志列表内（如选中了输入框文字）
+        }
+        contained = true;
+        container.querySelectorAll<HTMLElement>("[data-offset]").forEach((el) => {
+          const off = Number(el.dataset.offset);
+          if (Number.isFinite(off) && range.intersectsNode(el)) {
+            offsets.add(off);
+          }
+        });
+      }
+      lastSelectionRef.current = contained ? offsets : null;
+      setHasSelection(contained && offsets.size > 0);
+    };
+    document.addEventListener("selectionchange", onSelChange);
+    return () => document.removeEventListener("selectionchange", onSelChange);
+  }, []);
+
+  // 打开正文查看模态框：优先取「最近一次拖选的多行选区」，否则取「最近一次点选的行」。
+  const openContentViewer = useCallback(() => {
+    const offsets = lastSelectionRef.current;
+    let selected: LogLine[] = [];
+
+    if (offsets && offsets.size > 0) {
+      selected = [...offsets]
+        .map((off) => loadedLinesById.get(off))
+        .filter((l): l is LogLine => l != null)
+        .sort((a, b) => a.file_offset - b.file_offset);
+    }
+    // 无有效多行选区 → 退回最近一次点选的行。
+    if (selected.length === 0 && lastClickedLine) {
+      // 优先取当前缓存中该 offset 的最新文本（如已重载）；失效则用点选快照。
+      selected = [loadedLinesById.get(lastClickedLine.file_offset) ?? lastClickedLine];
+    }
+
+    if (selected.length === 0) {
+      return; // 无选中行：静默（tooltip 已提示用法）
+    }
+    setViewerLines(selected);
+  }, [lastClickedLine, loadedLinesById]);
+
+  // 复制正文查看器当前显示的全文。
+  const copyViewerText = useCallback(async () => {
+    if (!viewerLines) {
+      return;
+    }
+    const text = viewerLines.map((l) => l.text).join("\n");
+    try {
+      await copyTextToClipboard(text);
+      setViewerFeedback("ok");
+    } catch {
+      setViewerFeedback("err");
+    }
+    window.setTimeout(() => setViewerFeedback("idle"), 1200);
+  }, [viewerLines]);
+
+  // 点击行：记为最近一次点选（单行查看正文的依据）。
+  const handleRowClick = useCallback((line: LogLine) => {
+    setLastClickedLine(line);
+  }, []);
+
+  // 关闭正文查看器。
+  const closeContentViewer = useCallback(() => {
+    setViewerLines(null);
+    setViewerFeedback("idle");
+    setModalSize({ width: defaultModalWidth(), height: defaultModalHeight() });
+  }, []);
+
+  // 预设尺寸按钮：快速设置模态框大小。
+  // presets: 'small' | 'medium' | 'large' 按默认宽度档位设置；'max' 把当前宽度翻倍。
+  const applyModalPreset = useCallback((preset: "small" | "medium" | "large" | "max") => {
+    const baseW = defaultModalWidth();
+    const baseH = defaultModalHeight();
+    let next: { width: number; height: number };
+    switch (preset) {
+      case "small":
+        next = { width: Math.round(baseW * 0.55), height: Math.round(baseH * 0.6) };
+        break;
+      case "medium":
+        next = { width: baseW, height: baseH };
+        break;
+      case "large":
+        next = { width: Math.round(baseW * 1.5), height: baseH };
+        break;
+      case "max":
+        // 宽度设为当前的 2 倍（高度不变）。
+        next = {
+          width: Math.round(modalSizeRef.current.width * 2),
+          height: modalSizeRef.current.height,
+        };
+        break;
+    }
+    setModalSize({
+      width: Math.max(MODAL_MIN_W, Math.min(next.width, window.innerWidth - 16)),
+      height: Math.max(MODAL_MIN_H, Math.min(next.height, window.innerHeight - 16)),
+    });
+  }, []);
+
+  // 模态框拖拽调整大小：把手（右下角/右边/下边）按下后跟踪指针移动更新尺寸。
+  const onModalResizeStart = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>, dirs: { x: 0 | 1 | -1; y: 0 | 1 | -1 }) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const startX = e.clientX;
+      const startY = e.clientY;
+      const startW = modalSizeRef.current.width;
+      const startH = modalSizeRef.current.height;
+      const onMove = (ev: PointerEvent) => {
+        const dw = (ev.clientX - startX) * dirs.x;
+        const dh = (ev.clientY - startY) * dirs.y;
+        setModalSize({
+          width: Math.round(Math.max(MODAL_MIN_W, startW + dw)),
+          height: Math.round(Math.max(MODAL_MIN_H, startH + dh)),
+        });
+      };
+      const onUp = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+    },
+    []
+  );
+
   // 复制当前视图：旧窗口模型复制 lines（过滤后的已加载视图）；
   // 稀疏模型复制段缓存中已加载的行（按文件行号顺序）。不带头行号。
   const copyViewText = useCallback(async () => {
@@ -1726,6 +1942,14 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
           placeholder={t.highlightPlaceholder}
         />
         <button onClick={applyFilter}>{t.applyFilter}</button>
+        <button
+          className="view-body-btn"
+          onClick={openContentViewer}
+          disabled={!lastClickedLine && !hasSelection}
+          title={t.viewBodyTitle}
+        >
+          {t.viewBody}
+        </button>
         <span className="count">
           {totalLines != null
             ? t.countLinesOfTotal(filterActive ? lines.length : segLoadedCount(segments), totalLines)
@@ -1784,8 +2008,10 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
               <div
                 key={vi.key}
                 data-index={vi.index}
+                data-offset={line.file_offset}
                 ref={virtualizer.measureElement}
                 className={`row ${wrapLines ? "wrap" : "nowrap"}${highlighted ? " highlight" : ""}`}
+                onClick={() => handleRowClick(line)}
                 style={{
                   position: "absolute",
                   top: 0,
@@ -1833,6 +2059,89 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
           </div>
         ) : null}
       </div>
+
+      {viewerLines ? (
+        <div className="body-modal-overlay" onClick={closeContentViewer}>
+          <div
+            className="body-modal"
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            style={{
+              width: Math.min(modalSize.width, window.innerWidth - 16),
+              height: Math.min(modalSize.height, window.innerHeight - 16),
+            }}
+          >
+            <div className="body-modal-header">
+              <span className="body-modal-title">{t.viewBody}</span>
+              <span className="body-modal-count">{t.viewBodyCount(viewerLines.length)}</span>
+              <span className="body-modal-spacer" />
+              <button
+                className="body-modal-btn body-modal-size-btn"
+                onClick={() => applyModalPreset("small")}
+                title={t.viewBodySizeSmall}
+              >
+                {t.viewBodySizeSmall}
+              </button>
+              <button
+                className="body-modal-btn body-modal-size-btn"
+                onClick={() => applyModalPreset("medium")}
+                title={t.viewBodySizeMedium}
+              >
+                {t.viewBodySizeMedium}
+              </button>
+              <button
+                className="body-modal-btn body-modal-size-btn"
+                onClick={() => applyModalPreset("large")}
+                title={t.viewBodySizeLarge}
+              >
+                {t.viewBodySizeLarge}
+              </button>
+              <button
+                className="body-modal-btn body-modal-size-btn"
+                onClick={() => applyModalPreset("max")}
+                title={t.viewBodySizeMax}
+              >
+                {t.viewBodySizeMax}
+              </button>
+              <button
+                className="body-modal-btn"
+                onClick={() => void copyViewerText()}
+                title={t.copyViewTitle}
+              >
+                {viewerFeedback === "ok"
+                  ? t.copyViewOk
+                  : viewerFeedback === "err"
+                    ? t.copyViewErr
+                    : t.viewBodyCopy}
+              </button>
+              <button className="body-modal-btn" onClick={closeContentViewer} title={t.viewBodyClose}>
+                {t.viewBodyClose}
+              </button>
+            </div>
+            <div className="body-modal-body">
+              {viewerLines.map((l) => (
+                <div className="body-modal-line" key={l.file_offset}>
+                  <span className="body-modal-lineno">{l.file_line}</span>
+                  <span className="body-modal-text">{l.text}</span>
+                </div>
+              ))}
+            </div>
+            <div
+              className="body-modal-resizer resizer-e"
+              onPointerDown={(e) => onModalResizeStart(e, { x: 1, y: 0 })}
+            />
+            <div
+              className="body-modal-resizer resizer-s"
+              onPointerDown={(e) => onModalResizeStart(e, { x: 0, y: 1 })}
+            />
+            <div
+              className="body-modal-resizer resizer-se"
+              onPointerDown={(e) => onModalResizeStart(e, { x: 1, y: 1 })}
+            />
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
