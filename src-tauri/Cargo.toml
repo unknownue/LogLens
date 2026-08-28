@@ -14,6 +14,12 @@ edition = "2021"
 name = "loglens_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# 可执行文件显示名改为 LogLens（Windows 资源管理器显示 LogLens.exe）。
+# Cargo package name 不允许大写，故用 [[bin]] 显式指定二进制名。
+[[bin]]
+name = "LogLens"
+path = "src/main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
