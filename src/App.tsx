@@ -1264,6 +1264,10 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
   // 自绘垂直滚动条 DOM refs（applyVirtualTop 需要同步 thumb 位置，故提前声明）。
   const trackRef = useRef<HTMLDivElement>(null);
   const thumbRef = useRef<HTMLDivElement>(null);
+  /** 滚动条交互进行中：期间拦截一切文字选区发起（selectstart 防线）。 */
+  const draggingScrollbarRef = useRef(false);
+  /** 列表包裹层 DOM：交互期间挂/摘 .dragging-scroll（子树整体禁选，见 App.css）。 */
+  const wrapRef = useRef<HTMLDivElement>(null);
 
   // thumb 顶部位置 = 行空间映射：thumb 比例 f ⇔ 视口首行行号 = f ×（总行数−1）。
   // 日志是行寻址内容，行空间映射让「thumb 在 50% = 看到第 50% 行」精确成立，
@@ -1388,6 +1392,19 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
     return () => el.removeEventListener("wheel", wheelScrollHandler);
   }, [wheelScrollHandler]);
 
+  // 滚动条交互期间的最后防线：selectstart 是 Chromium 发起文字选区的必经事件，
+  // 交互进行中一律取消。个别 WebView2 版本可能不遵守 pointerdown 取消 /
+  // 指针捕获对兼容鼠标事件的抑制，此监听保证拖动滚动条时正文行绝不会被多选。
+  useEffect(() => {
+    const onSelectStart = (e: Event) => {
+      if (draggingScrollbarRef.current) {
+        e.preventDefault();
+      }
+    };
+    document.addEventListener("selectstart", onSelectStart);
+    return () => document.removeEventListener("selectstart", onSelectStart);
+  }, []);
+
   // ---- 滚动锚定：块加载使行高由占位估算变为实测后，总高会变化； ----
   // 把「首可见行及其相对视口顶部的偏移」钉回原位，消除内容跳动。
   const anchorRef = useRef<{ index: number; offset: number } | null>(null);
@@ -1450,6 +1467,16 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
       if (!track || !el || e.button !== 0) {
         return;
       }
+      // 关键：取消 pointerdown 默认行为（发起文字选区/拖拽图像等）。
+      // 否则以 thumb 为锚点拖过正文时，浏览器会对正文行发起多选
+      // （selectionchange 监听器也会因此点亮「提取」按钮）。
+      e.preventDefault();
+      // 与原生滚动条一致：点按/拖动滚动条时收起已有的文字选区，
+      // 同时让 selectionchange 同步更新「提取」按钮状态。
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed) {
+        sel.removeAllRanges();
+      }
       const totalSize = virtualizer.getTotalSize();
       const maxScroll = Math.max(0, totalSize - el.clientHeight);
       if (maxScroll <= 0) {
@@ -1470,23 +1497,52 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
       const onThumb = (e.target as HTMLElement).classList.contains("vthumb");
       // 拖动/点跳 = 主动离开尾部：关闭跟随（置底按钮可恢复）。
       setFollowTail(false);
+      // 进入滚动条交互：给整个列表子树挂 .dragging-scroll
+      // （user-select:none !important），交互期间正文不存在可选中的锚点，
+      // 多选从根源上无法发起；直到 pointerup/pointercancel 才摘除。
+      draggingScrollbarRef.current = true;
+      wrapRef.current?.classList.add("dragging-scroll");
       if (onThumb) {
-        // 拖 thumb：thumb 中心跟随鼠标，内容按行空间映射联动。
-        const onMove = (ev: PointerEvent) => {
-          const f = Math.max(0, Math.min(1, (ev.clientY - trackTop - thumbH / 2) / travel));
-          applyVirtualTopRef.current(fToOffset(f), "user");
-          // thumb 直接按鼠标位置定位（行空间 roundtrip 的亚像素误差不反馈到手上）。
-          if (thumbRef.current) {
-            thumbRef.current.style.top = `${Math.round(f * travel)}px`;
-          }
-        };
-        const onUp = () => {
-          window.removeEventListener("pointermove", onMove);
-          window.removeEventListener("pointerup", onUp);
-        };
-        window.addEventListener("pointermove", onMove);
-        window.addEventListener("pointerup", onUp);
-      } else {
+        // 捕获指针：即使拖出窗口外松开，也能收到 pointerup，
+        // 避免 thumb 卡在「拖动态」（窗口级监听拿不到窗口外的事件）。
+        try {
+          (e.target as HTMLElement).setPointerCapture(e.pointerId);
+        } catch {
+          /* 捕获失败不影响拖动（窗口级 move/up 监听兜底） */
+        }
+      }
+      // 拖 thumb：thumb 中心跟随鼠标，内容按行空间映射联动。
+      const onMove = (ev: PointerEvent) => {
+        if (!onThumb) {
+          return;
+        }
+        const f = Math.max(0, Math.min(1, (ev.clientY - trackTop - thumbH / 2) / travel));
+        applyVirtualTopRef.current(fToOffset(f), "user");
+        // thumb 直接按鼠标位置定位（行空间 roundtrip 的亚像素误差不反馈到手上）。
+        if (thumbRef.current) {
+          thumbRef.current.style.top = `${Math.round(f * travel)}px`;
+        }
+        // 兜底：个别 WebView2 版本若仍在拖动中形成了选区，立即收起。
+        const selNow = document.getSelection();
+        if (selNow && !selNow.isCollapsed) {
+          selNow.removeAllRanges();
+        }
+      };
+      const onUp = (ev: PointerEvent) => {
+        const th = thumbRef.current;
+        if (th && th.hasPointerCapture(ev.pointerId)) {
+          th.releasePointerCapture(ev.pointerId);
+        }
+        draggingScrollbarRef.current = false;
+        wrapRef.current?.classList.remove("dragging-scroll");
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("pointercancel", onUp);
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onUp);
+      if (!onThumb) {
         // 点轨道：把 thumb 中心定位到点击处（按行空间绝对跳转）。
         const clickY = e.clientY - trackTop;
         const f = Math.max(0, Math.min(1, (clickY - thumbH / 2) / travel));
@@ -1957,7 +2013,7 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
         </span>
       </div>
 
-      <div className="list-wrap">
+      <div className="list-wrap" ref={wrapRef}>
         <div className={`list ${wrapLines ? "wrap" : "nowrap"}`} ref={listRef}>
           <div
             className="list-inner"
@@ -2050,7 +2106,14 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
           </div>
         </div>
         {maxScrollUi > 0 ? (
-          <div className="vscrollbar" ref={trackRef} onPointerDown={onVScrollbarPointerDown}>
+          <div
+            className="vscrollbar"
+            ref={trackRef}
+            onPointerDown={onVScrollbarPointerDown}
+            // 兼容鼠标事件层再取消一次 mousedown 默认行为（含发起文字选区），
+            // 防住不遵守 pointerdown 取消抑制的旧 WebView2 版本。
+            onMouseDown={(e) => e.preventDefault()}
+          >
             <div
               className="vthumb"
               ref={thumbRef}

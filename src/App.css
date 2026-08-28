@@ -402,6 +402,16 @@ body,
   display: flex;
 }
 
+/* 滚动条交互期间（pointerdown → pointerup/cancel）由 JS 挂上的临时 class：
+   整个列表子树强制不可选中。只要按下滚动条，正文就不存在任何可选中的锚点，
+   从根源上杜绝拖动过程中浏览器对正文行发起多选（兜住不遵守 pointerdown
+   取消 / 指针捕获的旧 WebView2 版本）。 */
+.list-wrap.dragging-scroll,
+.list-wrap.dragging-scroll * {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+
 .list {
   flex: 1;
   min-width: 0;
@@ -433,6 +443,10 @@ body,
   background: color-mix(in srgb, var(--bg-bar) 72%, transparent);
   border-left: 1px solid var(--border);
   z-index: 5;
+  /* 关键：滚动条区域不可选中。否则拖动 thumb 时浏览器会以 thumb 为锚点
+     （DOM 中位于 .list 之后），命中测试吸附到最近的正文文本 → 整屏行被多选。 */
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .vthumb {
@@ -442,6 +456,10 @@ body,
   border-radius: 5px;
   background: var(--border-light);
   cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+  /* 触屏拖动 thumb 时不让浏览器把手势抢去做页面平移/选区 */
+  touch-action: none;
 }
 
 .vthumb:hover {
