@@ -106,6 +106,15 @@ impl TabSession {
         self.idx().lock().avg_line_len()
     }
 
+    /// 每个稀疏块（`block_lines` 行/块，与前端 SPARSE_BLOCK_LINES 一致）的平均行长。
+    /// 由行索引 64 行采样纯算术推算（无 IO）；`ensure_total_lines` 保证索引已覆盖
+    /// 到 EOF，因此各块基本都有值。前端据此按块估算占位行高，使滚动条总高
+    /// 贴近真实内容，消除块加载后滚动条跳变（拖动幅度与进度不一致的根因）。
+    pub fn block_avg_lens(&self, block_lines: u64) -> Vec<Option<f64>> {
+        let total = self.ensure_total_lines().unwrap_or(0);
+        self.idx().lock().block_avg_lens(block_lines, total)
+    }
+
     /// 分配一个新的 file_offset。
     fn alloc_offset(&self) -> i64 {
         self.next_offset.fetch_add(1, Ordering::SeqCst)

@@ -554,6 +554,13 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
   // ---- 稀疏虚拟列表（无过滤态）状态 ----
   const [segments, setSegments] = useState<SparseSegments>(() => new Map());
   const [avgLineLen, setAvgLineLen] = useState<number | null>(null);
+  /** 每个稀疏块的平均行长（字节/行，来自后端行索引 64 行采样，无额外 IO）。
+   *  占位行高按块估算而非全局平均：日志区域密度差异大（堆栈/JSON 段 vs 短行），
+   *  全局平均会让块加载后总高突变 → 滚动条跳变、拖动幅度与进度不一致。
+   *  null = 索引尚未覆盖该块（回退全局平均）。 */
+  const [blockAvgLens, setBlockAvgLens] = useState<(number | null)[]>([]);
+  /** 密度数据代际：文件轮转/截断（reset）时 +1，触发重新拉取。 */
+  const [densityEpoch, setDensityEpoch] = useState(0);
   /** 过滤是否已生效：true = 旧窗口模型；false = 稀疏模型。 */
   const [filterActive, setFilterActive] = useState(false);
   const filterActiveRef = useRef(false);
@@ -585,6 +592,7 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
   // 首次计算的偏移，若首次基于旧视图计算，落点就错到别处）。
   const [jumpRequest, setJumpRequest] = useState<{ target: number } | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const innerRef = useRef<HTMLDivElement>(null);
   const autoRefreshRef = useRef(autoRefresh);
   autoRefreshRef.current = autoRefresh;
   const [highlightOffsets, setHighlightOffsets] = useState<Set<number>>(new Set());
@@ -593,6 +601,21 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
   // 跳转定位的用户滚动保护：程序写入时间戳与最近一次用户滚动时间戳。
   const lastProgrammaticWriteRef = useRef(0);
   const lastUserScrollRef = useRef(0);
+
+  // ---- JS 驱动的垂直滚动（接管原生滚动条） ----
+  // 大文件换行模式下虚拟总高可超过 Chromium 元素高度硬上限（2^25 = 33,554,432px，
+  // 实测 scrollHeight 被钳到 33,554,428）：原生滚动条的映射空间被截断——拖到
+  // thumb 95% 实际只到内容 ~74%，文件尾部永远拖不到（E2E 实测复现）。
+  // 因此垂直滚动完全由 JS 接管：virtualTopRef 保存虚拟滚动偏移（JS number 无上限），
+  // 行内容以 transform 位移渲染，滚动条为自绘 overlay（thumb ↔ 偏移线性映射，
+  // 拖动幅度与实际进度严格成正比，且不受高度估算误差影响）。
+  const virtualTopRef = useRef(0);
+  /** 虚拟滚动偏移变化时的回调（由 useVirtualizer 的 observeElementOffset 注册）。 */
+  const offsetCbRef = useRef<((offset: number, isScrolling: boolean) => void) | null>(null);
+  /** thumb 位置渲染用的偏移镜像（与 virtualTopRef 同步，驱动重渲染）。 */
+  const [scrollOffsetUi, setScrollOffsetUi] = useState(0);
+  /** 统一的偏移写入入口（实现在 virtualizer 定义之后赋值）。 */
+  const applyVirtualTopRef = useRef<(next: number, source: "user" | "programmatic") => void>(() => {});
 
   // 行高估算参数（随字体大小变化）。用 useMemo 稳定引用：
   // 否则每次渲染都是新对象，estimateSize 的 useCallback 依赖会失效。
@@ -619,17 +642,23 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
     estimateCacheRef.current.clear();
   }, [wrapLines, fontSize, lang]);
 
-  // 占位行高度：用后端平均行长估算（滚动条比例与真实内容量大致成正比，
-  // 块加载后实测高度逐步修正）。不可用时退化为单行高。
-  const placeholderHeight = useCallback(() => {
-    if (!wrapLines || avgLineLen == null) {
-      return metrics.lineHeight;
-    }
-    const width = Math.max((listRef.current?.clientWidth ?? 800) - GUTTER_WIDTH, 100);
-    const estWidth = avgLineLen * metrics.charWidth;
-    const rows = Math.max(1, Math.ceil(estWidth / width));
-    return rows * metrics.lineHeight;
-  }, [wrapLines, avgLineLen, metrics]);
+  // 占位行高度：优先用所在块的实测平均行长（后端行索引采样，按块估算），
+  // 无块数据时回退全局平均。块级估算使「总高估算 ≈ 真实总高」，块加载后
+  // 滚动条几乎不跳变，拖动滚动条的幅度与实际进度保持一致。
+  const placeholderHeight = useCallback(
+    (index: number) => {
+      const len =
+        blockAvgLens[Math.floor(index / SPARSE_BLOCK_LINES)] ?? avgLineLen;
+      if (!wrapLines || len == null) {
+        return metrics.lineHeight;
+      }
+      const width = Math.max((listRef.current?.clientWidth ?? 800) - GUTTER_WIDTH, 100);
+      const estWidth = len * metrics.charWidth;
+      const rows = Math.max(1, Math.ceil(estWidth / width));
+      return rows * metrics.lineHeight;
+    },
+    [wrapLines, avgLineLen, blockAvgLens, metrics]
+  );
 
   const estimateSize = useCallback(
     (index: number) => {
@@ -647,7 +676,7 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
           ? lines[index]
           : segLineAt(segmentsRef.current, index);
         if (!line) {
-          result = placeholderHeight();
+          result = placeholderHeight(index);
         } else {
           // 宽度分桶（32px）：窗口宽度小幅变化不重算；桶变化时才重新估算。
           const width = (listRef.current?.clientWidth ?? 800) - GUTTER_WIDTH;
@@ -696,6 +725,19 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
     getItemKey,
     overscan: 30,
     measureElement: (el) => el.getBoundingClientRect().height,
+    // 垂直滚动由 JS 接管（见 virtualTopRef 注释）：偏移不经原生 scrollTop，
+    // 而是由 applyVirtualTop 写入 ref 并回调此 cb 通知虚拟列表。
+    observeElementOffset: (_instance, cb) => {
+      offsetCbRef.current = cb;
+      cb(virtualTopRef.current, false);
+      return () => {
+        offsetCbRef.current = null;
+      };
+    },
+    // 所有程序性滚动（scrollToIndex/scrollToEnd/内部锚定补偿）统一经此落地。
+    scrollToFn: (offset, { adjustments }) => {
+      applyVirtualTopRef.current(offset + (adjustments ?? 0), "programmatic");
+    },
     // 该 fork 默认 useFlushSync=true：同步 notify（发生在 React 提交阶段的
     // measureElement ref 回调里）会在渲染中调用 flushSync，触发
     // "flushSync was called from inside a lifecycle method" 并破坏同批次的
@@ -703,6 +745,12 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
     // 关闭后走正常异步 rerender，行为不变且无该错误。
     useFlushSync: false,
   });
+
+  // 垂直滚动由 JS 接管后，最大滚动偏移 = 虚拟总高 − 视口高（JS number，无上限）。
+  // 覆盖库内实现：其读取 DOM scrollHeight，会被 Chromium 2^25px 元素高度上限钳制，
+  // 导致 getOffsetForIndex/scrollToEnd 对超大文件永远到不了真正的尾部。
+  (virtualizer as unknown as { getMaxScrollOffset: () => number }).getMaxScrollOffset = () =>
+    Math.max(0, virtualizer.getTotalSize() - (listRef.current?.clientHeight ?? 0));
 
   // ---- 稀疏块加载：距离优先调度 + rAF 合并 + 淘汰（双向均可） ----
 
@@ -761,14 +809,15 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
     if (items.length === 0) {
       return;
     }
-    // items 与 DOM 滚动位置一致性校验：不一致说明虚拟列表还没跟上本次滚动。
+    // items 与滚动位置一致性校验：不一致说明虚拟列表还没跟上本次滚动。
     const el = listRef.current;
     if (el) {
       const first = items[0];
       const last = items[items.length - 1];
+      const vTop = virtualTopRef.current;
       const covered =
-        el.scrollTop >= first.start - 64 &&
-        el.scrollTop + el.clientHeight <= last.start + last.size + 64;
+        vTop >= first.start - 64 &&
+        vTop + el.clientHeight <= last.start + last.size + 64;
       if (!covered) {
         if (tickRetryRef.current < 3) {
           tickRetryRef.current += 1;
@@ -902,6 +951,11 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
       } else {
         // 稀疏模型：合并进段缓存；reset（轮转/新文件）时清空重建。
         setSegments((prev) => mergeSegments(reset ? new Map() : prev, newLines));
+        if (reset) {
+          // 文件轮转/截断：行索引已重建，块密度全部失效，触发重新拉取。
+          setBlockAvgLens([]);
+          setDensityEpoch((n) => n + 1);
+        }
       }
 
       if (!reset && newLines.length > 0) {
@@ -957,6 +1011,42 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
     };
   }, [tabId]);
 
+  // 拉取每块平均行长（占位行高按块估算的依据）。块数增长（文件追加跨过块边界）、
+  // 过滤退出回到稀疏模型、或轮转/截断（densityEpoch）时重拉；索引预热未覆盖的
+  // 块返回 null，稍后重试（预热通常在打开后秒级完成）。
+  const blockCount =
+    totalLines != null ? Math.ceil(totalLines / SPARSE_BLOCK_LINES) : 0;
+  useEffect(() => {
+    if (filterActive || blockCount <= 0) {
+      return;
+    }
+    let cancelled = false;
+    let attempts = 0;
+    const fetchLens = () => {
+      attempts += 1;
+      invoke<(number | null)[]>("get_block_avg_lens", {
+        tabId,
+        blockLines: SPARSE_BLOCK_LINES,
+      })
+        .then((lens) => {
+          if (cancelled) {
+            return;
+          }
+          setBlockAvgLens(lens);
+          if (lens.some((v) => v == null) && attempts < 3) {
+            window.setTimeout(fetchLens, 2000);
+          }
+        })
+        .catch(() => {
+          /* 静默失败：回退全局平均估算 */
+        });
+    };
+    fetchLens();
+    return () => {
+      cancelled = true;
+    };
+  }, [tabId, blockCount, filterActive, densityEpoch]);
+
   // 尾部跟随。
   useEffect(() => {
     // 历史 prepend 引起的行数变化不触发跟随（由 loadMoreHistory 的锚定接管）。
@@ -970,7 +1060,10 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
       });
       return () => cancelAnimationFrame(raf);
     }
-  }, [lines.length, totalLines, followTail, virtualizer, ensureVisibleBlocks]);
+    // totalSize 入依赖：打开文件初期占位总高偏小（密度数据未到达），
+    // 修正后重新贴尾，避免视口漂离尾部。用户向上滚/拖动会自动关闭跟随，
+    // 因此不会与用户操作打架。
+  }, [lines.length, totalLines, virtualizer.getTotalSize(), followTail, virtualizer, ensureVisibleBlocks]);
 
   // 高亮指定行 1s（与追加行的淡出高亮机制一致）：
   // 跳转/置顶/置底后高亮落点行，便于快速定位。
@@ -1006,8 +1099,7 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
     const listCount = filterActiveRef.current ? lines.length : (totalLines ?? 0);
     if (target >= 0 && target < listCount) {
       const attemptRecenter = (left: number) => {
-        const el = listRef.current;
-        if (!el || left <= 0) {
+        if (left <= 0) {
           return;
         }
         // 用户最近滚过 → 放弃干预。
@@ -1015,7 +1107,7 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
           return;
         }
         const off = virtualizer.getOffsetForIndex(target, "center");
-        if (off && Math.abs(el.scrollTop - off[0]) <= 2) {
+        if (off && Math.abs(virtualTopRef.current - off[0]) <= 2) {
           return; // 已精确居中，无需再动
         }
         lastProgrammaticWriteRef.current = Date.now();
@@ -1068,7 +1160,7 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
       }
       // 像素锚定：prepend 历史行后，把滚动位置往下推新增内容的高度，
       // 保持用户当前正在看的行位置不变。
-      const oldScrollTop = listRef.current?.scrollTop ?? 0;
+      const oldScrollTop = virtualTopRef.current;
       const containerWidth = listRef.current?.clientWidth ?? 800;
       const newHeight = res.lines.reduce(
         (sum, l) => sum + estimateRowHeight(l.text, wrapLines, containerWidth, metrics, lang),
@@ -1077,10 +1169,7 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
       suppressFollowRef.current = true; // 抑制本轮尾部跟随
       setLines((prev) => clampFrontLines([...res.lines, ...prev]));
       requestAnimationFrame(() => {
-        if (listRef.current) {
-          lastProgrammaticWriteRef.current = Date.now();
-          listRef.current.scrollTop = oldScrollTop + newHeight;
-        }
+        applyVirtualTopRef.current(oldScrollTop + newHeight, "programmatic");
         // 注意：不调用 virtualizer.measure()——它会清空行高缓存，
         // 而已渲染行的 ResizeObserver 不会因缓存清空重新触发，
         // 导致这些行停留在估算高度（估算与实际折行有偏差时会出现重叠）。
@@ -1097,11 +1186,7 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
     }
   }, [tabId, hasMoreHistory, wrapLines, fontSize, lang]);
 
-  // ---- 滚轮：稀疏模型下按「文件行数」滚动，滚轮与滚动条严格成比例 ----
-  // 原生滚轮按固定像素走（~100px/格），而滚动条映射全文件（几百万像素），
-  // 两者天然脱节。这里接管滚轮：把 delta 换算成行数 × 平均行高，
-  // thumb 移动量 = 行数 / 总行数，与内容位置一一对应。
-  // 视口中心行已加载 → 3 行/格（精细阅读）；未加载 → 放大步长快速穿越占位区。
+  // ---- 垂直滚动（JS 接管）：滚轮 / 自绘滚动条 / 程序性滚动统一走 applyVirtualTop ----
   /** 最近一次用户主动滚动（滚轮/拖动）的时间戳：交互期间锚定纠正不介入。 */
   const lastUserInputRef = useRef(0);
   /** 空闲纠正定时器：交互停止 350ms 后强制一次提交，让布局效应在空闲时收敛锚点。 */
@@ -1123,11 +1208,70 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
       }
     };
   }, []);
+  const followTailRef = useRef(followTail);
+  followTailRef.current = followTail;
+
+  // 自绘垂直滚动条 DOM refs（applyVirtualTop 需要同步 thumb 位置，故提前声明）。
+  const trackRef = useRef<HTMLDivElement>(null);
+  const thumbRef = useRef<HTMLDivElement>(null);
+
+  // thumb 顶部位置 = 行空间映射：thumb 比例 f ⇔ 视口首行行号 = f ×（总行数−1）。
+  // 日志是行寻址内容，行空间映射让「thumb 在 50% = 看到第 50% 行」精确成立，
+  // 不受行高估算误差影响（像素空间映射会有 ~2.6% 的中段偏差）。
+  const computeThumbTop = (v: number): number => {
+    const track = trackRef.current;
+    const thumb = thumbRef.current;
+    if (!track || !thumb) {
+      return 0;
+    }
+    const travel = Math.max(1, track.clientHeight - thumb.offsetHeight);
+    const count = filterActiveRef.current ? lines.length : (totalLinesRef.current ?? 0);
+    if (count <= 1) {
+      return 0;
+    }
+    const item = virtualizer.getVirtualItemForOffset(v);
+    const f = item ? item.index / (count - 1) : 0;
+    return Math.round(f * travel);
+  };
+
+  // 统一偏移写入入口：clamp 到 [0, totalSize − clientHeight]（虚拟 px，无浏览器上限），
+  // 通知虚拟列表（observeElementOffset 的 cb）、同步 inner transform 与 thumb 位置，
+  // 并按来源记录用户/程序写入时间戳（供锚定纠正与跳转重居中抑制判断）。
+  applyVirtualTopRef.current = (next, source) => {
+    const el = listRef.current;
+    const maxScroll = Math.max(0, virtualizer.getTotalSize() - (el?.clientHeight ?? 0));
+    const v = Math.max(0, Math.min(next, maxScroll));
+    if (v !== virtualTopRef.current) {
+      virtualTopRef.current = v;
+      offsetCbRef.current?.(v, source === "user");
+      setScrollOffsetUi(v);
+      // 立即同步位移与 thumb（不等 React 提交），滚轮/拖动的视觉延迟与原生一致。
+      if (innerRef.current) {
+        innerRef.current.style.transform = `translateY(${-v}px)`;
+      }
+      if (thumbRef.current) {
+        thumbRef.current.style.top = `${computeThumbTop(v)}px`;
+      }
+      if (source === "user") {
+        lastUserInputRef.current = Date.now();
+        lastUserScrollRef.current = Date.now();
+        scheduleIdleCorrection();
+      } else {
+        lastProgrammaticWriteRef.current = Date.now();
+      }
+    }
+    // 滚动后的副作用统一在此分发（含程序性滚动：跳转/跟随尾部后也要拉块）。
+    if (filterActiveRef.current) {
+      if (v < 200) {
+        void loadMoreHistory();
+      }
+    } else {
+      ensureVisibleBlocks();
+    }
+  };
+
   const wheelScrollHandler = useCallback(
     (e: WheelEvent) => {
-      if (filterActiveRef.current) {
-        return; // 旧窗口模型保持原生滚轮
-      }
       // 横向滚动（不换行模式的水平平移）交给原生处理，不拦截。
       if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
         return;
@@ -1136,13 +1280,33 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
       if (!el) {
         return;
       }
-      const totalLinesNow = totalLinesRef.current ?? 0;
       const totalSize = virtualizer.getTotalSize();
-      if (totalLinesNow <= 0 || totalSize <= 0) {
+      if (totalSize <= 0) {
         return;
       }
-      lastUserInputRef.current = Date.now(); // 用户正在交互：压制锚定纠正
-      scheduleIdleCorrection(); // 交互停止后补一次空闲纠正
+      // 向上滚动 = 离开尾部：关闭跟随，避免下一次追加把视图拽回底部。
+      if (e.deltaY < 0 && followTailRef.current) {
+        setFollowTail(false);
+      }
+      // deltaMode: 0=像素, 1=行, 2=页 → 统一换算为像素。
+      let deltaPx = e.deltaY;
+      if (e.deltaMode === 1) {
+        deltaPx = e.deltaY * metrics.lineHeight;
+      } else if (e.deltaMode === 2) {
+        deltaPx = e.deltaY * el.clientHeight;
+      }
+      if (filterActiveRef.current) {
+        // 旧窗口模型（过滤态）：按原生像素量滚动。
+        e.preventDefault();
+        applyVirtualTopRef.current(virtualTopRef.current + deltaPx, "user");
+        return;
+      }
+      const totalLinesNow = totalLinesRef.current ?? 0;
+      if (totalLinesNow <= 0) {
+        return;
+      }
+      // 稀疏模型：按「文件行数」滚动，滚轮与滚动条严格成比例。
+      // 视口中心行已加载 → 3 行/格（精细阅读）；未加载 → 放大步长快速穿越占位区。
       const pxPerLine = totalSize / totalLinesNow;
       const items = virtualizer.getVirtualItems();
       const centerIdx = items.length > 0 ? items[Math.floor(items.length / 2)].index : 0;
@@ -1154,20 +1318,13 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
         // 按住 Shift/Ctrl：粗粒度快速翻越（~0.4% 文件/格）。
         linesPerNotch = Math.max(linesPerNotch, Math.min(2000, Math.round(totalLinesNow / 250)));
       }
-      // deltaMode: 0=像素, 1=行, 2=页 → 统一换算为「格」。
-      let notches = e.deltaY;
-      if (e.deltaMode === 0) {
-        notches = e.deltaY / 100;
-      } else if (e.deltaMode === 2) {
-        notches = e.deltaY * (el.clientHeight / 100);
-      }
+      // 像素模式按浏览器默认 ~100px/格折算为「格」。
+      const notches = e.deltaMode === 0 ? e.deltaY / 100 : e.deltaY;
       e.preventDefault();
       const delta = notches * linesPerNotch * pxPerLine;
-      // 自己写滚动位置：视为程序写入，避免与跳转重居中互相打架。
-      lastProgrammaticWriteRef.current = Date.now();
-      el.scrollTop = Math.max(0, Math.min(el.scrollTop + delta, el.scrollHeight - el.clientHeight));
+      applyVirtualTopRef.current(virtualTopRef.current + delta, "user");
     },
-    [virtualizer, scheduleIdleCorrection]
+    [virtualizer, scheduleIdleCorrection, metrics]
   );
 
   // React 的 onWheel 在根容器上是 passive 监听，无法 preventDefault；
@@ -1182,31 +1339,21 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
   }, [wheelScrollHandler]);
 
   // ---- 滚动锚定：块加载使行高由占位估算变为实测后，总高会变化； ----
-  // 把「首可见行及其相对视口顶部的偏移」钉回原位，消除滚动条漂移与内容跳动。
+  // 把「首可见行及其相对视口顶部的偏移」钉回原位，消除内容跳动。
   const anchorRef = useRef<{ index: number; offset: number } | null>(null);
   const lastTotalSizeRef = useRef(0);
 
-  /** 记录当前锚点（每次 scroll 事件调用；仅稀疏模型）。 */
-  const updateAnchor = useCallback(() => {
-    if (filterActiveRef.current) {
-      return;
-    }
-    const el = listRef.current;
-    if (!el) {
-      return;
-    }
-    const items = virtualizer.getVirtualItems();
-    if (items.length === 0) {
-      return;
-    }
-    const first = items[0];
-    anchorRef.current = { index: first.index, offset: first.start - el.scrollTop };
-  }, [virtualizer]);
-
-  // 提交后若总高变化且用户已停止交互：回写 scrollTop，让锚点行回到同一视口位置。
-  // 关键：用户正在滚轮/拖动期间绝不回写（否则和用户的手打架，thumb 被拽回、
-  // 滚轮被抵消）；空闲 350ms 后才做一次收敛式纠正。
+  // 提交后：先记录锚点（首可见行 + 相对偏移）；若总高变化且用户已停止交互，
+  // 回写虚拟偏移让锚点行回到同一视口位置。
+  // 关键：用户正在滚轮/拖动期间绝不回写（否则和用户的手打架）；空闲 350ms 后才收敛。
   useLayoutEffect(() => {
+    if (!filterActiveRef.current) {
+      const items = virtualizer.getVirtualItems();
+      const first = items[0];
+      if (first) {
+        anchorRef.current = { index: first.index, offset: first.start - virtualTopRef.current };
+      }
+    }
     if (filterActiveRef.current || followTail) {
       return;
     }
@@ -1223,44 +1370,81 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
     if (prev === 0 || Math.abs(size - prev) <= 0.5) {
       return;
     }
-    const el = listRef.current;
     const anchor = anchorRef.current;
-    if (!el || !anchor) {
+    if (!anchor) {
       return;
     }
     const item = virtualizer.getVirtualItems().find((vi) => vi.index === anchor.index);
     if (item) {
       const want = item.start - anchor.offset;
-      if (Math.abs(el.scrollTop - want) > 1) {
-        lastProgrammaticWriteRef.current = Date.now();
-        el.scrollTop = want;
+      if (Math.abs(virtualTopRef.current - want) > 1) {
+        applyVirtualTopRef.current(want, "programmatic");
       }
     }
   });
 
-  const onListScroll = useCallback(() => {
-    if (window.__lvPerf) {
-      window.__lvPerf.scrollEvents++;
-    }
-    const el = listRef.current;
-    if (el) {
-      // 程序写入后 120ms 内的 scroll 事件视为回读；其余视为用户滚动。
-      if (Date.now() - lastProgrammaticWriteRef.current > 120) {
-        lastUserScrollRef.current = Date.now();
-        // 用户主动滚动（thumb 拖动等）：记录交互时间，压制锚定纠正。
-        lastUserInputRef.current = Date.now();
-        scheduleIdleCorrection();
+  // ---- 自绘垂直滚动条（thumb 比例 ⇔ 行号比例，拖动幅度 = 实际进度） ----
+  const totalSizeUi = virtualizer.getTotalSize();
+  const clientHUi = listRef.current?.clientHeight ?? 0;
+  const maxScrollUi = Math.max(0, totalSizeUi - clientHUi);
+  const thumbHUi =
+    maxScrollUi > 0
+      ? Math.max(24, Math.round(clientHUi * (clientHUi / Math.max(totalSizeUi, 1))))
+      : 0;
+  const thumbTopUi = computeThumbTop(scrollOffsetUi);
+
+  const onVScrollbarPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      const track = trackRef.current;
+      const el = listRef.current;
+      if (!track || !el || e.button !== 0) {
+        return;
       }
-      if (filterActiveRef.current) {
-        if (el.scrollTop < 200) {
-          void loadMoreHistory();
-        }
+      const totalSize = virtualizer.getTotalSize();
+      const maxScroll = Math.max(0, totalSize - el.clientHeight);
+      if (maxScroll <= 0) {
+        return;
+      }
+      const trackH = track.clientHeight;
+      const thumbH = thumbRef.current?.offsetHeight ?? 24;
+      const travel = Math.max(1, trackH - thumbH);
+      const trackTop = track.getBoundingClientRect().top;
+      const count = filterActiveRef.current ? lines.length : (totalLinesRef.current ?? 0);
+      // thumb 比例 f → 目标行（行空间映射）→ 虚拟偏移。
+      const fToOffset = (f: number): number => {
+        const clamped = Math.max(0, Math.min(1, f));
+        const line = Math.round(clamped * Math.max(0, count - 1));
+        const off = virtualizer.getOffsetForIndex(line, "start");
+        return off ? off[0] : clamped * maxScroll;
+      };
+      const onThumb = (e.target as HTMLElement).classList.contains("vthumb");
+      // 拖动/点跳 = 主动离开尾部：关闭跟随（置底按钮可恢复）。
+      setFollowTail(false);
+      if (onThumb) {
+        // 拖 thumb：thumb 中心跟随鼠标，内容按行空间映射联动。
+        const onMove = (ev: PointerEvent) => {
+          const f = Math.max(0, Math.min(1, (ev.clientY - trackTop - thumbH / 2) / travel));
+          applyVirtualTopRef.current(fToOffset(f), "user");
+          // thumb 直接按鼠标位置定位（行空间 roundtrip 的亚像素误差不反馈到手上）。
+          if (thumbRef.current) {
+            thumbRef.current.style.top = `${Math.round(f * travel)}px`;
+          }
+        };
+        const onUp = () => {
+          window.removeEventListener("pointermove", onMove);
+          window.removeEventListener("pointerup", onUp);
+        };
+        window.addEventListener("pointermove", onMove);
+        window.addEventListener("pointerup", onUp);
       } else {
-        updateAnchor();
-        ensureVisibleBlocks();
+        // 点轨道：把 thumb 中心定位到点击处（按行空间绝对跳转）。
+        const clickY = e.clientY - trackTop;
+        const f = Math.max(0, Math.min(1, (clickY - thumbH / 2) / travel));
+        applyVirtualTopRef.current(fToOffset(f), "user");
       }
-    }
-  }, [loadMoreHistory, ensureVisibleBlocks, updateAnchor, scheduleIdleCorrection]);
+    },
+    [virtualizer, lines.length]
+  );
 
   const toggleWrapLines = useCallback((next: boolean) => {
     // 先同步清空行高缓存，再切换 CSS：
@@ -1549,16 +1733,19 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
         </span>
       </div>
 
-      <div className={`list ${wrapLines ? "wrap" : "nowrap"}`} ref={listRef} onScroll={onListScroll}>
-        <div
-          className="list-inner"
-          style={{
-            height: virtualizer.getTotalSize(),
-            width: wrapLines ? "100%" : "max-content",
-            minWidth: "100%",
-            position: "relative",
-          }}
-        >
+      <div className="list-wrap">
+        <div className={`list ${wrapLines ? "wrap" : "nowrap"}`} ref={listRef}>
+          <div
+            className="list-inner"
+            ref={innerRef}
+            style={{
+              height: totalSizeUi,
+              width: wrapLines ? "100%" : "max-content",
+              minWidth: "100%",
+              position: "relative",
+              transform: `translateY(${-scrollOffsetUi}px)`,
+            }}
+          >
           {virtualizer.getVirtualItems().map((vi) => {
             const line = filterActive ? lines[vi.index] : segLineAt(segments, vi.index);
             if (!line) {
@@ -1576,7 +1763,7 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
                     left: 0,
                     width: wrapLines ? "100%" : "max-content",
                     minWidth: "100%",
-                    height: `${placeholderHeight()}px`,
+                    height: `${placeholderHeight(vi.index)}px`,
                     overflow: "hidden",
                     transform: `translateY(${vi.start}px)`,
                   }}
@@ -1634,7 +1821,17 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
               </div>
             );
           })}
+          </div>
         </div>
+        {maxScrollUi > 0 ? (
+          <div className="vscrollbar" ref={trackRef} onPointerDown={onVScrollbarPointerDown}>
+            <div
+              className="vthumb"
+              ref={thumbRef}
+              style={{ top: `${thumbTopUi}px`, height: `${thumbHUi}px` }}
+            />
+          </div>
+        ) : null}
       </div>
     </div>
   );

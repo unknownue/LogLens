@@ -157,6 +157,24 @@ fn get_total_lines(
     session.ensure_total_lines()
 }
 
+/// 每个稀疏块（`block_lines` 行/块，与前端 SPARSE_BLOCK_LINES 一致）的平均行长
+/// （字节/行，来自行索引 64 行采样，无额外 IO）。前端据此按块估算未加载区域的
+/// 占位行高：区域密度差异大时（堆栈/JSON 段 vs 短行），全局平均会让块加载后
+/// 总高突变、滚动条跳变，表现为拖动幅度与实际进度不一致；按块估算后总高贴近
+/// 真实值，滚动条映射稳定。索引未覆盖的块为 null（前端回退全局平均）。
+#[instrument(skip(state), fields(tab_id = %tab_id, block_lines))]
+#[tauri::command]
+fn get_block_avg_lens(
+    state: tauri::State<'_, Arc<AppState>>,
+    tab_id: String,
+    block_lines: u64,
+) -> Result<Vec<Option<f64>>, String> {
+    let session = state
+        .get(&tab_id)
+        .ok_or_else(|| format!("tab 不存在: {}", tab_id))?;
+    Ok(session.block_avg_lens(block_lines))
+}
+
 /// 跳转到文件第 `line_no` 行（1-based）：加载其附近窗口并替换前端视图。
 /// 与现有功能兼容：过滤条件继续生效（返回过滤后的窗口）、向上滚动仍可
 /// 继续加载更早历史、尾部追加不受影响。
@@ -188,7 +206,8 @@ pub fn run() {
             load_history,
             get_range,
             jump_to_line,
-            get_total_lines
+            get_total_lines,
+            get_block_avg_lens
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

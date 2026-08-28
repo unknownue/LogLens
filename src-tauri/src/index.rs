@@ -268,6 +268,85 @@ impl LineIndex {
             Some(self.covered_bytes as f64 / self.lines_upto as f64)
         }
     }
+
+    /// 每个稀疏块（`block_lines` 行/块）的平均行长（字节/行）。
+    ///
+    /// 由 64 行粒度的采样偏移纯算术推算（无 IO）：把每个采样区间的字节按行数
+    /// 摊入其覆盖的块。日志的区域密度差异大（堆栈/JSON 段 vs 短状态行），
+    /// 全局平均会让「块加载后总高突变 → 滚动条跳变」；按块估算后总高贴近
+    /// 真实值，拖动滚动条的幅度与实际进度保持一致。
+    /// 索引未覆盖到任何行的块返回 None（前端回退全局平均）。
+    pub fn block_avg_lens(&self, block_lines: u64, total_lines: u64) -> Vec<Option<f64>> {
+        let block_lines = block_lines.max(1);
+        let n_blocks = (((total_lines + block_lines - 1) / block_lines).max(1)) as usize;
+        let mut byte_sum = vec![0f64; n_blocks];
+        let mut line_sum = vec![0f64; n_blocks];
+
+        // 把「0-based 行区间 [line0, line0+lines) 共 bytes 字节」按行数摊入各块。
+        fn distribute(
+            line0: u64,
+            lines: u64,
+            bytes: f64,
+            block_lines: u64,
+            n_blocks: usize,
+            byte_sum: &mut [f64],
+            line_sum: &mut [f64],
+        ) {
+            if lines == 0 || bytes <= 0.0 {
+                return;
+            }
+            let per_line = bytes / lines as f64;
+            let mut pos = line0;
+            let end = line0 + lines;
+            while pos < end {
+                let b = (pos / block_lines) as usize;
+                if b >= n_blocks {
+                    break;
+                }
+                let take = (block_lines - (pos % block_lines)).min(end - pos);
+                byte_sum[b] += per_line * take as f64;
+                line_sum[b] += take as f64;
+                pos += take;
+            }
+        }
+
+        // 完整采样区间 i：0-based 行 [i*64, (i+1)*64)，字节 [samples[i], samples[i+1])。
+        for i in 0..self.samples.len().saturating_sub(1) {
+            let line0 = i as u64 * SAMPLE_EVERY;
+            let bytes = (self.samples[i + 1] - self.samples[i]) as f64;
+            distribute(
+                line0,
+                SAMPLE_EVERY,
+                bytes,
+                block_lines,
+                n_blocks,
+                &mut byte_sum,
+                &mut line_sum,
+            );
+        }
+        // 末尾部分区间：最后一个采样点 → covered_bytes，行 [last*64, lines_upto)。
+        let last = self.samples.len() - 1;
+        let tail_line0 = last as u64 * SAMPLE_EVERY;
+        let tail_lines = self.lines_upto.saturating_sub(tail_line0);
+        if tail_lines > 0 {
+            let tail_bytes = self.covered_bytes.saturating_sub(self.samples[last]) as f64;
+            distribute(
+                tail_line0,
+                tail_lines,
+                tail_bytes,
+                block_lines,
+                n_blocks,
+                &mut byte_sum,
+                &mut line_sum,
+            );
+        }
+
+        byte_sum
+            .iter()
+            .zip(line_sum.iter())
+            .map(|(&b, &l)| if l > 0.0 { Some(b / l) } else { None })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +480,61 @@ mod tests {
         assert_eq!(idx.lines_upto, 0);
         assert_eq!(idx.covered_bytes(), 0);
         assert_eq!(idx.total_lines(f.path()).unwrap(), 3); // 重置后可重新扫描
+    }
+
+    #[test]
+    fn block_avg_lens_reflects_regional_density() {
+        // 块 0：每行 10 字节 × 128 行；块 1：每行 100 字节 × 128 行。
+        // 块大小取 128（= 2×64 采样间隔），块边界与采样对齐 → 密度可精确验证。
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        for i in 0..128usize {
+            writeln!(f, "{:09}", i).unwrap(); // 9 + \n = 10 字节
+        }
+        for i in 0..128usize {
+            writeln!(f, "{}", "x".repeat(99)).unwrap(); // 99 + \n = 100 字节
+        }
+        f.flush().unwrap();
+        let path = f.path().to_path_buf();
+
+        let mut idx = LineIndex::new();
+        let total = idx.total_lines(&path).unwrap();
+        assert_eq!(total, 256);
+
+        let lens = idx.block_avg_lens(128, total);
+        assert_eq!(lens.len(), 2);
+        let l0 = lens[0].unwrap();
+        let l1 = lens[1].unwrap();
+        assert!((l0 - 10.0).abs() < 0.01, "block0 avg={l0}");
+        assert!((l1 - 100.0).abs() < 0.01, "block1 avg={l1}");
+
+        // block_lines 跨两块（256 行一块）→ 混合平均 = (1280 + 12800) / 256 = 55。
+        let lens = idx.block_avg_lens(256, total);
+        assert_eq!(lens.len(), 1);
+        let lm = lens[0].unwrap();
+        assert!((lm - 55.0).abs() < 0.01, "mixed avg={lm}");
+
+        // 未覆盖区域（重置后无数据）→ None。
+        idx.reset();
+        let lens = idx.block_avg_lens(128, total);
+        assert!(lens.iter().all(|v| v.is_none()));
+    }
+
+    #[test]
+    fn block_avg_lens_handles_partial_tail_interval() {
+        // 70 行 × 10 字节：完整采样区间只有 1 个（64 行），剩余 6 行走部分区间。
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        for i in 0..70usize {
+            writeln!(f, "{:09}", i).unwrap();
+        }
+        f.flush().unwrap();
+        let path = f.path().to_path_buf();
+
+        let mut idx = LineIndex::new();
+        let total = idx.total_lines(&path).unwrap();
+        let lens = idx.block_avg_lens(10_000, total);
+        assert_eq!(lens.len(), 1);
+        let l = lens[0].unwrap();
+        assert!((l - 10.0).abs() < 0.01, "avg={l}");
     }
 
     #[test]

@@ -393,10 +393,22 @@ body,
   white-space: nowrap;
 }
 
+/* 列表包裹层：承载自绘垂直滚动条（垂直滚动由 JS 接管，见 App.tsx virtualTopRef） */
+.list-wrap {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+  display: flex;
+}
+
 .list {
   flex: 1;
   min-width: 0;
-  overflow: auto;
+  /* 垂直滚动由 JS 接管：隐藏原生滚动条（大文件总高超 Chromium 2^25px 上限，
+     原生映射空间会被截断）；水平滚动保持原生。 */
+  overflow-y: hidden;
+  overflow-x: hidden;
   position: relative;
   background-color: var(--bg);
 }
@@ -409,6 +421,31 @@ body,
 /* 不换行模式：显示水平滚动条 */
 .list.nowrap {
   overflow-x: auto;
+}
+
+/* 自绘垂直滚动条：thumb 位置与虚拟滚动偏移线性映射 */
+.vscrollbar {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 12px;
+  background: color-mix(in srgb, var(--bg-bar) 72%, transparent);
+  border-left: 1px solid var(--border);
+  z-index: 5;
+}
+
+.vthumb {
+  position: absolute;
+  right: 1px;
+  width: 9px;
+  border-radius: 5px;
+  background: var(--border-light);
+  cursor: grab;
+}
+
+.vthumb:hover {
+  background: var(--text-dim);
 }
 
 .list-inner {
