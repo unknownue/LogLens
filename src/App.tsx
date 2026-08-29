@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
@@ -386,6 +387,7 @@ interface Messages {
   viewBodySizeMedium: string;
   viewBodySizeLarge: string;
   viewBodySizeMax: string;
+  dropToOpen: string;
 }
 
 const MESSAGES: Record<Lang, Messages> = {
@@ -453,6 +455,7 @@ const MESSAGES: Record<Lang, Messages> = {
     viewBodySizeMedium: "中",
     viewBodySizeLarge: "大",
     viewBodySizeMax: "最大",
+    dropToOpen: "松开以打开文件",
   },
   en: {
     notOpened: "No file opened",
@@ -518,6 +521,7 @@ const MESSAGES: Record<Lang, Messages> = {
     viewBodySizeMedium: "Medium",
     viewBodySizeLarge: "Large",
     viewBodySizeMax: "Max",
+    dropToOpen: "Drop files to open",
   },
 };
 
@@ -597,6 +601,8 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
   filterActiveRef.current = filterActive;
   const segmentsRef = useRef<SparseSegments>(segments);
   segmentsRef.current = segments;
+  /** 首屏内容绘制回执：只上报一次（供后端启动耗时打点）。 */
+  const firstPaintReportedRef = useRef(false);
   const lastEvictRef = useRef(0);
   const [keywordInput, setKeywordInput] = useState("");
   const [regexInput, setRegexInput] = useState("");
@@ -1060,6 +1066,26 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
       cancelled = true;
     };
   }, [tabId]);
+
+  // 首屏内容绘制回执：首次出现正文后，经「双 rAF」在绘制完成后通知后端
+  // （第一个 rAF 在绘制前、第二个在绘制后），用于后端打点统计「启动→可见」总耗时。
+  useEffect(() => {
+    if (firstPaintReportedRef.current) {
+      return;
+    }
+    const hasContent = filterActive ? lines.length > 0 : segLoadedCount(segments) > 0;
+    if (!hasContent) {
+      return;
+    }
+    firstPaintReportedRef.current = true;
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        void invoke("report_first_paint").catch(() => {
+          /* 打点失败静默 */
+        });
+      })
+    );
+  }, [segments, lines, filterActive]);
 
   // 拉取每块平均行长（占位行高按块估算的依据）。块数增长（文件追加跨过块边界）、
   // 过滤退出回到稀疏模型、或轮转/截断（densityEpoch）时重拉；索引预热未覆盖的
@@ -2213,6 +2239,8 @@ export default function App() {
   const [tabs, setTabs] = useState<TabInfo[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [opening, setOpening] = useState(false);
+  // 文件拖拽进行中：显示全屏放置提示遮罩。
+  const [dragActive, setDragActive] = useState(false);
 
   // ---- 文件记忆：保存当前标签页（在恢复完成前不写入，避免空列表覆盖存档） ----
   const restoredRef = useRef(false);
@@ -2390,6 +2418,39 @@ export default function App() {
     }
   }, []);
 
+  // 文件拖拽打开：监听 Tauri 原生拖放事件（Windows 上走 WebView2 原生 DnD，
+  // 无需 HTML5 DataTransfer，可直接拿到文件系统路径）。
+  // enter/over 显示全屏遮罩；drop 为每个拖入的文件新建 tab 打开；leave 隐藏遮罩。
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    void getCurrentWebview()
+      .onDragDropEvent((event) => {
+        const type = event.payload.type;
+        if (type === "enter" || type === "over") {
+          setDragActive(true);
+        } else if (type === "leave") {
+          setDragActive(false);
+        } else if (type === "drop") {
+          setDragActive(false);
+          for (const p of event.payload.paths) {
+            void openPath(p);
+          }
+        }
+      })
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [openPath]);
+
   const handleOpen = useCallback(async () => {
     setOpening(true);
     try {
@@ -2561,6 +2622,12 @@ export default function App() {
           </button>
         </div>
       )}
+
+      {dragActive ? (
+        <div className="drop-overlay">
+          <div className="drop-overlay-box">{appT.dropToOpen}</div>
+        </div>
+      ) : null}
     </div>
   );
 }

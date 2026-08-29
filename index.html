@@ -1,10 +1,23 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>LogLens 日志查看器</title>
+    <style>
+      /* 与 tauri.conf.json 的窗口 backgroundColor 保持一致，
+         避免 WebView2 首帧前（冷启动无帧期）出现白底。 */
+      html,
+      body,
+      #root {
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        background: #1e1e1e;
+      }
+    </style>
   </head>
 
   <body>

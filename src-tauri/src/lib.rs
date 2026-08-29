@@ -2,6 +2,7 @@
 
 mod filter;
 mod index;
+pub mod perf;
 mod state;
 mod tail;
 
@@ -41,6 +42,8 @@ fn open_log_file(
     if !path.is_file() {
         return Err(format!("文件不存在: {}", path.display()));
     }
+    let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+    perf::mark(&format!("open:start:{size}"));
 
     let session = state.get_or_create(&tab_id);
     start_watching_for_session(app, tab_id, session, path);
@@ -88,6 +91,7 @@ fn get_lines(
     state: tauri::State<'_, Arc<AppState>>,
     tab_id: String,
 ) -> Result<Vec<LogLine>, String> {
+    perf::mark("get_lines");
     let session = state
         .get(&tab_id)
         .ok_or_else(|| format!("tab 不存在: {}", tab_id))?;
@@ -151,6 +155,7 @@ fn get_total_lines(
     state: tauri::State<'_, Arc<AppState>>,
     tab_id: String,
 ) -> Result<u64, String> {
+    perf::mark("get_total_lines");
     let session = state
         .get(&tab_id)
         .ok_or_else(|| format!("tab 不存在: {}", tab_id))?;
@@ -191,13 +196,24 @@ fn jump_to_line(
     session.jump_to_line(line_no)
 }
 
+/// 前端首次绘制正文后的回执（打点用）：由前端在首屏内容渲染完成后调用一次。
+#[tauri::command]
+fn report_first_paint() {
+    perf::mark("frontend:first-paint");
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    perf::mark("run:start");
     init_tracy();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(AppState::new()))
+        .setup(|_app| {
+            perf::mark("webview:ready");
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             open_log_file,
             set_filter,
@@ -207,7 +223,8 @@ pub fn run() {
             get_range,
             jump_to_line,
             get_total_lines,
-            get_block_avg_lens
+            get_block_avg_lens,
+            report_first_paint
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

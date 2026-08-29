@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use tracing::instrument;
 
 use crate::index::SharedIndex;
+use crate::perf;
 
 // Windows 下需要 OpenOptionsExt 以使用 .share_mode()（FILE_SHARE_* 共享打开）。
 #[cfg(windows)]
@@ -164,7 +165,10 @@ impl TailReader {
             let n_in_buf = buf.iter().filter(|&&b| b == b'\n').count() as u64;
             // start 之前的完整行数（一次前缀扫描，仅首屏一次）。
             let prefix_complete = if start > 0 {
-                self.count_newlines_before(start)?
+                perf::mark("init_tail:scan-start");
+                let n = self.count_newlines_before(start)?;
+                perf::mark("init_tail:scan-done");
+                n
             } else {
                 0
             };

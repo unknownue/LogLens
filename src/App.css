@@ -622,6 +622,29 @@ body,
   /* 复用 filterbar button 的样式（accent 背景）；此处仅需占位提示的差异处理 */
 }
 
+/* ===== 文件拖拽放置遮罩 ===== */
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  background: color-mix(in srgb, var(--bg) 72%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* 不拦截指针：拖放由 Tauri 原生事件处理，遮罩只负责视觉提示。 */
+  pointer-events: none;
+}
+
+.drop-overlay-box {
+  padding: 28px 48px;
+  border: 2px dashed var(--accent);
+  border-radius: 10px;
+  background: var(--bg-bar);
+  color: var(--text-bright);
+  font-size: 16px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4);
+}
+
 /* ===== 正文查看器模态框 ===== */
 .body-modal-overlay {
   position: fixed;

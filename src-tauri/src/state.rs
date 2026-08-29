@@ -16,6 +16,7 @@ use tracing::{info_span, instrument};
 
 use crate::filter::{Filter, FilterSpec};
 use crate::index::{LineIndex, SharedIndex, SCAN_CHUNK_BYTES};
+use crate::perf;
 use crate::tail::{LogLine, TailEvent, TailReader};
 
 /// 传给前端的一批行事件负载（带 tab_id 用于前端路由到对应 tab）。
@@ -423,6 +424,7 @@ pub fn start_watching_for_session(app: AppHandle, tab_id: String, session: Arc<T
     session.invalidate_total_lines();
 
     // 先加载初始尾部。
+    perf::mark("open:tail-start");
     let mut reader = TailReader::new(path.clone());
     let (initial, first_line_no) = match reader.init_tail(1000) {
         Ok(v) => v,
@@ -431,6 +433,7 @@ pub fn start_watching_for_session(app: AppHandle, tab_id: String, session: Arc<T
             (Vec::new(), 1)
         }
     };
+    perf::mark("open:tail-done");
     let matched = session.append_lines(initial, first_line_no);
     let total_lines = reader.total_lines();
     let avg_line_len = reader.index.lock().avg_line_len();
@@ -439,6 +442,7 @@ pub fn start_watching_for_session(app: AppHandle, tab_id: String, session: Arc<T
         "log-lines",
         LinesPayload { tab_id: tab_id.clone(), lines: matched, reset: true, total_lines, avg_line_len },
     );
+    perf::mark("open:emit-done");
 
     *session.file_path.lock() = Some(path.clone());
     // 会话与 reader 共享同一行索引。
