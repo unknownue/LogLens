@@ -20,6 +20,8 @@
   --row-highlight: #3a3520;
   --row-highlight-hover: #4a4328;
   --lineno: #858585;
+  /* 错误提示（跳转模态框等） */
+  --error: #f14c4c;
   /* 日志字体大小（App 内联覆盖） */
   --log-font-size: 12px;
 }
@@ -45,6 +47,7 @@
   --row-highlight: #fff3c4;
   --row-highlight-hover: #ffe9a0;
   --lineno: #a0a0a0;
+  --error: #c50f1f;
 }
 
 :root {
@@ -131,6 +134,118 @@ body,
 
 .tabbar .tab-close:hover {
   color: var(--text-bright);
+}
+
+/* tab 栏最左侧：最近打开历史下拉的图标按钮 */
+.tabbar .recent-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  min-width: 32px;
+  align-self: stretch;
+  background: transparent;
+  border: none;
+  border-right: 1px solid var(--border);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.tabbar .recent-btn:hover,
+.tabbar .recent-btn[aria-expanded="true"] {
+  color: var(--text-bright);
+  background-color: var(--bg-hover);
+}
+
+/* 历史下拉菜单：经 portal 渲染到 body，fixed 定位避开 tabbar 的 overflow 裁剪 */
+.recent-menu {
+  z-index: 100;
+  min-width: 340px;
+  max-width: min(560px, calc(100vw - 24px));
+  max-height: min(420px, 70vh);
+  overflow-y: auto;
+  background: var(--bg-bar);
+  border: 1px solid var(--border);
+  border-radius: 0 0 4px 4px;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.4);
+}
+
+.recent-menu .recent-empty {
+  padding: 16px 12px;
+  font-size: 12px;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+.recent-menu .recent-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-bottom: 1px solid var(--row-border);
+}
+
+.recent-menu .recent-item:last-child {
+  border-bottom: none;
+}
+
+.recent-menu .recent-item:hover {
+  background: var(--bg-hover);
+}
+
+/* 点击打开的区域（文件名 + 完整路径） */
+.recent-menu .recent-open {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 4px 6px 12px;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+}
+
+/* 单项删除按钮：右侧 ✕，悬停显红 */
+.recent-menu .recent-del {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-right: 6px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.recent-menu .recent-del:hover {
+  color: var(--error);
+  background: var(--bg-hover);
+}
+
+.recent-menu .recent-name {
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-menu .recent-path {
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .tabbar .tab-add {
@@ -345,25 +460,48 @@ body,
   flex: 1;
 }
 
+/* 关键词大小写开关（Aa 图标按钮）：紧贴关键词输入框右侧。
+   关闭（忽略大小写）时 Aa 带删除线、外观弱化；开启时高亮为 accent。 */
+.filterbar .case-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 24px;
+  padding: 0;
+  margin: 0 -2px 0 -6px; /* 视觉上贴近关键词输入框 */
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--border-light);
+  border-radius: 3px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.filterbar .case-btn:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+  border-color: var(--border);
+}
+
+.filterbar .case-btn.on {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.filterbar .case-btn.on:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: #fff;
+}
+
 .filterbar .regex {
   flex: 1;
 }
 
 .filterbar .highlight {
   flex: 1;
-}
-
-/* 工具栏中的跳转行号输入框：固定宽度不参与弹性布局 */
-.toolbar .jump {
-  width: 104px;
-  flex: 0 0 auto;
-  padding: 4px 8px;
-  background: var(--bg);
-  color: var(--text);
-  border: 1px solid var(--border-light);
-  border-radius: 3px;
-  font-family: inherit;
-  font-size: 12px;
 }
 
 .filterbar button {
@@ -431,6 +569,33 @@ body,
 /* 不换行模式：显示水平滚动条 */
 .list.nowrap {
   overflow-x: auto;
+}
+
+/* 不换行模式的水平滚动条：外观与自绘垂直滚动条（.vscrollbar / .vthumb）保持一致。
+   行为仍由原生滚动承担（横向滚轮 / Shift+滚轮 / 触控板横滑在 App.tsx 的
+   wheelScrollHandler 中不拦截，交给浏览器），此处仅重绘外观：
+   轨道 12px + 内容侧 1px 分隔线（72% 底栏色），thumb 圆角、缩进、hover 提亮
+   —— 与垂直轨道/拇指同色同构。 */
+.list.nowrap::-webkit-scrollbar {
+  height: 12px;
+}
+
+.list.nowrap::-webkit-scrollbar-track {
+  background: color-mix(in srgb, var(--bg-bar) 72%, transparent);
+  border-top: 1px solid var(--border);
+}
+
+.list.nowrap::-webkit-scrollbar-thumb {
+  background: var(--border-light);
+  /* 透明边框 + background-clip：伪元素不支持 margin/定位，
+     用边框外扩 + 填充裁剪让拇指四边各缩进 1px（≈ .vthumb 的 9px/12px 比例）。 */
+  border: 1px solid transparent;
+  background-clip: padding-box;
+  border-radius: 5px;
+}
+
+.list.nowrap::-webkit-scrollbar-thumb:hover {
+  background: var(--text-dim);
 }
 
 /* 自绘垂直滚动条：thumb 位置与虚拟滚动偏移线性映射 */
@@ -706,6 +871,69 @@ body,
 
 .body-modal-btn:hover {
   background: var(--accent-hover);
+}
+
+.body-modal-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ===== 跳转到行模态框 ===== */
+.jump-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 320px;
+  max-width: calc(100vw - 32px);
+  padding: 14px;
+  background: var(--bg-bar);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4);
+}
+
+.jump-modal-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-bright);
+}
+
+.jump-modal-input {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border-light);
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.jump-modal-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.jump-modal-error {
+  font-size: 12px;
+  color: var(--error);
+  word-break: break-all;
+}
+
+.jump-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.jump-modal-actions .jump-cancel {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border-light);
+}
+
+.jump-modal-actions .jump-cancel:hover {
+  background: var(--bg-hover);
 }
 
 .body-modal-body {

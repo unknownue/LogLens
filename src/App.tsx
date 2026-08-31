@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -80,6 +81,44 @@ function readSavedTabs(): SavedTabs | null {
   } catch {
     return null;
   }
+}
+
+// ==================== 最近打开记录（首行最左侧的历史下拉菜单） ====================
+//
+// 仅做「记录」：展开菜单时不检查文件存在性，不存在的文件记录照样保留
+// （点击后走常规打开流程，失败时 tab 上显示 ⚠ 提示，与手动打开一致）。
+
+/** 历史记录条数上限。 */
+const RECENT_MAX = 10;
+/** localStorage 键。 */
+const RECENT_KEY = "lv-recent";
+
+/** 读取最近打开记录（无数据/损坏时返回空列表）。 */
+function readRecentPaths(): string[] {
+  try {
+    const raw = localStorage.getItem(RECENT_KEY);
+    if (!raw) {
+      return [];
+    }
+    const v = JSON.parse(raw) as unknown;
+    if (!Array.isArray(v)) {
+      return [];
+    }
+    return v
+      .filter((p): p is string => typeof p === "string" && p.length > 0)
+      .slice(0, RECENT_MAX);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 把一条路径插入历史头部：Windows 路径大小写不敏感，去重按小写比较；
+ * 保留最新一次的大小写写法，截断到 RECENT_MAX 条。
+ */
+function pushRecentPath(list: string[], path: string): string[] {
+  const key = path.toLowerCase();
+  return [path, ...list.filter((p) => p.toLowerCase() !== key)].slice(0, RECENT_MAX);
 }
 
 /**
@@ -338,7 +377,13 @@ interface Messages {
   jumpTitle: string;
   jumpPlaceholder: string;
   jumpPlaceholderRange: (n: number) => string;
+  jumpModalTitle: string;
+  jumpConfirm: string;
+  jumpCancel: string;
+  jumpOutOfRange: (total: number) => string;
   keywordPlaceholder: string;
+  keywordCaseOnTitle: string;
+  keywordCaseOffTitle: string;
   regexPlaceholder: string;
   highlightPlaceholder: string;
   applyFilter: string;
@@ -361,6 +406,9 @@ interface Messages {
   closeTabTitle: string;
   openTab: string;
   openTabTitle: string;
+  recentTitle: string;
+  recentEmpty: string;
+  recentDeleteTitle: string;
   openDialogName: string;
   openFailed: string;
   fontSizeSmaller: string;
@@ -406,7 +454,13 @@ const MESSAGES: Record<Lang, Messages> = {
     jumpTitle: "跳转到文件第 N 行（目标行会被定位到视图中央）",
     jumpPlaceholder: "跳转到行号",
     jumpPlaceholderRange: (n) => `行号 1-${n}`,
+    jumpModalTitle: "跳转到行",
+    jumpConfirm: "确定",
+    jumpCancel: "取消",
+    jumpOutOfRange: (total) => `行号超出范围（1-${total}）`,
     keywordPlaceholder: "关键词（含空格作为完整短语匹配）",
+    keywordCaseOnTitle: "关键词匹配区分大小写：开（点击关闭）",
+    keywordCaseOffTitle: "关键词匹配区分大小写：关（点击开启，忽略大小写）",
     regexPlaceholder: "正则（可选，多条件 OR 如 error|warn）",
     highlightPlaceholder: "高亮关键词（空格分隔多个，实时生效）",
     applyFilter: "过滤",
@@ -429,6 +483,9 @@ const MESSAGES: Record<Lang, Messages> = {
     closeTabTitle: "关闭 tab",
     openTab: "+ 打开日志",
     openTabTitle: "打开新日志文件",
+    recentTitle: "最近打开的日志（历史记录）",
+    recentEmpty: "暂无历史记录",
+    recentDeleteTitle: "删除此记录",
     openDialogName: "日志文件",
     openFailed: "打开失败",
     fontSizeSmaller: "减小字体",
@@ -472,7 +529,13 @@ const MESSAGES: Record<Lang, Messages> = {
     jumpTitle: "Jump to file line N (target line is centered in the view)",
     jumpPlaceholder: "Jump to line",
     jumpPlaceholderRange: (n) => `Line 1-${n}`,
+    jumpModalTitle: "Jump to line",
+    jumpConfirm: "OK",
+    jumpCancel: "Cancel",
+    jumpOutOfRange: (total) => `Line out of range (1-${total})`,
     keywordPlaceholder: "Keyword (spaces match the whole phrase)",
+    keywordCaseOnTitle: "Match keyword case: on (click to turn off)",
+    keywordCaseOffTitle: "Match keyword case: off (click to turn on, ignore case)",
     regexPlaceholder: "Regex (optional, OR conditions like error|warn)",
     highlightPlaceholder: "Highlight keywords (space-separated, live)",
     applyFilter: "Filter",
@@ -495,6 +558,9 @@ const MESSAGES: Record<Lang, Messages> = {
     closeTabTitle: "Close tab",
     openTab: "+ Open log",
     openTabTitle: "Open a new log file",
+    recentTitle: "Recently opened logs (history)",
+    recentEmpty: "No recent files",
+    recentDeleteTitle: "Remove this entry",
     openDialogName: "Log files",
     openFailed: "Failed to open",
     fontSizeSmaller: "Decrease font size",
@@ -606,6 +672,8 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
   const lastEvictRef = useRef(0);
   const [keywordInput, setKeywordInput] = useState("");
   const [regexInput, setRegexInput] = useState("");
+  // 关键词匹配是否区分大小写（默认 false = 忽略大小写，与后端 FilterSpec 默认一致）。
+  const [caseSensitive, setCaseSensitive] = useState(false);
   // 高亮关键词（输入框原始文本 + 解析后的列表，实时生效）。
   const [highlightInput, setHighlightInput] = useState("");
   const highlightKeywords = parseHighlightKeywords(highlightInput);
@@ -617,9 +685,20 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
   const [followTail, setFollowTail] = useState(true);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [wrapLines, setWrapLines] = useState(true);
-  // ---- 跳转到指定行 ----
+  // ---- 跳转到指定行（模态框输入） ----
+  const [jumpOpen, setJumpOpen] = useState(false);
   const [jumpInput, setJumpInput] = useState("");
+  /** 模态框内的校验/失败提示；null = 无提示。 */
+  const [jumpError, setJumpError] = useState<string | null>(null);
   const [jumping, setJumping] = useState(false);
+  const jumpInputRef = useRef<HTMLInputElement>(null);
+  // 模态框打开时聚焦并全选已有内容（便于直接输入覆盖）。
+  useEffect(() => {
+    if (jumpOpen) {
+      jumpInputRef.current?.focus();
+      jumpInputRef.current?.select();
+    }
+  }, [jumpOpen]);
   const [totalLines, setTotalLines] = useState<number | null>(null);
   const totalLinesRef = useRef<number | null>(totalLines);
   totalLinesRef.current = totalLines;
@@ -1595,63 +1674,78 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
         try {
           const keywords = tokenizeKeywordInput(keywordInput);
           const regex = regexInput.trim() || null;
-          await invoke("set_filter", { tabId, keywords, regex, caseSensitive: false });
+          await invoke("set_filter", { tabId, keywords, regex, caseSensitive });
         } catch {
           /* 静默失败 */
         }
       }
     },
-    [tabId, keywordInput, regexInput]
+    [tabId, keywordInput, regexInput, caseSensitive]
   );
 
-  const applyFilter = useCallback(async () => {
-    const keywords = tokenizeKeywordInput(keywordInput);
-    const regex = regexInput.trim() || null;
-    const hasSpec = keywords.length > 0 || regex != null;
-    if (!hasSpec && !filterActiveRef.current) {
-      return; // 稀疏且无过滤条件：无需操作
-    }
-    try {
-      if (!hasSpec) {
-        // 清空过滤：回到稀疏模型，锚定在当前视口位置（保持阅读位置）。
-        const items = virtualizer.getVirtualItems();
-        const first = items.length > 0 ? lines[items[0].index] : undefined;
-        const anchorLine = first?.file_line ?? 1;
-        await invoke("set_filter", { tabId, keywords, regex, caseSensitive: false });
-        setFilterActive(false);
-        setSegments(new Map());
-        setJumpRequest({ target: Math.max(0, anchorLine - 1) });
-      } else if (!filterActiveRef.current) {
-        // 稀疏 → 旧窗口：先按当前锚点物化跳转窗口（后端 all_lines），再应用过滤。
-        const items = virtualizer.getVirtualItems();
-        const anchor = items.length > 0 ? items[0].index + 1 : 1;
-        const j = await invoke<JumpPayload>("jump_to_line", { tabId, lineNo: anchor });
-        const matched = await invoke<LogLine[]>("set_filter", {
-          tabId,
-          keywords,
-          regex,
-          caseSensitive: false,
-        });
-        setLines(clampFrontLines(matched));
-        setHasMoreHistory(j.has_more);
-        setFilterActive(true);
-        setFollowTail(false);
-        const targetIdx = matched.findIndex((l) => l.file_line >= anchor);
-        setJumpRequest({ target: targetIdx >= 0 ? targetIdx : Math.max(matched.length - 1, 0) });
-      } else {
-        // 旧窗口模型内更新过滤：返回值即重扫结果（log-lines reset 事件与之等价）。
-        const matched = await invoke<LogLine[]>("set_filter", {
-          tabId,
-          keywords,
-          regex,
-          caseSensitive: false,
-        });
-        setLines(clampFrontLines(matched));
+  const applyFilter = useCallback(
+    async (caseOverride?: boolean) => {
+      const keywords = tokenizeKeywordInput(keywordInput);
+      const regex = regexInput.trim() || null;
+      // caseOverride 由大小写开关立即重扫时传入；否则用当前状态值。
+      const cs = caseOverride ?? caseSensitive;
+      const hasSpec = keywords.length > 0 || regex != null;
+      if (!hasSpec && !filterActiveRef.current) {
+        return; // 稀疏且无过滤条件：无需操作
       }
-    } catch {
-      /* 静默失败 */
+      try {
+        if (!hasSpec) {
+          // 清空过滤：回到稀疏模型，锚定在当前视口位置（保持阅读位置）。
+          const items = virtualizer.getVirtualItems();
+          const first = items.length > 0 ? lines[items[0].index] : undefined;
+          const anchorLine = first?.file_line ?? 1;
+          await invoke("set_filter", { tabId, keywords, regex, caseSensitive: cs });
+          setFilterActive(false);
+          setSegments(new Map());
+          setJumpRequest({ target: Math.max(0, anchorLine - 1) });
+        } else if (!filterActiveRef.current) {
+          // 稀疏 → 旧窗口：先按当前锚点物化跳转窗口（后端 all_lines），再应用过滤。
+          const items = virtualizer.getVirtualItems();
+          const anchor = items.length > 0 ? items[0].index + 1 : 1;
+          const j = await invoke<JumpPayload>("jump_to_line", { tabId, lineNo: anchor });
+          const matched = await invoke<LogLine[]>("set_filter", {
+            tabId,
+            keywords,
+            regex,
+            caseSensitive: cs,
+          });
+          setLines(clampFrontLines(matched));
+          setHasMoreHistory(j.has_more);
+          setFilterActive(true);
+          setFollowTail(false);
+          const targetIdx = matched.findIndex((l) => l.file_line >= anchor);
+          setJumpRequest({ target: targetIdx >= 0 ? targetIdx : Math.max(matched.length - 1, 0) });
+        } else {
+          // 旧窗口模型内更新过滤：返回值即重扫结果（log-lines reset 事件与之等价）。
+          const matched = await invoke<LogLine[]>("set_filter", {
+            tabId,
+            keywords,
+            regex,
+            caseSensitive: cs,
+          });
+          setLines(clampFrontLines(matched));
+        }
+      } catch {
+        /* 静默失败 */
+      }
+    },
+    [tabId, keywordInput, regexInput, caseSensitive, lines, virtualizer]
+  );
+
+  /** 关键词大小写开关：过滤已生效时立即用新设置重扫；
+   *  未生效时仅记录偏好，下次点击「过滤」时生效。 */
+  const toggleCaseSensitive = useCallback(() => {
+    const next = !caseSensitive;
+    setCaseSensitive(next);
+    if (filterActiveRef.current) {
+      void applyFilter(next);
     }
-  }, [tabId, keywordInput, regexInput, lines, virtualizer]);
+  }, [caseSensitive, applyFilter]);
 
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") {
@@ -1662,10 +1756,11 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
   // 跳转执行：lineNo 为文件行号（1-based；0 = 最后一行）。
   // 后端定位并加载窗口，整体替换视图；过滤条件继续生效，
   // 向上滚动仍可加载更早历史。
+  // 返回值：null = 成功；字符串 = 错误信息（供跳转模态框显示）。
   const performJump = useCallback(
-    async (lineNo: number) => {
+    async (lineNo: number): Promise<string | null> => {
       if (jumping) {
-        return;
+        return null;
       }
       setJumping(true);
       try {
@@ -1689,8 +1784,9 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
           const abs = (lineNo === 0 ? res.total_lines : lineNo) - 1;
           setJumpRequest({ target: Math.max(0, Math.min(abs, Math.max(res.total_lines - 1, 0))) });
         }
-      } catch {
-        /* 静默失败：跳转状态由视图是否变化体现 */
+        return null;
+      } catch (e) {
+        return String(e);
       } finally {
         setJumping(false);
       }
@@ -1698,15 +1794,50 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
     [tabId, jumping]
   );
 
-  // 输入框跳转：解析行号并调用 performJump。
-  const jumpToLine = useCallback(async () => {
-    const n = Number(jumpInput);
-    if (!Number.isInteger(n) || n < 1) {
+  // 打开跳转模态框。
+  const openJumpModal = useCallback(() => {
+    setJumpError(null);
+    setJumpOpen(true);
+  }, []);
+
+  // 取消跳转：收起模态框并清空输入。
+  const cancelJump = useCallback(() => {
+    setJumpOpen(false);
+    setJumpError(null);
+    setJumpInput("");
+  }, []);
+
+  // 模态框内确认：校验行号（≥1 整数、不超过总行数），失败显示原因，
+  // 成功则收起模态框。后端校验兜底（文件为空/行号超限等）。
+  const confirmJump = useCallback(async () => {
+    const raw = jumpInput.trim();
+    const n = Number(raw);
+    if (raw === "" || !Number.isInteger(n) || n < 1) {
+      setJumpError(t.invalidLine);
       return;
     }
-    setJumpInput("");
-    void performJump(n);
-  }, [jumpInput, performJump]);
+    if (totalLines != null && n > totalLines) {
+      setJumpError(t.jumpOutOfRange(totalLines));
+      return;
+    }
+    setJumpError(null);
+    const err = await performJump(n);
+    if (err == null) {
+      setJumpOpen(false);
+      setJumpInput("");
+    } else {
+      setJumpError(t.jumpFailed(err));
+    }
+  }, [jumpInput, totalLines, performJump, t]);
+
+  // 模态框输入框按键：Enter 确认，Escape 取消。
+  const onJumpKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter") {
+      void confirmJump();
+    } else if (e.key === "Escape") {
+      cancelJump();
+    }
+  };
 
   // 置顶：文件头已加载则直接滚动（保留已加载内容），否则跳转到第 1 行。
   const gotoTop = useCallback(() => {
@@ -1984,21 +2115,8 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
         <button onClick={gotoBottom} title={t.gotoBottomTitle}>
           {t.gotoBottom}
         </button>
-        <input
-          className="jump"
-          value={jumpInput}
-          onChange={(e) => setJumpInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              void jumpToLine();
-            }
-          }}
-          placeholder={totalLines != null ? t.jumpPlaceholderRange(totalLines) : t.jumpPlaceholder}
-          inputMode="numeric"
-          title={t.jumpTitle}
-        />
-        <button onClick={() => void jumpToLine()} disabled={jumping} title={t.jumpTitle}>
-          {jumping ? "…" : t.jump}
+        <button onClick={openJumpModal} title={t.jumpTitle}>
+          {t.jump}
         </button>
       </div>
 
@@ -2010,6 +2128,30 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
           onKeyDown={onKeyDown}
           placeholder={t.keywordPlaceholder}
         />
+        <button
+          className={`case-btn${caseSensitive ? " on" : ""}`}
+          onClick={toggleCaseSensitive}
+          title={caseSensitive ? t.keywordCaseOnTitle : t.keywordCaseOffTitle}
+          aria-pressed={caseSensitive}
+        >
+          <svg width="18" height="13" viewBox="0 0 18 13" aria-hidden="true">
+            <text
+              x="9"
+              y="10"
+              textAnchor="middle"
+              fontSize="10.5"
+              fontWeight="700"
+              fill="currentColor"
+              fontFamily="inherit"
+            >
+              Aa
+            </text>
+            {/* 忽略大小写时给 Aa 加删除线；开启区分大小写时无删除线 */}
+            {!caseSensitive && (
+              <line x1="3" y1="12" x2="15" y2="12" stroke="currentColor" strokeWidth="1" />
+            )}
+          </svg>
+        </button>
         <input
           className="regex"
           value={regexInput}
@@ -2023,7 +2165,7 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
           onChange={(e) => setHighlightInput(e.target.value)}
           placeholder={t.highlightPlaceholder}
         />
-        <button onClick={applyFilter}>{t.applyFilter}</button>
+        <button onClick={() => void applyFilter()}>{t.applyFilter}</button>
         <button
           className="view-body-btn"
           onClick={openContentViewer}
@@ -2231,6 +2373,63 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
           </div>
         </div>
       ) : null}
+
+      {jumpOpen ? (
+        <div
+          className="body-modal-overlay"
+          onClick={cancelJump}
+          onKeyDown={(e) => {
+            // 焦点在输入框之外（如按钮）时也能 Esc 取消。
+            if (e.key === "Escape") {
+              cancelJump();
+            }
+          }}
+        >
+          <div
+            className="jump-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={t.jumpModalTitle}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="jump-modal-title">{t.jumpModalTitle}</div>
+            <input
+              ref={jumpInputRef}
+              className="jump-modal-input"
+              value={jumpInput}
+              onChange={(e) => {
+                setJumpInput(e.target.value);
+                setJumpError(null);
+              }}
+              onKeyDown={onJumpKeyDown}
+              placeholder={
+                totalLines != null ? t.jumpPlaceholderRange(totalLines) : t.jumpPlaceholder
+              }
+              inputMode="numeric"
+              spellCheck={false}
+            />
+            {jumpError != null ? <div className="jump-modal-error">{jumpError}</div> : null}
+            <div className="jump-modal-actions">
+              <button
+                className="body-modal-btn jump-cancel"
+                onClick={cancelJump}
+                disabled={jumping}
+                title={t.jumpCancel}
+              >
+                {t.jumpCancel}
+              </button>
+              <button
+                className="body-modal-btn"
+                onClick={() => void confirmJump()}
+                disabled={jumping}
+                title={t.jumpConfirm}
+              >
+                {jumping ? "…" : t.jumpConfirm}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -2241,6 +2440,15 @@ export default function App() {
   const [opening, setOpening] = useState(false);
   // 文件拖拽进行中：显示全屏放置提示遮罩。
   const [dragActive, setDragActive] = useState(false);
+
+  // ---- 最近打开记录（首行最左侧历史下拉） ----
+  const [recentPaths, setRecentPaths] = useState<string[]>(() => readRecentPaths());
+  const [recentOpen, setRecentOpen] = useState(false);
+  // 下拉菜单的固定定位坐标（展开时从图标矩形读取；tabbar 是滚动容器，
+  // 菜单经 portal 渲染到 body 上避免被 overflow 裁剪）。
+  const [recentMenuPos, setRecentMenuPos] = useState<{ left: number; top: number } | null>(null);
+  const recentBtnRef = useRef<HTMLButtonElement>(null);
+  const recentMenuRef = useRef<HTMLDivElement>(null);
 
   // ---- 文件记忆：保存当前标签页（在恢复完成前不写入，避免空列表覆盖存档） ----
   const restoredRef = useRef(false);
@@ -2262,6 +2470,48 @@ export default function App() {
       /* localStorage 不可用时静默 */
     }
   }, [tabs, activeTabId]);
+
+  // 最近打开记录持久化（仅保存路径，不做任何文件系统检查）。
+  useEffect(() => {
+    try {
+      localStorage.setItem(RECENT_KEY, JSON.stringify(recentPaths));
+    } catch {
+      /* localStorage 不可用时静默 */
+    }
+  }, [recentPaths]);
+
+  // 历史下拉展开时：点击菜单外任意处 / 按 Esc / 窗口尺寸变化时收起。
+  useEffect(() => {
+    if (!recentOpen) {
+      return;
+    }
+    const onDown = (e: MouseEvent) => {
+      const menu = recentMenuRef.current;
+      const btn = recentBtnRef.current;
+      const target = e.target as Node;
+      // 图标按钮自身负责 toggle（否则 mousedown 先关、click 又开，开关失灵）。
+      if (btn && btn.contains(target)) {
+        return;
+      }
+      if (menu && !menu.contains(target)) {
+        setRecentOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setRecentOpen(false);
+      }
+    };
+    const onResize = () => setRecentOpen(false);
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    window.addEventListener("resize", onResize);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+      window.removeEventListener("resize", onResize);
+    };
+  }, [recentOpen]);
 
   // 恢复：挂载时读上次会话，重建标签页并重新打开文件。
   useEffect(() => {
@@ -2407,6 +2657,8 @@ export default function App() {
   const openPath = useCallback(async (selected: string) => {
     const id = nextTabId();
     const name = selected.split(/[\\/]/).pop() || selected;
+    // 记录到最近打开历史（去重、上限 10 条；不做存在性检查）。
+    setRecentPaths((prev) => pushRecentPath(prev, selected));
     // 先建 tab，再让后端打开文件。
     setTabs((prev) => [...prev, { id, title: name, path: selected }]);
     setActiveTabId(id);
@@ -2468,6 +2720,39 @@ export default function App() {
     }
   }, [appT, openPath]);
 
+  /** 历史下拉的开关：展开时从图标矩形读取坐标（portal 定位用）。 */
+  const toggleRecentMenu = useCallback(() => {
+    if (recentOpen) {
+      setRecentOpen(false);
+      return;
+    }
+    const r = recentBtnRef.current?.getBoundingClientRect();
+    setRecentMenuPos(r ? { left: r.left, top: r.bottom } : { left: 0, top: 0 });
+    setRecentOpen(true);
+  }, [recentOpen]);
+
+  /** 历史菜单选中一项：同路径的 tab 已打开（且打开成功）→ 激活它，不新建；
+   *  否则走常规打开流程。Windows 路径大小写不敏感，按小写比较。 */
+  const openRecent = useCallback(
+    (path: string) => {
+      setRecentOpen(false);
+      const key = path.toLowerCase();
+      const existing = tabs.find((t) => t.path.toLowerCase() === key && !t.openError);
+      if (existing) {
+        setActiveTabId(existing.id);
+        return;
+      }
+      void openPath(path);
+    },
+    [tabs, openPath]
+  );
+
+  /** 单独删除一条历史记录（菜单保持展开，便于连续删除）。 */
+  const removeRecent = useCallback((path: string) => {
+    const key = path.toLowerCase();
+    setRecentPaths((prev) => prev.filter((p) => p.toLowerCase() !== key));
+  }, []);
+
   // 自动化/调试钩子：绕过系统文件对话框直接打开文件（供 E2E 测试驱动 UI）。
   useEffect(() => {
     const w = window as unknown as { __lvOpenPath?: (path: string) => void };
@@ -2499,6 +2784,19 @@ export default function App() {
       style={{ "--log-font-size": `${fontSize}px` } as React.CSSProperties}
     >
       <div className="tabbar">
+        <button
+          className="recent-btn"
+          ref={recentBtnRef}
+          onClick={toggleRecentMenu}
+          title={appT.recentTitle}
+          aria-haspopup="menu"
+          aria-expanded={recentOpen}
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="1.2" />
+            <path d="M8 4.5V8l2.5 1.5" stroke="currentColor" strokeWidth="1.2" fill="none" />
+          </svg>
+        </button>
         <div className="tabs">
           {tabs.map((t) => (
             <div
@@ -2591,6 +2889,41 @@ export default function App() {
           </button>
         </div>
       </div>
+
+      {recentOpen && recentMenuPos
+        ? createPortal(
+            <div
+              className="recent-menu"
+              ref={recentMenuRef}
+              role="menu"
+              style={{ position: "fixed", left: recentMenuPos.left, top: recentMenuPos.top }}
+            >
+              {recentPaths.length === 0 ? (
+                <div className="recent-empty">{appT.recentEmpty}</div>
+              ) : (
+                recentPaths.map((p) => {
+                  const name = p.split(/[\\/]/).pop() || p;
+                  return (
+                    <div key={p.toLowerCase()} className="recent-item" role="menuitem" title={p}>
+                      <button className="recent-open" onClick={() => openRecent(p)}>
+                        <span className="recent-name">{name}</span>
+                        <span className="recent-path">{p}</span>
+                      </button>
+                      <button
+                        className="recent-del"
+                        onClick={() => removeRecent(p)}
+                        title={appT.recentDeleteTitle}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  );
+                })
+              )}
+            </div>,
+            document.body
+          )
+        : null}
 
       {tabs.length > 0 ? (
         <>
