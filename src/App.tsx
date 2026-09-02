@@ -415,6 +415,8 @@ interface Messages {
   fontSizeBigger: string;
   switchToLight: string;
   switchToDark: string;
+  alwaysOnTopOn: string;
+  alwaysOnTopOff: string;
   switchLangTitle: (current: Lang) => string;
   copyViewTitle: string;
   copyViewOk: string;
@@ -492,6 +494,8 @@ const MESSAGES: Record<Lang, Messages> = {
     fontSizeBigger: "增大字体",
     switchToLight: "切换到浅色主题",
     switchToDark: "切换到深色主题",
+    alwaysOnTopOn: "取消窗口置顶",
+    alwaysOnTopOff: "窗口始终置顶",
     switchLangTitle: (cur) => (cur === "zh" ? "Switch to English" : "切换为中文"),
     copyViewTitle: "复制当前正文（若使用过滤，则复制过滤后的内容）",
     copyViewOk: "已复制",
@@ -567,6 +571,8 @@ const MESSAGES: Record<Lang, Messages> = {
     fontSizeBigger: "Increase font size",
     switchToLight: "Switch to light theme",
     switchToDark: "Switch to dark theme",
+    alwaysOnTopOn: "Turn off always-on-top",
+    alwaysOnTopOff: "Keep window always on top",
     switchLangTitle: (cur) => (cur === "zh" ? "Switch to English" : "切换为中文"),
     copyViewTitle: "Copy the current view (filtered content when a filter is active)",
     copyViewOk: "Copied",
@@ -2597,6 +2603,17 @@ export default function App() {
     setTheme((t) => (t === "dark" ? "light" : "dark"));
   }, []);
 
+  // ---- 窗口「始终置顶」 ----
+  // 后端 toggle_always_on_top 返回权威结果，本地 UI 状态据此回滚，避免窗口错配。
+  const [alwaysOnTop, setAlwaysOnTop] = useState(false);
+  const toggleAlwaysOnTop = useCallback(() => {
+    void invoke<boolean>("toggle_always_on_top")
+      .then((v) => setAlwaysOnTop(v))
+      .catch(() => {
+        /* 后端不可用（如 dev 浏览器）时静默忽略 */
+      });
+  }, []);
+
   const toggleLang = useCallback(() => {
     setLang((l) => (l === "zh" ? "en" : "zh"));
   }, []);
@@ -2878,6 +2895,22 @@ export default function App() {
             <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
               <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="1.2" />
               <path d="M2 8h12M8 2c-4.5 3-4.5 9 0 12M8 2c4.5 3 4.5 9 0 12" stroke="currentColor" strokeWidth="1.2" />
+            </svg>
+          </button>
+          <button
+            className="icon-btn always-on-top"
+            onClick={toggleAlwaysOnTop}
+            title={alwaysOnTop ? appT.alwaysOnTopOn : appT.alwaysOnTopOff}
+            aria-pressed={alwaysOnTop}
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+              <path
+                d="M5.5 10V5.5a2.5 2.5 0 0 1 5 0V10"
+                stroke="currentColor"
+                strokeWidth="1.3"
+                fill="none"
+              />
+              <path d="M8 10v3" stroke="currentColor" strokeWidth="1.3" />
             </svg>
           </button>
           <button

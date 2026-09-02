@@ -300,6 +300,12 @@ body,
   background: transparent;
 }
 
+/* 窗口「始终置顶」开关：激活时高亮为 accent，提示当前置顶状态。 */
+.tabbar .tabbar-right .icon-btn.always-on-top[aria-pressed="true"] {
+  color: var(--accent-soft);
+  background-color: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
 .tabbar .tabbar-right .font-label {
   color: var(--text-dim);
   font-size: 12px;

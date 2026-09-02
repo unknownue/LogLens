@@ -11,7 +11,7 @@ use std::sync::Arc;
 use filter::FilterSpec;
 use state::{start_watching_for_session, AppState, JumpPayload, LinesPayload};
 use tail::LogLine;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tracing::instrument;
 
 /// 初始化 Tracy 采样：仅 `tracy` feature 且环境变量 `TRACY=1` 时启用。
@@ -202,6 +202,18 @@ fn report_first_paint() {
     perf::mark("frontend:first-paint");
 }
 
+/// 切换主窗口「始终置顶」状态，返回切换后的实际状态。
+/// 使用 toggle 语义：前端记录本地 UI 状态，后端返回权威结果以便回滚错配。
+#[tauri::command]
+fn toggle_always_on_top(app: tauri::AppHandle) -> Result<bool, String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "未找到主窗口".to_string())?;
+    let current = window.is_always_on_top().map_err(|e| e.to_string())?;
+    window.set_always_on_top(!current).map_err(|e| e.to_string())?;
+    Ok(!current)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     perf::mark("run:start");
@@ -224,7 +236,8 @@ pub fn run() {
             jump_to_line,
             get_total_lines,
             get_block_avg_lens,
-            report_first_paint
+            report_first_paint,
+            toggle_always_on_top
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
