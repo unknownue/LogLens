@@ -1,5 +1,6 @@
 //! Tauri 后端入口：注册命令、初始化后台日志监控。
 
+mod client_cfg;
 mod filter;
 mod index;
 pub mod perf;
@@ -214,6 +215,18 @@ fn toggle_always_on_top(app: tauri::AppHandle) -> Result<bool, String> {
     Ok(!current)
 }
 
+/// 启动命令行传入的文件路径（“用 LogLens 打开”入口）：返回存在且为文件的参数。
+/// 前端挂载时调用一次，逐个 openPath。
+#[tauri::command]
+fn get_startup_paths() -> Vec<String> {
+    std::env::args()
+        .skip(1)
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
+        .map(|p| p.to_string_lossy().to_string())
+        .collect()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     perf::mark("run:start");
@@ -237,7 +250,9 @@ pub fn run() {
             get_total_lines,
             get_block_avg_lens,
             report_first_paint,
-            toggle_always_on_top
+            toggle_always_on_top,
+            client_cfg::parse_client_cfg_bin,
+            get_startup_paths
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

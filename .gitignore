@@ -26,3 +26,7 @@ src-tauri/gen/
 *.njsproj
 *.sln
 *.sw?
+
+# Python tools
+__pycache__/
+*.pyc

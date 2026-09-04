@@ -12,6 +12,7 @@ Designed for large log files: follow them in real time and browse anywhere witho
 - **Line index** — a sampled (every 64 lines) byte-offset index makes line lookups and line counts O(sample gap) instead of a full file scan.
 - **Session restore** — reopens the tabs from the previous run; missing files show a warning instead of crashing.
 - **Extras** — multi-tab, jump-to-line, keyword highlighting, copy-view, recent-files dropdown (last 10 opens, keeps missing files), bilingual UI (中文 / English).
+- **Config-table viewer** — every file opens as a log by default; the top-right icon button (grid ⇄ lines) switches the *active* tab to a GM10 `client_cfg` config-table view (MemoryPack), parsed with the schema in `cfg_table_slots.json` (auto-located from the file path, or picked manually). Each tab's mode is independent; the table is virtualized with a sticky header and copy-view exports TSV. Format spec: [docs/client_cfg_bin_format.md](docs/client_cfg_bin_format.md).
 
 ## Requirements
 

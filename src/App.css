@@ -1037,3 +1037,130 @@ body,
   border-color: var(--border-light);
   color: var(--text-bright);
 }
+
+/* ==================== client_cfg 表格视图 ==================== */
+
+.cfg-tab {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.cfg-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  background: var(--bg-bar);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.cfg-name {
+  color: var(--path);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cfg-lang {
+  color: var(--status);
+  border: 1px solid var(--border-light);
+  border-radius: 3px;
+  padding: 0 6px;
+  font-size: 11px;
+}
+
+.cfg-count {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.cfg-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+}
+
+.cfg-btn {
+  background: var(--bg-hover);
+  color: var(--text);
+  border: 1px solid var(--border-light);
+  border-radius: 3px;
+  padding: 2px 10px;
+  cursor: pointer;
+}
+
+.cfg-btn:hover {
+  background: var(--border-light);
+}
+
+.cfg-error {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  padding: 20px;
+}
+
+.cfg-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: var(--log-font-size);
+}
+
+.cfg-inner {
+  position: relative;
+}
+
+.cfg-head {
+  z-index: 2;
+  background: var(--bg-bar);
+  border-bottom: 1px solid var(--border-light);
+}
+
+.cfg-row {
+  border-bottom: 1px solid var(--row-border);
+}
+
+.cfg-row:hover {
+  background: var(--row-hover);
+}
+
+.cfg-cell {
+  padding: 3px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-right: 1px solid var(--row-border);
+  min-width: 0;
+}
+
+.cfg-head-cell {
+  color: var(--accent-soft);
+  font-weight: 600;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.cfg-ftype {
+  color: var(--text-dim);
+  font-weight: 400;
+  font-size: 10px;
+}
+
+.cfg-key {
+  color: var(--lineno);
+}
+
+/* 右上角「表格/文本」模式切换图标：表格模式激活时高亮 */
+.icon-btn.cfg-toggle.on {
+  color: var(--accent-soft);
+}

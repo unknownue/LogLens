@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
+import { CfgTableTab, type ClientCfgTable } from "./CfgTableTab";
 import "./App.css";
 
 /** 一行日志（与后端 LogLine 对应）。 */
@@ -49,6 +50,8 @@ interface TabInfo {
   id: string;
   title: string;
   path: string;
+  /** 当前视图模式：默认文本（日志），用户可手动切换为 client_cfg 表格。 */
+  viewMode?: "text" | "cfg";
   /** 打开失败（如恢复上次会话时文件已被删除）时的错误信息；成功打开为 undefined。 */
   openError?: string;
 }
@@ -438,6 +441,8 @@ interface Messages {
   viewBodySizeLarge: string;
   viewBodySizeMax: string;
   dropToOpen: string;
+  cfgViewTitle: string;
+  cfgBackTextTitle: string;
 }
 
 const MESSAGES: Record<Lang, Messages> = {
@@ -517,6 +522,8 @@ const MESSAGES: Record<Lang, Messages> = {
     viewBodySizeLarge: "大",
     viewBodySizeMax: "最大",
     dropToOpen: "松开以打开文件",
+    cfgViewTitle: "切换为表格视图（以 client_cfg 配置表格式解析当前文件）",
+    cfgBackTextTitle: "切回文本视图",
   },
   en: {
     notOpened: "No file opened",
@@ -594,6 +601,8 @@ const MESSAGES: Record<Lang, Messages> = {
     viewBodySizeLarge: "Large",
     viewBodySizeMax: "Max",
     dropToOpen: "Drop files to open",
+    cfgViewTitle: "Switch to table view (parse current file as a client_cfg config table)",
+    cfgBackTextTitle: "Switch back to text view",
   },
 };
 
@@ -2519,17 +2528,67 @@ export default function App() {
     };
   }, [recentOpen]);
 
-  // 恢复：挂载时读上次会话，重建标签页并重新打开文件。
+  // ---- client_cfg 表格数据（.bin tab 的解析结果，key 为 tabId） ----
+  const [cfgTables, setCfgTables] = useState<Record<string, ClientCfgTable>>({});
+
+  /** 解析一个 client_cfg bin：成功存表数据，失败标记到该 tab。 */
+  const parseCfg = useCallback(
+    async (tabId: string, binPath: string, slotsPath?: string) => {
+      try {
+        const table = await invoke<ClientCfgTable>("parse_client_cfg_bin", {
+          path: binPath,
+          slotsPath: slotsPath ?? null,
+        });
+        setCfgTables((prev) => ({ ...prev, [tabId]: table }));
+        setTabs((prev) =>
+          prev.map((t) => (t.id === tabId ? { ...t, openError: undefined } : t))
+        );
+      } catch (e) {
+        setTabs((prev) =>
+          prev.map((t) => (t.id === tabId ? { ...t, openError: String(e) } : t))
+        );
+      }
+    },
+    []
+  );
+
+  /** 手动选择 cfg_table_slots.json 后重新解析指定 tab。 */
+  const pickCfgSchema = useCallback(
+    async (tabId: string, binPath: string) => {
+      try {
+        const selected = await open({
+          multiple: false,
+          filters: [{ name: "cfg_table_slots.json", extensions: ["json"] }],
+        });
+        if (typeof selected === "string") {
+          await parseCfg(tabId, binPath, selected);
+        }
+      } catch (e) {
+        console.error("pickCfgSchema failed", e);
+      }
+    },
+    [parseCfg]
+  );
+
+  // 恢复：挂载时读上次会话，重建标签页并重新打开文件（默认全部按文本打开）。
   useEffect(() => {
     const saved = readSavedTabs();
     restoredRef.current = true; // 先标记完成，避免后续保存被跳过
     if (!saved || saved.paths.length === 0) {
       return;
     }
-    const list: TabInfo[] = saved.paths.map((p) => {
+    // 历史存档可能有重复路径（旧版本/异常场景），按 Windows 大小写不敏感去重。
+    const seen = new Set<string>();
+    const list: TabInfo[] = [];
+    for (const p of saved.paths) {
+      const key = p.toLowerCase();
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
       const id = nextTabId();
-      return { id, title: p.split(/[\\/]/).pop() || p, path: p };
-    });
+      list.push({ id, title: p.split(/[\\/]/).pop() || p, path: p });
+    }
     setTabs(list);
     setActiveTabId(list[saved.active]?.id ?? list[list.length - 1]?.id ?? null);
     for (const t of list) {
@@ -2669,9 +2728,19 @@ export default function App() {
     window.setTimeout(() => setCopyFeedback("idle"), 1200);
   }, []);
 
-  // 打开新文件：新建一个 tab。
+  // 打开新文件：新建一个 tab（默认文本视图；MemoryPack 表格视图由用户手动切换）。
+  // 同路径（Windows 大小写不敏感）已打开且未失败时直接激活，不重复打开。
+  const tabsRef = useRef<TabInfo[]>([]);
+  tabsRef.current = tabs;
+
   /** 打开指定路径（对话框选中后 / 自动化钩子 / 会话恢复共用）。 */
   const openPath = useCallback(async (selected: string) => {
+    const key = selected.toLowerCase();
+    const existing = tabsRef.current.find((t) => t.path.toLowerCase() === key && !t.openError);
+    if (existing) {
+      setActiveTabId(existing.id);
+      return;
+    }
     const id = nextTabId();
     const name = selected.split(/[\\/]/).pop() || selected;
     // 记录到最近打开历史（去重、上限 10 条；不做存在性检查）。
@@ -2686,6 +2755,23 @@ export default function App() {
       setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, openError: String(e) } : t)));
     }
   }, []);
+
+  /** 切换指定 tab 的视图模式；切到表格时触发 client_cfg 解析。 */
+  const switchViewMode = useCallback(
+    (tabId: string, mode: "text" | "cfg", binPath: string) => {
+      setTabs((prev) =>
+        prev.map((t) =>
+          t.id === tabId
+            ? { ...t, viewMode: mode, openError: mode === "cfg" ? undefined : t.openError }
+            : t
+        )
+      );
+      if (mode === "cfg") {
+        void parseCfg(tabId, binPath);
+      }
+    },
+    [parseCfg]
+  );
 
   // 文件拖拽打开：监听 Tauri 原生拖放事件（Windows 上走 WebView2 原生 DnD，
   // 无需 HTML5 DataTransfer，可直接拿到文件系统路径）。
@@ -2725,7 +2811,7 @@ export default function App() {
     try {
       const selected = await open({
         multiple: false,
-        filters: [{ name: appT.openDialogName, extensions: ["log", "txt", "*"] }],
+        filters: [{ name: appT.openDialogName, extensions: ["log", "txt", "bin", "*"] }],
       });
       if (typeof selected === "string") {
         await openPath(selected);
@@ -2781,9 +2867,32 @@ export default function App() {
     };
   }, [openPath]);
 
+  // 启动参数传入的文件（“用 LogLens 打开”入口）：挂载后逐个打开。
+  useEffect(() => {
+    void invoke<string[]>("get_startup_paths")
+      .then((paths) => {
+        for (const p of paths) {
+          void openPath(p);
+        }
+      })
+      .catch(() => {
+        /* 后端不可用（如 dev 浏览器）时静默忽略 */
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const closeTab = useCallback(
     (id: string) => {
+      // 无论文本还是表格视图，后端会话都要清理。
       void invoke("close_tab", { tabId: id });
+      setCfgTables((prev) => {
+        if (!(id in prev)) {
+          return prev;
+        }
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
       setTabs((prev) => {
         const next = prev.filter((t) => t.id !== id);
         if (activeTabId === id) {
@@ -2794,6 +2903,10 @@ export default function App() {
     },
     [activeTabId]
   );
+
+  /** 当前激活 tab 及其视图模式（右上角「表格/文本」切换图标用）。 */
+  const activeTab = tabs.find((t) => t.id === activeTabId);
+  const activeIsCfg = activeTab?.viewMode === "cfg";
 
   return (
     <div
@@ -2858,6 +2971,30 @@ export default function App() {
             disabled={fontSize >= 20}
           >
             A+
+          </button>
+          <button
+            className={`icon-btn cfg-toggle${activeIsCfg ? " on" : ""}`}
+            onClick={() => {
+              if (activeTab) {
+                switchViewMode(activeTab.id, activeIsCfg ? "text" : "cfg", activeTab.path);
+              }
+            }}
+            disabled={!activeTab}
+            aria-pressed={activeIsCfg}
+            title={activeIsCfg ? appT.cfgBackTextTitle : appT.cfgViewTitle}
+          >
+            {activeIsCfg ? (
+              /* 文本视图图标：多行文字 */
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                <path d="M3 4h10M3 8h10M3 12h6" stroke="currentColor" strokeWidth="1.3" />
+              </svg>
+            ) : (
+              /* 表格视图图标：网格 */
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                <rect x="2.5" y="3.5" width="11" height="9" rx="1" stroke="currentColor" strokeWidth="1.2" />
+                <path d="M2.5 6.5h11M2.5 9.5h11M6.2 3.5v9M9.8 3.5v9" stroke="currentColor" strokeWidth="1.2" />
+              </svg>
+            )}
           </button>
           <button
             className="icon-btn copy-view"
@@ -2966,17 +3103,32 @@ export default function App() {
               className="tab-panel"
               style={{ display: t.id === activeTabId ? "flex" : "none" }}
             >
-              <LogTab
-                tabId={t.id}
-                path={t.path}
-                openError={t.openError}
-                active={t.id === activeTabId}
-                fontSize={fontSize}
-                lang={lang}
-                onClose={() => closeTab(t.id)}
-                registerCopy={registerCopy}
-                reportTotal={reportTotal}
-              />
+              {t.viewMode === "cfg" ? (
+                <CfgTableTab
+                  tabId={t.id}
+                  path={t.path}
+                  data={cfgTables[t.id] ?? null}
+                  error={t.openError}
+                  active={t.id === activeTabId}
+                  fontSize={fontSize}
+                  uiLang={lang}
+                  onPickSchema={() => void pickCfgSchema(t.id, t.path)}
+                  registerCopy={registerCopy}
+                  reportTotal={reportTotal}
+                />
+              ) : (
+                <LogTab
+                  tabId={t.id}
+                  path={t.path}
+                  openError={t.openError}
+                  active={t.id === activeTabId}
+                  fontSize={fontSize}
+                  lang={lang}
+                  onClose={() => closeTab(t.id)}
+                  registerCopy={registerCopy}
+                  reportTotal={reportTotal}
+                />
+              )}
             </div>
           ))}
         </>
