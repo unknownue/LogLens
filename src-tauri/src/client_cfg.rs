@@ -34,6 +34,7 @@
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use tauri::Manager;
 
 // ============================== 值类型 ==============================
 
@@ -577,29 +578,6 @@ pub fn load_schema(slots_path: &Path) -> Result<HashMap<String, Vec<(String, Str
     Ok(out)
 }
 
-/// 从 bin 路径自动定位 cfg_table_slots.json。
-/// 沿 bin 文件向上逐级检查 `<ancestor>/res_dev/client_cfg_src/cfg_table_slots.json`、
-/// `<ancestor>/client_cfg_src/cfg_table_slots.json` 与 `<ancestor>/cfg_table_slots.json`。
-pub fn locate_slots(bin_path: &Path) -> Option<PathBuf> {
-    let mut dir = bin_path.parent()?.to_path_buf();
-    for _ in 0..8 {
-        for rel in [
-            "res_dev/client_cfg_src/cfg_table_slots.json",
-            "client_cfg_src/cfg_table_slots.json",
-            "cfg_table_slots.json",
-        ] {
-            let candidate = dir.join(rel);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-    None
-}
-
 /// 表名：文件名去掉 `.bin`；若 schema 无该表且以 `_<数字>` 结尾，再去掉后缀重试。
 fn resolve_table_name<'a>(stem: &'a str, schema: &HashMap<String, Vec<(String, String)>>) -> Option<&'a str> {
     if schema.contains_key(stem) {
@@ -617,11 +595,11 @@ fn resolve_table_name<'a>(stem: &'a str, schema: &HashMap<String, Vec<(String, S
 // ============================== Tauri 命令入口 ==============================
 
 /// 打开并解析一个 client_cfg bin 为表格数据。
-/// `slots_path` 缺省时沿 bin 路径自动定位 cfg_table_slots.json。
+/// schema 文件（cfg_table_slots.json）由前端手动指定（应用内保存的 schema 记录）。
 #[tauri::command]
 pub fn parse_client_cfg_bin(
     path: String,
-    slots_path: Option<String>,
+    slots_path: String,
 ) -> Result<ClientCfgTable, String> {
     let bin_path = PathBuf::from(&path);
     if !bin_path.is_file() {
@@ -633,14 +611,7 @@ pub fn parse_client_cfg_bin(
         .unwrap_or("")
         .to_string();
 
-    let slots_path = match slots_path {
-        Some(p) => PathBuf::from(p),
-        None => locate_slots(&bin_path).ok_or_else(|| {
-            format!(
-                "未找到 cfg_table_slots.json（已沿 {path} 向上查找 res_dev/client_cfg_src 等位置）；请手动指定 schema 文件"
-            )
-        })?,
-    };
+    let slots_path = PathBuf::from(&slots_path);
     if !slots_path.is_file() {
         return Err(format!("schema 文件不存在: {}", slots_path.display()));
     }
@@ -656,6 +627,71 @@ pub fn parse_client_cfg_bin(
     let data = std::fs::read(&bin_path).map_err(|e| format!("读取失败: {e}"))?;
     parse_client_cfg(&data, table_name, &fields)
         .map_err(|e| format!("解析 {table_name} 失败: {e}"))
+}
+
+// ============================== schema 备份管理 ==============================
+//
+// schema 文件由用户手动添加后，立即备份到应用数据目录（schemas/ 子目录），
+// 此后程序只使用备份副本，不再依赖用户磁盘上的原文件（原文件可被删除/移动）。
+// 同名不同内容自动追加序号；内容完全一致时复用已有存档（幂等）。
+
+/// 在 `dir` 中为一份 schema 内容分配存档路径：
+/// 与已存在文件内容一致 → 复用；不同 → `name-2.json`、`name-3.json`…
+fn schema_stored_path(dir: &Path, src_name: &str, content: &[u8]) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let base = src_name.strip_suffix(".json").unwrap_or(src_name);
+    for i in 0..1000 {
+        let name = if i == 0 {
+            format!("{base}.json")
+        } else {
+            format!("{base}-{}.json", i + 1)
+        };
+        let cand = dir.join(&name);
+        match std::fs::read(&cand) {
+            Ok(existing) if existing == content => return Ok(cand), // 同内容复用
+            Ok(_) => {}                                              // 同名不同内容 → 继续找下一序号
+            Err(_) => return Ok(cand),                               // 不存在 → 用该名
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "schema 存档命名冲突过多",
+    ))
+}
+
+/// 把用户选择的 schema 文件备份到应用数据目录，返回备份后的绝对路径。
+/// 之后表格视图解析一律使用返回的路径（不再依赖原文件）。
+#[tauri::command]
+pub fn save_schema(app: tauri::AppHandle, path: String) -> Result<String, String> {
+    let src = PathBuf::from(&path);
+    if !src.is_file() {
+        return Err(format!("文件不存在: {}", path));
+    }
+    let name = src
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("schema.json")
+        .to_string();
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("schemas");
+    let content = std::fs::read(&src).map_err(|e| format!("读取失败: {e}"))?;
+    let target = schema_stored_path(&dir, &name, &content).map_err(|e| format!("备份失败: {e}"))?;
+    std::fs::write(&target, &content).map_err(|e| format!("备份失败: {e}"))?;
+    Ok(target.to_string_lossy().to_string())
+}
+
+/// 删除一份已备份的 schema 文件。仅允许删除应用数据目录内的文件，防止误删。
+#[tauri::command]
+pub fn remove_schema_file(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let p = PathBuf::from(&path);
+    if !p.starts_with(&app_data) {
+        return Err("拒绝删除应用数据目录之外的文件".to_string());
+    }
+    std::fs::remove_file(&p).map_err(|e| format!("删除失败: {e}"))
 }
 
 // ============================== 测试 ==============================
@@ -849,6 +885,38 @@ mod tests {
         assert_eq!(resolve_table_name("missing_table", &schema), None);
     }
 
+    #[test]
+    fn schema_stored_path_reuses_identical_and_bumps_on_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+
+        // 空目录：直接用原名。
+        let p1 = schema_stored_path(d, "cfg_table_slots.json", b"content-A").unwrap();
+        std::fs::write(&p1, b"content-A").unwrap();
+        assert_eq!(p1.file_name().unwrap(), "cfg_table_slots.json");
+
+        // 同内容：复用同一路径（幂等）。
+        let p2 = schema_stored_path(d, "cfg_table_slots.json", b"content-A").unwrap();
+        assert_eq!(p2, p1);
+
+        // 同名不同内容：追加 -2 序号。
+        let p3 = schema_stored_path(d, "cfg_table_slots.json", b"content-B").unwrap();
+        assert_eq!(p3.file_name().unwrap(), "cfg_table_slots-2.json");
+        std::fs::write(&p3, b"content-B").unwrap();
+
+        // 再次同内容 B：复用 -2。
+        let p4 = schema_stored_path(d, "cfg_table_slots.json", b"content-B").unwrap();
+        assert_eq!(p4, p3);
+
+        // 第三份内容：-3 序号。
+        let p5 = schema_stored_path(d, "cfg_table_slots.json", b"content-C").unwrap();
+        assert_eq!(p5.file_name().unwrap(), "cfg_table_slots-3.json");
+
+        // 非 .json 后缀也能处理。
+        let p6 = schema_stored_path(d, "slots.other", b"content-D").unwrap();
+        assert_eq!(p6.file_name().unwrap(), "slots.other.json");
+    }
+
     /// 用真实 bin 做端到端校验（可选）：设置环境变量后运行。
     /// CLIENT_CFG_FIXTURE=<bin 路径> CLIENT_CFG_SLOTS=<slots 路径> [CLIENT_CFG_DUMP=<输出 json>]
     #[test]
@@ -857,7 +925,10 @@ mod tests {
             return;
         };
         let slots = std::env::var("CLIENT_CFG_SLOTS").unwrap_or_default();
-        let table = parse_client_cfg_bin(bin.clone(), (!slots.is_empty()).then_some(slots)).unwrap();
+        if slots.is_empty() {
+            return; // schema 需手动指定，未设置时跳过
+        }
+        let table = parse_client_cfg_bin(bin.clone(), slots).unwrap();
         assert!(!table.keys.is_empty(), "fixture 表格不应为空");
         if let Ok(out) = std::env::var("CLIENT_CFG_DUMP") {
             let json = serde_json::to_string_pretty(&table).unwrap();

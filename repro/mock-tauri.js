@@ -19,6 +19,8 @@
   const CMD_DIALOG = "plugin:dialog|open";
   const CMD_REVEAL = "plugin:opener|reveal_item_in_dir";
   const CMD_VERSION = "plugin:app|version";
+  const CMD_SAVE_SCHEMA = "save_schema";
+  const CMD_RM_SCHEMA = "remove_schema_file";
 
   // 与后端 init_tail(2000) 行为对齐：先加载尾部约 2000 行。
   const TAIL_LINES = 2000;
@@ -62,6 +64,16 @@
         return null;
       case CMD_VERSION:
         return "0.2.0";
+      case CMD_SAVE_SCHEMA: {
+        // 与后端 save_schema 对齐：备份到应用数据目录，返回备份路径。
+        const name = String(args.path).split(/[\\/]/).pop() || "schema.json";
+        const stored = "C:\\Users\\duzihui\\AppData\\Roaming\\com.loglens.LogLens\\schemas\\" + name;
+        console.log("[mock] save_schema", args.path, "→", stored);
+        return stored;
+      }
+      case CMD_RM_SCHEMA:
+        console.log("[mock] remove_schema_file", args.path);
+        return null;
       case CMD_OPEN: {
         const all = await getAllLines();
         const start = Math.max(0, all.length - TAIL_LINES);

@@ -252,6 +252,8 @@ pub fn run() {
             report_first_paint,
             toggle_always_on_top,
             client_cfg::parse_client_cfg_bin,
+            client_cfg::save_schema,
+            client_cfg::remove_schema_file,
             get_startup_paths
         ])
         .run(tauri::generate_context!())

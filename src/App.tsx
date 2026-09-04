@@ -56,6 +56,8 @@ interface TabInfo {
   viewMode?: "text" | "cfg";
   /** 打开失败（如恢复上次会话时文件已被删除）时的错误信息；成功打开为 undefined。 */
   openError?: string;
+  /** 表格视图解析用的 schema 文件路径（手动指定）；null/undefined = 尚未选择。 */
+  slotsPath?: string | null;
 }
 
 /** 文件 tab 右键菜单的展开状态：目标 tab + 光标坐标（portal fixed 定位用）。 */
@@ -65,6 +67,37 @@ interface TabMenuState {
   y: number;
 }
 
+/** 拖拽手势的待定状态（pointerdown 记录，移动超过阈值才升级为真正拖拽）。 */
+interface PendingTabDrag {
+  tabId: string;
+  pointerId: number;
+  startX: number;
+  startY: number;
+  /** 指针相对源 tab 左上角的横向偏移（ghost 锚定，拖动中不跳变）。 */
+  offsetX: number;
+  /** 源 tab 的起始矩形（ghost 顶边/宽高）。 */
+  rect: { top: number; width: number; height: number };
+  /** 源 tab 在手势开始时的下标。 */
+  from: number;
+}
+
+/** tab 拖拽进行中的状态（ghost 坐标 + 插入目标位置）。 */
+interface TabDragState {
+  tabId: string;
+  pointerId: number;
+  /** ghost 左上角 fixed 坐标。 */
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** 插入指示线在 .tabs 容器内的横坐标。 */
+  indicatorX: number;
+  /** 插入目标：在含源 tab 的序列里插到该下标之前（== tabs.length 表示末尾）。 */
+  target: number;
+  /** 源 tab 在手势开始时的下标。 */
+  from: number;
+}
+
 // ==================== 文件记忆（重启恢复上次打开的文件） ====================
 
 /** localStorage 中保存的标签页列表。 */
@@ -72,6 +105,8 @@ interface SavedTabs {
   paths: string[];
   /** 上次激活的 tab 下标。 */
   active: number;
+  /** 每个 tab 选择的 schema 文件路径（与 paths 下标对齐；null = 自动定位）。 */
+  schemas?: (string | null)[];
 }
 
 /** 读取上次会话的标签页（无数据/损坏时返回 null）。 */
@@ -89,10 +124,55 @@ function readSavedTabs(): SavedTabs | null {
     if (paths.length === 0) {
       return null;
     }
-    return { paths, active: typeof v.active === "number" ? v.active : paths.length - 1 };
+    const schemas = Array.isArray(v.schemas)
+      ? v.schemas.slice(0, paths.length).map((s) =>
+          typeof s === "string" && s.length > 0 ? s : null
+        )
+      : undefined;
+    return {
+      paths,
+      active: typeof v.active === "number" ? v.active : paths.length - 1,
+      schemas,
+    };
   } catch {
     return null;
   }
+}
+
+// ==================== schema 文件记录（表格视图解析用） ====================
+//
+// schema 文件（cfg_table_slots.json）作为应用「记录数据」的一部分保存：
+// 用户可以保存多个 schema 文件路径，在视图模式模态框里为当前 tab 选择
+// 使用哪一个；不再依赖固定/硬编码的 schema 路径（未选择时回退自动定位）。
+
+/** schema 记录条数上限。 */
+const SCHEMA_MAX = 20;
+/** localStorage 键。 */
+const SCHEMA_KEY = "lv-schemas";
+
+/** 读取 schema 文件记录（无数据/损坏时返回空列表）。 */
+function readSchemaPaths(): string[] {
+  try {
+    const raw = localStorage.getItem(SCHEMA_KEY);
+    if (!raw) {
+      return [];
+    }
+    const v = JSON.parse(raw) as unknown;
+    if (!Array.isArray(v)) {
+      return [];
+    }
+    return v
+      .filter((p): p is string => typeof p === "string" && p.length > 0)
+      .slice(0, SCHEMA_MAX);
+  } catch {
+    return [];
+  }
+}
+
+/** 把一条 schema 路径插入记录头部：Windows 大小写不敏感去重，截断到上限。 */
+function pushSchemaPath(list: string[], path: string): string[] {
+  const key = path.toLowerCase();
+  return [path, ...list.filter((p) => p.toLowerCase() !== key)].slice(0, SCHEMA_MAX);
 }
 
 // ==================== 最近打开记录（首行最左侧的历史下拉菜单） ====================
@@ -450,8 +530,18 @@ interface Messages {
   viewBodySizeLarge: string;
   viewBodySizeMax: string;
   dropToOpen: string;
-  cfgViewTitle: string;
-  cfgBackTextTitle: string;
+  viewModeButtonTitle: string;
+  viewModeModalTitle: string;
+  viewModeTextName: string;
+  viewModeTextDesc: string;
+  viewModeCfgName: string;
+  viewModeCfgDesc: string;
+  viewModeCurrent: string;
+  viewModeSchemaTitle: string;
+  viewModeSchemaAdd: string;
+  viewModeSchemaRemove: string;
+  viewModeSchemaEmpty: string;
+  viewModeSchemaRequired: string;
   tabMenuReveal: string;
   tabMenuCopyPath: string;
   tabMenuCopyPathOk: string;
@@ -539,8 +629,19 @@ const MESSAGES: Record<Lang, Messages> = {
     viewBodySizeLarge: "大",
     viewBodySizeMax: "最大",
     dropToOpen: "松开以打开文件",
-    cfgViewTitle: "切换为表格视图（以 client_cfg 配置表格式解析当前文件）",
-    cfgBackTextTitle: "切回文本视图",
+    viewModeButtonTitle: "切换视图模式",
+    viewModeModalTitle: "选择视图模式",
+    viewModeTextName: "文本视图",
+    viewModeTextDesc: "以日志文本方式查看：tail-follow 实时跟随、关键词/正则过滤、高亮与稀疏虚拟滚动。",
+    viewModeCfgName: "表格视图",
+    viewModeCfgDesc:
+      "以 client_cfg 配置表格式解析当前文件。数据为 MemoryPack 二进制序列化格式，解析依赖表结构描述文件 cfg_table_slots.json。",
+    viewModeCurrent: "当前",
+    viewModeSchemaTitle: "Schema 文件（表格解析用）",
+    viewModeSchemaAdd: "添加 schema 文件…",
+    viewModeSchemaRemove: "移除该记录",
+    viewModeSchemaEmpty: "尚未保存 schema 文件",
+    viewModeSchemaRequired: "请先选择或添加 schema 文件",
     tabMenuReveal: "在文件浏览器中打开",
     tabMenuCopyPath: "复制路径",
     tabMenuCopyPathOk: "已复制路径",
@@ -626,8 +727,18 @@ const MESSAGES: Record<Lang, Messages> = {
     viewBodySizeLarge: "Large",
     viewBodySizeMax: "Max",
     dropToOpen: "Drop files to open",
-    cfgViewTitle: "Switch to table view (parse current file as a client_cfg config table)",
-    cfgBackTextTitle: "Switch back to text view",
+    viewModeButtonTitle: "Switch view mode",
+    viewModeModalTitle: "Select view mode",
+    viewModeTextName: "Text view",
+    viewModeTextDesc: "View the file as log text: tail-follow live updates, keyword/regex filtering, highlighting and sparse virtual scrolling.",
+    viewModeCfgName: "Table view",
+    viewModeCfgDesc: "Parse the current file as a client_cfg config table. The data uses the MemoryPack binary serialization format; parsing requires the cfg_table_slots.json schema description.",
+    viewModeCurrent: "Current",
+    viewModeSchemaTitle: "Schema files (for table parsing)",
+    viewModeSchemaAdd: "Add schema file…",
+    viewModeSchemaRemove: "Remove this entry",
+    viewModeSchemaEmpty: "No schema files saved",
+    viewModeSchemaRequired: "Select or add a schema file first",
     tabMenuReveal: "Reveal in File Explorer",
     tabMenuCopyPath: "Copy path",
     tabMenuCopyPathOk: "Path copied",
@@ -2504,10 +2615,33 @@ export default function App() {
   const [tabMenuCopied, setTabMenuCopied] = useState(false);
   const tabMenuRef = useRef<HTMLDivElement>(null);
 
+  // ---- 拖动 tab 调整顺序 ----
+  // pointerdown 先记「待定手势」，移动超过阈值才进入拖拽：拖影 ghost 跟随指针、
+  // 源 tab 淡显、列表内显示插入指示线；drop 时 splice 重排 tabs，
+  // localStorage 持久化由现有「文件记忆」effect 自动完成。
+  const [tabDrag, setTabDrag] = useState<TabDragState | null>(null);
+  const tabDragRef = useRef<TabDragState | null>(null);
+  tabDragRef.current = tabDrag;
+  const pendingDragRef = useRef<PendingTabDrag | null>(null);
+  /** 本次手势是否已越过阈值进入拖拽。 */
+  const dragActiveRef = useRef(false);
+  /** 最近一次拖拽落点（tabId + 时间戳）：吞掉紧随其后的 click 激活。 */
+  const lastTabDragEndRef = useRef<{ tabId: string; time: number } | null>(null);
+  const tabbarRef = useRef<HTMLDivElement>(null);
+  const tabsBoxRef = useRef<HTMLDivElement>(null);
+
   // ---- 「关于」模态框 ----
   const [aboutOpen, setAboutOpen] = useState(false);
   /** 应用版本（tauri.conf.json）：core:app 插件默认注册，浏览器 mock 下回退内置值。 */
   const [appVersion, setAppVersion] = useState("0.1.0");
+
+  // ---- 视图模式选择模态框（文本 / 表格） ----
+  const [viewModeOpen, setViewModeOpen] = useState(false);
+  /** 未选 schema 就尝试切表格视图：模态框内显示提示。 */
+  const [schemaError, setSchemaError] = useState(false);
+
+  // ---- schema 文件记录（表格视图解析用，应用内保存多个备选） ----
+  const [schemaPaths, setSchemaPaths] = useState<string[]>(() => readSchemaPaths());
 
   // 挂载时读取真实版本号（getVersion → plugin:app|version）。
   useEffect(() => {
@@ -2536,6 +2670,27 @@ export default function App() {
     return () => document.removeEventListener("keydown", onKey);
   }, [aboutOpen]);
 
+  // 视图模式模态框：Esc 关闭；目标 tab 消失（被关闭）时同步收起。
+  useEffect(() => {
+    if (!viewModeOpen) {
+      return;
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setViewModeOpen(false);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [viewModeOpen]);
+
+  useEffect(() => {
+    // 目标 tab 被关闭（激活 tab 不存在）时同步收起模态框。
+    if (viewModeOpen && !tabs.some((t) => t.id === activeTabId)) {
+      setViewModeOpen(false);
+    }
+  }, [viewModeOpen, tabs, activeTabId]);
+
   // ---- 文件记忆：保存当前标签页（在恢复完成前不写入，避免空列表覆盖存档） ----
   const restoredRef = useRef(false);
 
@@ -2550,6 +2705,7 @@ export default function App() {
         JSON.stringify({
           paths: tabs.map((t) => t.path),
           active: tabs.findIndex((t) => t.id === activeTabId),
+          schemas: tabs.map((t) => t.slotsPath ?? null),
         })
       );
     } catch {
@@ -2565,6 +2721,15 @@ export default function App() {
       /* localStorage 不可用时静默 */
     }
   }, [recentPaths]);
+
+  // schema 文件记录持久化（仅保存路径，不做存在性检查）。
+  useEffect(() => {
+    try {
+      localStorage.setItem(SCHEMA_KEY, JSON.stringify(schemaPaths));
+    } catch {
+      /* localStorage 不可用时静默 */
+    }
+  }, [schemaPaths]);
 
   // 历史下拉展开时：点击菜单外任意处 / 按 Esc / 窗口尺寸变化时收起。
   useEffect(() => {
@@ -2656,13 +2821,13 @@ export default function App() {
   // ---- client_cfg 表格数据（.bin tab 的解析结果，key 为 tabId） ----
   const [cfgTables, setCfgTables] = useState<Record<string, ClientCfgTable>>({});
 
-  /** 解析一个 client_cfg bin：成功存表数据，失败标记到该 tab。 */
+  /** 解析一个 client_cfg bin：成功存表数据，失败标记到该 tab。schema 必须手动指定。 */
   const parseCfg = useCallback(
-    async (tabId: string, binPath: string, slotsPath?: string) => {
+    async (tabId: string, binPath: string, slotsPath: string) => {
       try {
         const table = await invoke<ClientCfgTable>("parse_client_cfg_bin", {
           path: binPath,
-          slotsPath: slotsPath ?? null,
+          slotsPath,
         });
         setCfgTables((prev) => ({ ...prev, [tabId]: table }));
         setTabs((prev) =>
@@ -2677,19 +2842,68 @@ export default function App() {
     []
   );
 
-  /** 手动选择 cfg_table_slots.json 后重新解析指定 tab。 */
+  /** 通过文件对话框添加一个 schema：备份进应用数据目录后注册，返回备份路径（取消 null）。 */
+  const importSchemaViaDialog = useCallback(async (): Promise<string | null> => {
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: "cfg_table_slots.json", extensions: ["json"] }],
+      });
+      if (typeof selected !== "string") {
+        return null;
+      }
+      // 后端把文件内容复制到应用数据目录，此后不再依赖原文件。
+      const stored = await invoke<string>("save_schema", { path: selected });
+      setSchemaPaths((prev) => pushSchemaPath(prev, stored));
+      return stored;
+    } catch (e) {
+      console.error("importSchemaViaDialog failed", e);
+      return null;
+    }
+  }, []);
+
+  /** 手动选择 cfg_table_slots.json 后重新解析指定 tab（备份进应用数据目录后使用）。 */
   const pickCfgSchema = useCallback(
     async (tabId: string, binPath: string) => {
-      try {
-        const selected = await open({
-          multiple: false,
-          filters: [{ name: "cfg_table_slots.json", extensions: ["json"] }],
-        });
-        if (typeof selected === "string") {
-          await parseCfg(tabId, binPath, selected);
-        }
-      } catch (e) {
-        console.error("pickCfgSchema failed", e);
+      const stored = await importSchemaViaDialog();
+      if (!stored) {
+        return;
+      }
+      setTabs((prev) =>
+        prev.map((t) => (t.id === tabId ? { ...t, slotsPath: stored } : t))
+      );
+      await parseCfg(tabId, binPath, stored);
+    },
+    [importSchemaViaDialog, parseCfg]
+  );
+
+  // ==================== schema 文件记录管理 ====================
+
+  /** 从 schema 记录中移除一条（同步删除应用数据目录中的备份文件）；
+   *  若激活 tab 正选中它，回退为未选择。 */
+  const removeSchema = useCallback((path: string) => {
+    void invoke("remove_schema_file", { path }).catch((e) => {
+      console.error("remove_schema_file failed", path, e);
+    });
+    const key = path.toLowerCase();
+    setSchemaPaths((prev) => prev.filter((p) => p.toLowerCase() !== key));
+    setTabs((prev) =>
+      prev.map((t) =>
+        t.slotsPath && t.slotsPath.toLowerCase() === key ? { ...t, slotsPath: null } : t
+      )
+    );
+  }, []);
+
+  /** 为指定 tab 选择 schema；若已处于表格视图则立即重新解析。 */
+  const selectTabSchema = useCallback(
+    (tabId: string, slotsPath: string) => {
+      setSchemaError(false);
+      setTabs((prev) =>
+        prev.map((t) => (t.id === tabId ? { ...t, slotsPath } : t))
+      );
+      const tab = tabsRef.current.find((t) => t.id === tabId);
+      if (tab && (tab.viewMode ?? "text") === "cfg") {
+        void parseCfg(tabId, tab.path, slotsPath);
       }
     },
     [parseCfg]
@@ -2705,14 +2919,20 @@ export default function App() {
     // 历史存档可能有重复路径（旧版本/异常场景），按 Windows 大小写不敏感去重。
     const seen = new Set<string>();
     const list: TabInfo[] = [];
-    for (const p of saved.paths) {
+    for (let i = 0; i < saved.paths.length; i++) {
+      const p = saved.paths[i];
       const key = p.toLowerCase();
       if (seen.has(key)) {
         continue;
       }
       seen.add(key);
       const id = nextTabId();
-      list.push({ id, title: p.split(/[\\/]/).pop() || p, path: p });
+      list.push({
+        id,
+        title: p.split(/[\\/]/).pop() || p,
+        path: p,
+        slotsPath: saved.schemas?.[i] ?? null,
+      });
     }
     setTabs(list);
     setActiveTabId(list[saved.active]?.id ?? list[list.length - 1]?.id ?? null);
@@ -2881,9 +3101,9 @@ export default function App() {
     }
   }, []);
 
-  /** 切换指定 tab 的视图模式；切到表格时触发 client_cfg 解析。 */
+  /** 切换指定 tab 的视图模式；切到表格时按该 tab 选择的 schema 解析（必须手动指定）。 */
   const switchViewMode = useCallback(
-    (tabId: string, mode: "text" | "cfg", binPath: string) => {
+    (tabId: string, mode: "text" | "cfg", binPath: string, slotsPath: string) => {
       setTabs((prev) =>
         prev.map((t) =>
           t.id === tabId
@@ -2892,7 +3112,7 @@ export default function App() {
         )
       );
       if (mode === "cfg") {
-        void parseCfg(tabId, binPath);
+        void parseCfg(tabId, binPath, slotsPath);
       }
     },
     [parseCfg]
@@ -3031,6 +3251,9 @@ export default function App() {
 
   /** 打开 tab 右键菜单：抑制 WebView2 默认菜单，记录光标坐标，并激活该 tab。 */
   const openTabMenu = useCallback((e: React.MouseEvent, tab: TabInfo) => {
+    if (tabDragRef.current) {
+      return; // 拖拽进行中不打开菜单
+    }
     e.preventDefault();
     e.stopPropagation();
     setActiveTabId(tab.id);
@@ -3070,6 +3293,163 @@ export default function App() {
     [closeTabMenu]
   );
 
+  // ==================== tab 拖拽排序 ====================
+
+  /** 由指针横坐标计算插入目标：含源 tab 的序列中第一个「中线在指针右侧」的
+   *  下标（== tabs.length 表示末尾），同时返回指示线在 .tabs 容器内的横坐标。 */
+  const computeTabTarget = useCallback((clientX: number) => {
+    const box = tabsBoxRef.current;
+    if (!box) {
+      return { target: 0, indicatorX: 0 };
+    }
+    const els = Array.from(box.querySelectorAll<HTMLElement>(".tab"));
+    const boxLeft = box.getBoundingClientRect().left;
+    const n = els.length;
+    let target = n;
+    let indicatorX = 0;
+    for (let i = 0; i < n; i++) {
+      const r = els[i].getBoundingClientRect();
+      if (clientX < r.left + r.width / 2) {
+        target = i;
+        indicatorX = r.left - 2 - boxLeft;
+        break;
+      }
+    }
+    if (target === n && n > 0) {
+      indicatorX = els[n - 1].getBoundingClientRect().right + 2 - boxLeft;
+    }
+    return { target, indicatorX };
+  }, []);
+
+  /** 拖拽时指针靠近 tabbar 左右边缘 → 自动横向滚动（速率随距离增大）。 */
+  const autoScrollTabbar = useCallback((clientX: number) => {
+    const bar = tabbarRef.current;
+    if (!bar) {
+      return;
+    }
+    const r = bar.getBoundingClientRect();
+    const edge = 48;
+    let dx = 0;
+    if (clientX < r.left + edge) {
+      dx = -Math.ceil((edge - (clientX - r.left)) / 2);
+    } else if (clientX > r.right - edge) {
+      dx = Math.ceil((edge - (r.right - clientX)) / 2);
+    }
+    if (dx !== 0) {
+      bar.scrollLeft += dx;
+    }
+  }, []);
+
+  /** pointerdown：记录待定手势并捕获指针；✕ 按钮与右键不参与。 */
+  const onTabPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>, t: TabInfo) => {
+    if (e.button !== 0) {
+      return;
+    }
+    if ((e.target as HTMLElement).closest(".tab-close")) {
+      return;
+    }
+    const el = e.currentTarget;
+    const r = el.getBoundingClientRect();
+    dragActiveRef.current = false;
+    pendingDragRef.current = {
+      tabId: t.id,
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      offsetX: e.clientX - r.left,
+      rect: { top: r.top, width: r.width, height: r.height },
+      from: tabsRef.current.findIndex((x) => x.id === t.id),
+    };
+    try {
+      el.setPointerCapture(e.pointerId);
+    } catch {
+      /* 合成事件/指针不存在时忽略捕获，事件仍按冒泡到达本元素 */
+    }
+  }, []);
+
+  /** pointermove（指针捕获后持续到达源 tab）：超过阈值才升级为拖拽，否则视为点击。 */
+  const onTabPointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      const p = pendingDragRef.current;
+      if (!p || p.pointerId !== e.pointerId) {
+        return;
+      }
+      if (!dragActiveRef.current) {
+        if (Math.abs(e.clientX - p.startX) < 5 && Math.abs(e.clientY - p.startY) < 5) {
+          return;
+        }
+        dragActiveRef.current = true;
+        setTabMenu(null); // 进入拖拽：收起右键菜单
+        const { target, indicatorX } = computeTabTarget(e.clientX);
+        setTabDrag({
+          tabId: p.tabId,
+          pointerId: p.pointerId,
+          x: e.clientX - p.offsetX,
+          y: p.rect.top,
+          width: p.rect.width,
+          height: p.rect.height,
+          indicatorX,
+          target,
+          from: p.from,
+        });
+        return;
+      }
+      autoScrollTabbar(e.clientX);
+      const { target, indicatorX } = computeTabTarget(e.clientX);
+      setTabDrag((d) =>
+        d ? { ...d, x: e.clientX - p.offsetX, indicatorX, target } : d
+      );
+    },
+    [computeTabTarget, autoScrollTabbar]
+  );
+
+  /** 结束手势：commit=true 按目标位置重排 tabs；false（Esc/pointercancel）放弃。 */
+  const finishTabDrag = useCallback((commit: boolean) => {
+    const p = pendingDragRef.current;
+    pendingDragRef.current = null;
+    const wasDragging = dragActiveRef.current;
+    dragActiveRef.current = false;
+    const d = tabDragRef.current;
+    setTabDrag(null);
+    if (!wasDragging || !p || !d || !commit) {
+      return;
+    }
+    // 记录落点：紧随 pointerup 的 click 会命中被拖 tab，短窗口内忽略该次激活。
+    lastTabDragEndRef.current = { tabId: d.tabId, time: Date.now() };
+    // 含源 tab 序列里的插入下标 → 移除源 tab 后的实际下标。
+    const to = d.target > d.from ? d.target - 1 : d.target;
+    if (to === d.from) {
+      return; // 落回原位置，无需重排
+    }
+    setTabs((prev) => {
+      const from = prev.findIndex((x) => x.id === d.tabId);
+      if (from < 0 || to < 0 || to > prev.length - 1 || to === from) {
+        return prev;
+      }
+      const next = prev.slice();
+      const [moved] = next.splice(from, 1);
+      if (!moved) {
+        return prev;
+      }
+      next.splice(to, 0, moved);
+      return next;
+    });
+  }, []);
+
+  // 拖拽中按 Esc 取消（不影响其它 Esc 处理器：about 菜单等各自独立监听）。
+  useEffect(() => {
+    if (!tabDrag) {
+      return;
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        finishTabDrag(false);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [tabDrag, finishTabDrag]);
+
   /** 当前激活 tab 及其视图模式（右上角「表格/文本」切换图标用）。 */
   const activeTab = tabs.find((t) => t.id === activeTabId);
   const activeIsCfg = activeTab?.viewMode === "cfg";
@@ -3082,7 +3462,7 @@ export default function App() {
       className="loglens"
       style={{ "--log-font-size": `${fontSize}px` } as React.CSSProperties}
     >
-      <div className="tabbar">
+      <div className="tabbar" ref={tabbarRef}>
         <button
           className="recent-btn"
           ref={recentBtnRef}
@@ -3096,13 +3476,28 @@ export default function App() {
             <path d="M8 4.5V8l2.5 1.5" stroke="currentColor" strokeWidth="1.2" fill="none" />
           </svg>
         </button>
-        <div className="tabs">
+        <div className="tabs" ref={tabsBoxRef}>
           {tabs.map((t) => (
             <div
               key={t.id}
-              className={`tab ${t.id === activeTabId ? "active" : ""}`}
-              onClick={() => setActiveTabId(t.id)}
+              className={`tab ${t.id === activeTabId ? "active" : ""} ${
+                tabDrag?.tabId === t.id ? "drag-source" : ""
+              }`}
+              onClick={() => {
+                // 拖拽结束后的首次 click 是 pointerup 的附属事件，不激活 tab
+                // （时间窗 + 同 tab 判定，避免误吞用户快速点击其它 tab）。
+                const last = lastTabDragEndRef.current;
+                if (last && last.tabId === t.id && Date.now() - last.time < 400) {
+                  lastTabDragEndRef.current = null;
+                  return;
+                }
+                setActiveTabId(t.id);
+              }}
               onContextMenu={(e) => openTabMenu(e, t)}
+              onPointerDown={(e) => onTabPointerDown(e, t)}
+              onPointerMove={onTabPointerMove}
+              onPointerUp={() => finishTabDrag(true)}
+              onPointerCancel={() => finishTabDrag(false)}
             >
               <span className="tab-title">{t.title}</span>
               <button
@@ -3117,6 +3512,9 @@ export default function App() {
               </button>
             </div>
           ))}
+          {tabDrag ? (
+            <div className="tab-drop-indicator" style={{ left: tabDrag.indicatorX }} />
+          ) : null}
           <button className="tab-add" onClick={handleOpen} disabled={opening} title={appT.openTabTitle}>
             {opening ? "…" : appT.openTab}
           </button>
@@ -3145,13 +3543,12 @@ export default function App() {
           <button
             className={`icon-btn cfg-toggle${activeIsCfg ? " on" : ""}`}
             onClick={() => {
-              if (activeTab) {
-                switchViewMode(activeTab.id, activeIsCfg ? "text" : "cfg", activeTab.path);
-              }
+              setSchemaError(false);
+              setViewModeOpen(true);
             }}
             disabled={!activeTab}
             aria-pressed={activeIsCfg}
-            title={activeIsCfg ? appT.cfgBackTextTitle : appT.cfgViewTitle}
+            title={appT.viewModeButtonTitle}
           >
             {activeIsCfg ? (
               /* 文本视图图标：多行文字 */
@@ -3336,6 +3733,33 @@ export default function App() {
           )
         : null}
 
+      {tabDrag
+        ? (() => {
+            const dragTab = tabs.find((t) => t.id === tabDrag.tabId);
+            if (!dragTab) {
+              return null;
+            }
+            return createPortal(
+              <div
+                className="drag-ghost"
+                aria-hidden="true"
+                style={{
+                  left: tabDrag.x,
+                  top: tabDrag.y,
+                  width: tabDrag.width,
+                  height: tabDrag.height,
+                }}
+              >
+                <span className="tab-title">{dragTab.title}</span>
+                <button className="tab-close" tabIndex={-1} disabled>
+                  ✕
+                </button>
+              </div>,
+              document.body
+            );
+          })()
+        : null}
+
       {tabs.length > 0 ? (
         <>
           {tabs.map((t) => (
@@ -3400,6 +3824,105 @@ export default function App() {
             <button className="body-modal-btn" onClick={() => setAboutOpen(false)}>
               {appT.aboutClose}
             </button>
+          </div>
+        </div>
+      ) : null}
+
+      {viewModeOpen && activeTab ? (
+        <div className="body-modal-overlay" onClick={() => setViewModeOpen(false)}>
+          <div
+            className="viewmode-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={appT.viewModeModalTitle}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="viewmode-title">{appT.viewModeModalTitle}</div>
+            {(
+              [
+                { id: "text", name: appT.viewModeTextName, desc: appT.viewModeTextDesc },
+                { id: "cfg", name: appT.viewModeCfgName, desc: appT.viewModeCfgDesc },
+              ] as const
+            ).map((m) => {
+              const current = (activeTab.viewMode ?? "text") === m.id;
+              return (
+                <button
+                  key={m.id}
+                  className={`viewmode-item${current ? " current" : ""}`}
+                  onClick={() => {
+                    // 表格视图必须已手动指定 schema 文件；未选择时提示并留在模态框。
+                    if (m.id === "cfg" && !activeTab.slotsPath) {
+                      setSchemaError(true);
+                      return;
+                    }
+                    switchViewMode(activeTab.id, m.id, activeTab.path, activeTab.slotsPath ?? "");
+                    setViewModeOpen(false);
+                  }}
+                >
+                  <div className="viewmode-item-head">
+                    <span className="viewmode-item-name">{m.name}</span>
+                    {current ? (
+                      <span className="viewmode-current">{appT.viewModeCurrent}</span>
+                    ) : null}
+                  </div>
+                  <div className="viewmode-item-desc">{m.desc}</div>
+                </button>
+              );
+            })}
+            <div className="viewmode-schema">
+              <div className="viewmode-schema-title">{appT.viewModeSchemaTitle}</div>
+              {schemaError ? (
+                <div className="viewmode-schema-error">{appT.viewModeSchemaRequired}</div>
+              ) : null}
+              {schemaPaths.length === 0 ? (
+                <div className="viewmode-schema-empty">{appT.viewModeSchemaEmpty}</div>
+              ) : null}
+              {schemaPaths.map((p) => {
+                const name = p.split(/[\\/]/).pop() || p;
+                const checked =
+                  activeTab.slotsPath != null &&
+                  activeTab.slotsPath.toLowerCase() === p.toLowerCase();
+                return (
+                  <div
+                    key={p.toLowerCase()}
+                    className={`viewmode-schema-item${checked ? " current" : ""}`}
+                  >
+                    <label>
+                      <input
+                        type="radio"
+                        name="lv-schema"
+                        checked={checked}
+                        onChange={() => selectTabSchema(activeTab.id, p)}
+                      />
+                      <span className="viewmode-schema-name" title={p}>
+                        {name}
+                      </span>
+                      <span className="viewmode-schema-path">{p}</span>
+                    </label>
+                    <button
+                      className="viewmode-schema-del"
+                      onClick={() => removeSchema(p)}
+                      title={appT.viewModeSchemaRemove}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                );
+              })}
+              <button
+                className="viewmode-schema-add"
+                onClick={() => {
+                  void importSchemaViaDialog().then((sel) => {
+                    // 添加即选中（文件已备份进应用数据目录）。
+                    if (sel) {
+                      selectTabSchema(activeTab.id, sel);
+                    }
+                  });
+                }}
+              >
+                {appT.viewModeSchemaAdd}
+              </button>
+            </div>
           </div>
         </div>
       ) : null}
