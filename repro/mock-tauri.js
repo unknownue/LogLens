@@ -17,6 +17,8 @@
   const CMD_LISTEN = "plugin:event|listen";
   const CMD_UNLISTEN = "plugin:event|unlisten";
   const CMD_DIALOG = "plugin:dialog|open";
+  const CMD_REVEAL = "plugin:opener|reveal_item_in_dir";
+  const CMD_VERSION = "plugin:app|version";
 
   // 与后端 init_tail(2000) 行为对齐：先加载尾部约 2000 行。
   const TAIL_LINES = 2000;
@@ -55,6 +57,11 @@
       case CMD_DIALOG: {
         return "E:\\Work\\GM10\\qa_branch\\code\\client_csharp\\log_inst21.txt";
       }
+      case CMD_REVEAL:
+        console.log("[mock] reveal_item_in_dir", args.paths);
+        return null;
+      case CMD_VERSION:
+        return "0.2.0";
       case CMD_OPEN: {
         const all = await getAllLines();
         const start = Math.max(0, all.length - TAIL_LINES);

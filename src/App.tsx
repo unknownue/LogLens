@@ -2,9 +2,11 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { createPortal } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { CfgTableTab, type ClientCfgTable } from "./CfgTableTab";
 import "./App.css";
 
@@ -54,6 +56,13 @@ interface TabInfo {
   viewMode?: "text" | "cfg";
   /** 打开失败（如恢复上次会话时文件已被删除）时的错误信息；成功打开为 undefined。 */
   openError?: string;
+}
+
+/** 文件 tab 右键菜单的展开状态：目标 tab + 光标坐标（portal fixed 定位用）。 */
+interface TabMenuState {
+  tabId: string;
+  x: number;
+  y: number;
 }
 
 // ==================== 文件记忆（重启恢复上次打开的文件） ====================
@@ -443,6 +452,14 @@ interface Messages {
   dropToOpen: string;
   cfgViewTitle: string;
   cfgBackTextTitle: string;
+  tabMenuReveal: string;
+  tabMenuCopyPath: string;
+  tabMenuCopyPathOk: string;
+  aboutTitle: string;
+  aboutClose: string;
+  aboutVersionLabel: string;
+  aboutDesc: string;
+  aboutTech: string;
 }
 
 const MESSAGES: Record<Lang, Messages> = {
@@ -524,6 +541,14 @@ const MESSAGES: Record<Lang, Messages> = {
     dropToOpen: "松开以打开文件",
     cfgViewTitle: "切换为表格视图（以 client_cfg 配置表格式解析当前文件）",
     cfgBackTextTitle: "切回文本视图",
+    tabMenuReveal: "在文件浏览器中打开",
+    tabMenuCopyPath: "复制路径",
+    tabMenuCopyPathOk: "已复制路径",
+    aboutTitle: "关于 LogLens",
+    aboutClose: "关闭",
+    aboutVersionLabel: "版本",
+    aboutDesc: "大日志实时查看器：tail-follow 实时跟随、关键词/正则过滤、稀疏虚拟滚动，流畅浏览千万行级日志。",
+    aboutTech: "Tauri 2 · React · Rust",
   },
   en: {
     notOpened: "No file opened",
@@ -603,6 +628,14 @@ const MESSAGES: Record<Lang, Messages> = {
     dropToOpen: "Drop files to open",
     cfgViewTitle: "Switch to table view (parse current file as a client_cfg config table)",
     cfgBackTextTitle: "Switch back to text view",
+    tabMenuReveal: "Reveal in File Explorer",
+    tabMenuCopyPath: "Copy path",
+    tabMenuCopyPathOk: "Path copied",
+    aboutTitle: "About LogLens",
+    aboutClose: "Close",
+    aboutVersionLabel: "Version",
+    aboutDesc: "A realtime large-log viewer: tail-follow, keyword/regex filtering and sparse virtual scrolling for logs with millions of lines.",
+    aboutTech: "Tauri 2 · React · Rust",
   },
 };
 
@@ -2465,6 +2498,44 @@ export default function App() {
   const recentBtnRef = useRef<HTMLButtonElement>(null);
   const recentMenuRef = useRef<HTMLDivElement>(null);
 
+  // ---- 文件 tab 右键菜单（在文件浏览器中打开 / 复制路径） ----
+  const [tabMenu, setTabMenu] = useState<TabMenuState | null>(null);
+  /** 复制路径成功后的瞬时反馈：菜单项文案切换为「已复制路径」。 */
+  const [tabMenuCopied, setTabMenuCopied] = useState(false);
+  const tabMenuRef = useRef<HTMLDivElement>(null);
+
+  // ---- 「关于」模态框 ----
+  const [aboutOpen, setAboutOpen] = useState(false);
+  /** 应用版本（tauri.conf.json）：core:app 插件默认注册，浏览器 mock 下回退内置值。 */
+  const [appVersion, setAppVersion] = useState("0.1.0");
+
+  // 挂载时读取真实版本号（getVersion → plugin:app|version）。
+  useEffect(() => {
+    void getVersion()
+      .then((v) => {
+        if (typeof v === "string" && v.length > 0) {
+          setAppVersion(v);
+        }
+      })
+      .catch(() => {
+        /* 后端不可用（如 dev 浏览器）时保留回退版本号 */
+      });
+  }, []);
+
+  // 「关于」模态框：Esc 关闭。
+  useEffect(() => {
+    if (!aboutOpen) {
+      return;
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setAboutOpen(false);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [aboutOpen]);
+
   // ---- 文件记忆：保存当前标签页（在恢复完成前不写入，避免空列表覆盖存档） ----
   const restoredRef = useRef(false);
 
@@ -2527,6 +2598,60 @@ export default function App() {
       window.removeEventListener("resize", onResize);
     };
   }, [recentOpen]);
+
+  // tab 右键菜单展开时：点击菜单外 / Esc / resize 收起。
+  // 右键另一个 tab 时（mousedown 先关、contextmenu 后开）菜单会重新定位到新 tab。
+  useEffect(() => {
+    if (!tabMenu) {
+      return;
+    }
+    const onDown = (e: MouseEvent) => {
+      const menu = tabMenuRef.current;
+      const target = e.target as Node;
+      if (menu && !menu.contains(target)) {
+        setTabMenu(null);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setTabMenu(null);
+      }
+    };
+    const onResize = () => setTabMenu(null);
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    window.addEventListener("resize", onResize);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+      window.removeEventListener("resize", onResize);
+    };
+  }, [tabMenu]);
+
+  // 钳位：菜单挂载后按实测尺寸修正位置，保证完整落在视口内（贴近边缘右键时）。
+  useEffect(() => {
+    if (!tabMenu) {
+      return;
+    }
+    const el = tabMenuRef.current;
+    if (!el) {
+      return;
+    }
+    const rect = el.getBoundingClientRect();
+    const margin = 8;
+    const x = Math.min(Math.max(tabMenu.x, margin), window.innerWidth - rect.width - margin);
+    const y = Math.min(Math.max(tabMenu.y, margin), window.innerHeight - rect.height - margin);
+    if (x !== tabMenu.x || y !== tabMenu.y) {
+      setTabMenu({ ...tabMenu, x, y });
+    }
+  }, [tabMenu]);
+
+  // 目标 tab 被关闭时同步收起菜单。
+  useEffect(() => {
+    if (tabMenu && !tabs.some((t) => t.id === tabMenu.tabId)) {
+      setTabMenu(null);
+    }
+  }, [tabMenu, tabs]);
 
   // ---- client_cfg 表格数据（.bin tab 的解析结果，key 为 tabId） ----
   const [cfgTables, setCfgTables] = useState<Record<string, ClientCfgTable>>({});
@@ -2904,9 +3029,53 @@ export default function App() {
     [activeTabId]
   );
 
+  /** 打开 tab 右键菜单：抑制 WebView2 默认菜单，记录光标坐标，并激活该 tab。 */
+  const openTabMenu = useCallback((e: React.MouseEvent, tab: TabInfo) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setActiveTabId(tab.id);
+    setTabMenuCopied(false);
+    setTabMenu({ tabId: tab.id, x: e.clientX, y: e.clientY });
+  }, []);
+
+  const closeTabMenu = useCallback(() => {
+    setTabMenu(null);
+    setTabMenuCopied(false);
+  }, []);
+
+  /** 「在文件浏览器中打开」：Explorer 弹出并选中该文件；失败静默记录（菜单已关）。 */
+  const handleRevealTab = useCallback(
+    (tab: TabInfo) => {
+      closeTabMenu();
+      void revealItemInDir(tab.path).catch((e) => {
+        console.error("revealItemInDir failed:", tab.path, e);
+      });
+    },
+    [closeTabMenu]
+  );
+
+  /** 「复制路径」：成功后菜单项短暂显示「已复制路径」再自动关闭；失败静默关闭。 */
+  const handleCopyTabPath = useCallback(
+    (tab: TabInfo) => {
+      void copyTextToClipboard(tab.path)
+        .then(() => {
+          setTabMenuCopied(true);
+          window.setTimeout(closeTabMenu, 900);
+        })
+        .catch((e) => {
+          console.error("copy path failed:", tab.path, e);
+          closeTabMenu();
+        });
+    },
+    [closeTabMenu]
+  );
+
   /** 当前激活 tab 及其视图模式（右上角「表格/文本」切换图标用）。 */
   const activeTab = tabs.find((t) => t.id === activeTabId);
   const activeIsCfg = activeTab?.viewMode === "cfg";
+
+  /** 右键菜单指向的 tab（已关闭时找不到，菜单随之消失）。 */
+  const menuTab = tabMenu ? tabs.find((t) => t.id === tabMenu.tabId) : undefined;
 
   return (
     <div
@@ -2933,6 +3102,7 @@ export default function App() {
               key={t.id}
               className={`tab ${t.id === activeTabId ? "active" : ""}`}
               onClick={() => setActiveTabId(t.id)}
+              onContextMenu={(e) => openTabMenu(e, t)}
             >
               <span className="tab-title">{t.title}</span>
               <button
@@ -3057,6 +3227,17 @@ export default function App() {
           >
             {theme === "dark" ? "☀" : "☾"}
           </button>
+          <button
+            className="icon-btn about-btn"
+            onClick={() => setAboutOpen(true)}
+            title={appT.aboutTitle}
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+              <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="1.2" />
+              <path d="M8 7.2v3.8" stroke="currentColor" strokeWidth="1.3" />
+              <circle cx="8" cy="4.9" r="0.9" fill="currentColor" />
+            </svg>
+          </button>
         </div>
       </div>
 
@@ -3090,6 +3271,66 @@ export default function App() {
                   );
                 })
               )}
+            </div>,
+            document.body
+          )
+        : null}
+
+      {tabMenu && menuTab
+        ? createPortal(
+            <div
+              className="tab-menu"
+              ref={tabMenuRef}
+              role="menu"
+              style={{ position: "fixed", left: tabMenu.x, top: tabMenu.y }}
+              onContextMenu={(e) => e.preventDefault()}
+            >
+              <button
+                className="tab-menu-item"
+                role="menuitem"
+                onClick={() => handleRevealTab(menuTab)}
+              >
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path
+                    d="M2 4.5h12M2 4.5v7.5a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V4.5"
+                    stroke="currentColor"
+                    strokeWidth="1.2"
+                    fill="none"
+                  />
+                  <path d="M2 6.5h12M5 9h6" stroke="currentColor" strokeWidth="1.2" />
+                </svg>
+                {appT.tabMenuReveal}
+              </button>
+              <button
+                className="tab-menu-item"
+                role="menuitem"
+                onClick={() => handleCopyTabPath(menuTab)}
+              >
+                {tabMenuCopied ? (
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                    <path d="M2.5 8.5L6 12L13.5 4" stroke="currentColor" strokeWidth="1.6" />
+                  </svg>
+                ) : (
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                    <rect
+                      x="5.5"
+                      y="5.5"
+                      width="9"
+                      height="9"
+                      rx="1"
+                      stroke="currentColor"
+                      strokeWidth="1.2"
+                    />
+                    <path
+                      d="M10.5 5.5V3.5a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"
+                      stroke="currentColor"
+                      strokeWidth="1.2"
+                      fill="none"
+                    />
+                  </svg>
+                )}
+                {tabMenuCopied ? appT.tabMenuCopyPathOk : appT.tabMenuCopyPath}
+              </button>
             </div>,
             document.body
           )
@@ -3140,6 +3381,28 @@ export default function App() {
           </button>
         </div>
       )}
+
+      {aboutOpen ? (
+        <div className="body-modal-overlay" onClick={() => setAboutOpen(false)}>
+          <div
+            className="about-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={appT.aboutTitle}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="about-name">LogLens</div>
+            <div className="about-version">
+              {appT.aboutVersionLabel} v{appVersion}
+            </div>
+            <div className="about-desc">{appT.aboutDesc}</div>
+            <div className="about-tech">{appT.aboutTech}</div>
+            <button className="body-modal-btn" onClick={() => setAboutOpen(false)}>
+              {appT.aboutClose}
+            </button>
+          </div>
+        </div>
+      ) : null}
 
       {dragActive ? (
         <div className="drop-overlay">
