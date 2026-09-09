@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { CfgTableTab, type ClientCfgTable } from "./CfgTableTab";
@@ -509,7 +510,8 @@ interface Messages {
   switchToDark: string;
   alwaysOnTopOn: string;
   alwaysOnTopOff: string;
-  switchLangTitle: (current: Lang) => string;
+  /** 总菜单里的语言项文案（用当前界面语言书写，如「语言：中文」）。 */
+  menuLangTitle: string;
   copyViewTitle: string;
   copyViewOk: string;
   copyViewErr: string;
@@ -550,6 +552,12 @@ interface Messages {
   aboutVersionLabel: string;
   aboutDesc: string;
   aboutTech: string;
+  winMinimize: string;
+  winMaximize: string;
+  winRestore: string;
+  winClose: string;
+  menuTitle: string;
+  menuExit: string;
 }
 
 const MESSAGES: Record<Lang, Messages> = {
@@ -608,7 +616,7 @@ const MESSAGES: Record<Lang, Messages> = {
     switchToDark: "切换到深色主题",
     alwaysOnTopOn: "取消窗口置顶",
     alwaysOnTopOff: "窗口始终置顶",
-    switchLangTitle: (cur) => (cur === "zh" ? "Switch to English" : "切换为中文"),
+    menuLangTitle: "语言：中文",
     copyViewTitle: "复制当前正文（若使用过滤，则复制过滤后的内容）",
     copyViewOk: "已复制",
     copyViewErr: "复制失败",
@@ -650,6 +658,12 @@ const MESSAGES: Record<Lang, Messages> = {
     aboutVersionLabel: "版本",
     aboutDesc: "大日志实时查看器：tail-follow 实时跟随、关键词/正则过滤、稀疏虚拟滚动，流畅浏览千万行级日志。",
     aboutTech: "Tauri 2 · React · Rust",
+    winMinimize: "最小化",
+    winMaximize: "最大化",
+    winRestore: "还原",
+    winClose: "关闭",
+    menuTitle: "菜单",
+    menuExit: "退出程序",
   },
   en: {
     notOpened: "No file opened",
@@ -706,7 +720,7 @@ const MESSAGES: Record<Lang, Messages> = {
     switchToDark: "Switch to dark theme",
     alwaysOnTopOn: "Turn off always-on-top",
     alwaysOnTopOff: "Keep window always on top",
-    switchLangTitle: (cur) => (cur === "zh" ? "Switch to English" : "切换为中文"),
+    menuLangTitle: "Language: English",
     copyViewTitle: "Copy the current view (filtered content when a filter is active)",
     copyViewOk: "Copied",
     copyViewErr: "Copy failed",
@@ -747,6 +761,12 @@ const MESSAGES: Record<Lang, Messages> = {
     aboutVersionLabel: "Version",
     aboutDesc: "A realtime large-log viewer: tail-follow, keyword/regex filtering and sparse virtual scrolling for logs with millions of lines.",
     aboutTech: "Tauri 2 · React · Rust",
+    winMinimize: "Minimize",
+    winMaximize: "Maximize",
+    winRestore: "Restore",
+    winClose: "Close",
+    menuTitle: "Menu",
+    menuExit: "Exit",
   },
 };
 
@@ -1533,23 +1553,29 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
   /** 列表包裹层 DOM：交互期间挂/摘 .dragging-scroll（子树整体禁选，见 App.css）。 */
   const wrapRef = useRef<HTMLDivElement>(null);
 
-  // thumb 顶部位置 = 行空间映射：thumb 比例 f ⇔ 视口首行行号 = f ×（总行数−1）。
-  // 日志是行寻址内容，行空间映射让「thumb 在 50% = 看到第 50% 行」精确成立，
-  // 不受行高估算误差影响（像素空间映射会有 ~2.6% 的中段偏差）。
-  const computeThumbTop = (v: number): number => {
+  // thumb 顶部位置 = 像素空间映射：thumb 顶部 = 已滚偏移 / 最大偏移 × 行程，
+  // 与原生滚动条语义一致，保证滚到底时 thumb 底边与轨道底边重合。
+  // 早期用「行空间映射」（thumb 比例 = 视口首行行号 /（总行数−1））规避行高
+  // 估算误差，但视口首行永远不是末行：短日志（内容不足数屏，如 <50 行）滚到底
+  // 时 thumb 停在中途，轨道下方留出一段死区（占轨道 20%+，内容越少占比越大），
+  // 该区间的滚动已被 clamp 到最大偏移，表现为「滚动条下方有一段空间无法滚动」。
+  // thumbH 参数：渲染路径必须传入本次渲染要应用的高度（thumbHUi）——若读 DOM
+  // offsetHeight 只能拿到上一次提交的旧高度，高度变化时顶部按旧高计算、底部
+  // 按新高落地，thumb 底边会伸出轨道下缘（resize 时实测伸出 4~459px）。
+  const computeThumbTop = (v: number, thumbH?: number): number => {
     const track = trackRef.current;
     const thumb = thumbRef.current;
-    if (!track || !thumb) {
+    const el = listRef.current;
+    if (!track || !thumb || !el) {
       return 0;
     }
-    const travel = Math.max(1, track.clientHeight - thumb.offsetHeight);
-    const count = filterActiveRef.current ? lines.length : (totalLinesRef.current ?? 0);
-    if (count <= 1) {
+    const h = thumbH ?? thumb.offsetHeight;
+    const travel = Math.max(1, track.clientHeight - h);
+    const maxScroll = Math.max(0, virtualizer.getTotalSize() - el.clientHeight);
+    if (maxScroll <= 0) {
       return 0;
     }
-    const item = virtualizer.getVirtualItemForOffset(v);
-    const f = item ? item.index / (count - 1) : 0;
-    return Math.round(f * travel);
+    return Math.round(Math.min(1, v / maxScroll) * travel);
   };
 
   // 统一偏移写入入口：clamp 到 [0, totalSize − clientHeight]（虚拟 px，无浏览器上限），
@@ -1714,7 +1740,7 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
     }
   });
 
-  // ---- 自绘垂直滚动条（thumb 比例 ⇔ 行号比例，拖动幅度 = 实际进度） ----
+  // ---- 自绘垂直滚动条（thumb 比例 ⇔ 像素滚动比例，拖动幅度 = 实际进度） ----
   const totalSizeUi = virtualizer.getTotalSize();
   const clientHUi = listRef.current?.clientHeight ?? 0;
   const maxScrollUi = Math.max(0, totalSizeUi - clientHUi);
@@ -1722,7 +1748,8 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
     maxScrollUi > 0
       ? Math.max(24, Math.round(clientHUi * (clientHUi / Math.max(totalSizeUi, 1))))
       : 0;
-  const thumbTopUi = computeThumbTop(scrollOffsetUi);
+  // 传入本次渲染要应用的 thumbHUi：顶部与高度同源，thumb 底边不会伸出轨道。
+  const thumbTopUi = computeThumbTop(scrollOffsetUi, thumbHUi);
 
   const onVScrollbarPointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
@@ -1750,13 +1777,10 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
       const thumbH = thumbRef.current?.offsetHeight ?? 24;
       const travel = Math.max(1, trackH - thumbH);
       const trackTop = track.getBoundingClientRect().top;
-      const count = filterActiveRef.current ? lines.length : (totalLinesRef.current ?? 0);
-      // thumb 比例 f → 目标行（行空间映射）→ 虚拟偏移。
+      // thumb 比例 f → 虚拟偏移（像素空间反变换，与 computeThumbTop 精确互逆）。
       const fToOffset = (f: number): number => {
         const clamped = Math.max(0, Math.min(1, f));
-        const line = Math.round(clamped * Math.max(0, count - 1));
-        const off = virtualizer.getOffsetForIndex(line, "start");
-        return off ? off[0] : clamped * maxScroll;
+        return clamped * maxScroll;
       };
       const onThumb = (e.target as HTMLElement).classList.contains("vthumb");
       // 拖动/点跳 = 主动离开尾部：关闭跟随（置底按钮可恢复）。
@@ -1775,14 +1799,14 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
           /* 捕获失败不影响拖动（窗口级 move/up 监听兜底） */
         }
       }
-      // 拖 thumb：thumb 中心跟随鼠标，内容按行空间映射联动。
+      // 拖 thumb：thumb 中心跟随鼠标，内容按像素比例联动。
       const onMove = (ev: PointerEvent) => {
         if (!onThumb) {
           return;
         }
         const f = Math.max(0, Math.min(1, (ev.clientY - trackTop - thumbH / 2) / travel));
         applyVirtualTopRef.current(fToOffset(f), "user");
-        // thumb 直接按鼠标位置定位（行空间 roundtrip 的亚像素误差不反馈到手上）。
+        // thumb 直接按鼠标位置定位（正反映射互逆，亚像素误差不反馈到手上）。
         if (thumbRef.current) {
           thumbRef.current.style.top = `${Math.round(f * travel)}px`;
         }
@@ -1807,13 +1831,13 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
       window.addEventListener("pointerup", onUp);
       window.addEventListener("pointercancel", onUp);
       if (!onThumb) {
-        // 点轨道：把 thumb 中心定位到点击处（按行空间绝对跳转）。
+        // 点轨道：把 thumb 中心定位到点击处（按像素比例绝对跳转）。
         const clickY = e.clientY - trackTop;
         const f = Math.max(0, Math.min(1, (clickY - thumbH / 2) / travel));
         applyVirtualTopRef.current(fToOffset(f), "user");
       }
     },
-    [virtualizer, lines.length]
+    [virtualizer]
   );
 
   const toggleWrapLines = useCallback((next: boolean) => {
@@ -2600,14 +2624,17 @@ export default function App() {
   // 文件拖拽进行中：显示全屏放置提示遮罩。
   const [dragActive, setDragActive] = useState(false);
 
-  // ---- 最近打开记录（首行最左侧历史下拉） ----
+  // ---- 最近打开记录（总菜单的「最近打开」二级菜单数据） ----
   const [recentPaths, setRecentPaths] = useState<string[]>(() => readRecentPaths());
-  const [recentOpen, setRecentOpen] = useState(false);
+  // ---- 首行最左侧的总菜单（历史记录二级菜单 / 语言 / 关于 / 退出） ----
+  const [menuOpen, setMenuOpen] = useState(false);
+  /** 总菜单内「最近打开」二级菜单的展开状态。 */
+  const [historyOpen, setHistoryOpen] = useState(false);
   // 下拉菜单的固定定位坐标（展开时从图标矩形读取；tabbar 是滚动容器，
   // 菜单经 portal 渲染到 body 上避免被 overflow 裁剪）。
-  const [recentMenuPos, setRecentMenuPos] = useState<{ left: number; top: number } | null>(null);
-  const recentBtnRef = useRef<HTMLButtonElement>(null);
-  const recentMenuRef = useRef<HTMLDivElement>(null);
+  const [menuPos, setMenuPos] = useState<{ left: number; top: number } | null>(null);
+  const menuBtnRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
 
   // ---- 文件 tab 右键菜单（在文件浏览器中打开 / 复制路径） ----
   const [tabMenu, setTabMenu] = useState<TabMenuState | null>(null);
@@ -2731,29 +2758,34 @@ export default function App() {
     }
   }, [schemaPaths]);
 
-  // 历史下拉展开时：点击菜单外任意处 / 按 Esc / 窗口尺寸变化时收起。
+  // 总菜单展开时：点击菜单外任意处 / 按 Esc / 窗口尺寸变化时收起。
   useEffect(() => {
-    if (!recentOpen) {
+    if (!menuOpen) {
       return;
     }
     const onDown = (e: MouseEvent) => {
-      const menu = recentMenuRef.current;
-      const btn = recentBtnRef.current;
+      const menu = menuRef.current;
+      const btn = menuBtnRef.current;
       const target = e.target as Node;
       // 图标按钮自身负责 toggle（否则 mousedown 先关、click 又开，开关失灵）。
       if (btn && btn.contains(target)) {
         return;
       }
       if (menu && !menu.contains(target)) {
-        setRecentOpen(false);
+        setMenuOpen(false);
+        setHistoryOpen(false);
       }
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        setRecentOpen(false);
+        setMenuOpen(false);
+        setHistoryOpen(false);
       }
     };
-    const onResize = () => setRecentOpen(false);
+    const onResize = () => {
+      setMenuOpen(false);
+      setHistoryOpen(false);
+    };
     document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onKey);
     window.addEventListener("resize", onResize);
@@ -2762,7 +2794,7 @@ export default function App() {
       document.removeEventListener("keydown", onKey);
       window.removeEventListener("resize", onResize);
     };
-  }, [recentOpen]);
+  }, [menuOpen]);
 
   // tab 右键菜单展开时：点击菜单外 / Esc / resize 收起。
   // 右键另一个 tab 时（mousedown 先关、contextmenu 后开）菜单会重新定位到新 tab。
@@ -2986,6 +3018,16 @@ export default function App() {
     }
   }, [theme]);
 
+  // Overlay 标题栏：窗口右上角原生按钮（最小化/最大化/关闭）的深浅色跟随主题，
+  // 否则切换浅色主题后按钮仍是深色系，与首行观感割裂。
+  useEffect(() => {
+    try {
+      void getCurrentWindow().setTheme(theme === "dark" ? "dark" : "light");
+    } catch {
+      /* 浏览器复现环境无窗口对象：忽略 */
+    }
+  }, [theme]);
+
   useEffect(() => {
     try {
       localStorage.setItem("lv-fontsize", String(fontSize));
@@ -3016,6 +3058,55 @@ export default function App() {
       .catch(() => {
         /* 后端不可用（如 dev 浏览器）时静默忽略 */
       });
+  }, []);
+
+  // ---- 无边框窗口（decorations:false）的自绘窗口按钮 ----
+  // maximized 驱动「最大化/还原」图标；经 onResized 跟踪真实窗口状态。
+  const [maximized, setMaximized] = useState(false);
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    let win: ReturnType<typeof getCurrentWindow> | null = null;
+    try {
+      win = getCurrentWindow();
+    } catch {
+      return; // 浏览器复现环境无窗口对象
+    }
+    const w = win;
+    const refresh = () => {
+      w.isMaximized()
+        .then((m) => {
+          if (!cancelled) {
+            setMaximized(m === true);
+          }
+        })
+        .catch(() => {
+          /* ignore */
+        });
+    };
+    void w
+      .onResized(refresh)
+      .then((fn) => {
+        if (!cancelled) {
+          unlisten = fn;
+          refresh();
+        }
+      })
+      .catch(() => {
+        /* ignore */
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  const toggleMaximize = useCallback(() => {
+    try {
+      void getCurrentWindow().toggleMaximize();
+    } catch {
+      /* 浏览器复现环境：忽略 */
+    }
   }, []);
 
   const toggleLang = useCallback(() => {
@@ -3168,22 +3259,39 @@ export default function App() {
     }
   }, [appT, openPath]);
 
-  /** 历史下拉的开关：展开时从图标矩形读取坐标（portal 定位用）。 */
-  const toggleRecentMenu = useCallback(() => {
-    if (recentOpen) {
-      setRecentOpen(false);
+  /** 收起总菜单（连同其二级菜单）。 */
+  const closeMenu = useCallback(() => {
+    setMenuOpen(false);
+    setHistoryOpen(false);
+  }, []);
+
+  /** 总菜单开关：展开时从图标矩形读取坐标（portal 定位用）。 */
+  const toggleMenu = useCallback(() => {
+    if (menuOpen) {
+      closeMenu();
       return;
     }
-    const r = recentBtnRef.current?.getBoundingClientRect();
-    setRecentMenuPos(r ? { left: r.left, top: r.bottom } : { left: 0, top: 0 });
-    setRecentOpen(true);
-  }, [recentOpen]);
+    const r = menuBtnRef.current?.getBoundingClientRect();
+    setMenuPos(r ? { left: r.left, top: r.bottom } : { left: 0, top: 0 });
+    setHistoryOpen(false);
+    setMenuOpen(true);
+  }, [menuOpen, closeMenu]);
+
+  /** 退出程序：单窗口应用，关闭主窗口即退出。 */
+  const exitApp = useCallback(() => {
+    closeMenu();
+    try {
+      void getCurrentWindow().close();
+    } catch {
+      /* 浏览器复现环境：忽略 */
+    }
+  }, [closeMenu]);
 
   /** 历史菜单选中一项：同路径的 tab 已打开（且打开成功）→ 激活它，不新建；
    *  否则走常规打开流程。Windows 路径大小写不敏感，按小写比较。 */
   const openRecent = useCallback(
     (path: string) => {
-      setRecentOpen(false);
+      closeMenu();
       const key = path.toLowerCase();
       const existing = tabs.find((t) => t.path.toLowerCase() === key && !t.openError);
       if (existing) {
@@ -3192,10 +3300,10 @@ export default function App() {
       }
       void openPath(path);
     },
-    [tabs, openPath]
+    [tabs, openPath, closeMenu]
   );
 
-  /** 单独删除一条历史记录（菜单保持展开，便于连续删除）。 */
+  /** 单独删除一条历史记录（二级菜单保持展开，便于连续删除）。 */
   const removeRecent = useCallback((path: string) => {
     const key = path.toLowerCase();
     setRecentPaths((prev) => prev.filter((p) => p.toLowerCase() !== key));
@@ -3454,6 +3562,16 @@ export default function App() {
   const activeTab = tabs.find((t) => t.id === activeTabId);
   const activeIsCfg = activeTab?.viewMode === "cfg";
 
+  // 原生标题条已与首行融合（Overlay）：把窗口标题同步为当前激活 tab 的文件名，
+  // 任务栏 / Alt+Tab 上能直接看到正在看哪个日志；无 tab 时回落为应用名。
+  useEffect(() => {
+    try {
+      void getCurrentWindow().setTitle(activeTab ? activeTab.title : "LogLens");
+    } catch {
+      /* 浏览器复现环境无窗口对象：忽略 */
+    }
+  }, [activeTab?.title]);
+
   /** 右键菜单指向的 tab（已关闭时找不到，菜单随之消失）。 */
   const menuTab = tabMenu ? tabs.find((t) => t.id === tabMenu.tabId) : undefined;
 
@@ -3463,17 +3581,20 @@ export default function App() {
       style={{ "--log-font-size": `${fontSize}px` } as React.CSSProperties}
     >
       <div className="tabbar" ref={tabbarRef}>
+        {/* 无边框窗口（decorations:false）：tab 列表与右侧工具栏之间的空白
+            拖拽条负责窗口拖动。双击拖拽条由 Tauri 内置脚本自动触发最大化/还原
+            （internal_toggle_maximize）。tabbar 容器自身不标 drag region——它的
+            底部可能出现水平滚动条，标在容器上会抢走滚动条拖动。 */}
         <button
-          className="recent-btn"
-          ref={recentBtnRef}
-          onClick={toggleRecentMenu}
-          title={appT.recentTitle}
+          className="menu-btn"
+          ref={menuBtnRef}
+          onClick={toggleMenu}
+          title={appT.menuTitle}
           aria-haspopup="menu"
-          aria-expanded={recentOpen}
+          aria-expanded={menuOpen}
         >
           <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="1.2" />
-            <path d="M8 4.5V8l2.5 1.5" stroke="currentColor" strokeWidth="1.2" fill="none" />
+            <path d="M2 4.5h12M2 8h12M2 11.5h12" stroke="currentColor" strokeWidth="1.2" />
           </svg>
         </button>
         <div className="tabs" ref={tabsBoxRef}>
@@ -3519,6 +3640,8 @@ export default function App() {
             {opening ? "…" : appT.openTab}
           </button>
         </div>
+        {/* tab 列表与右侧工具栏之间的空白：窗口拖动主区域（tab 少时占满整行）。 */}
+        <div className="titlebar-drag" data-tauri-drag-region />
         <div className="tabbar-right">
           <span className="total-lines" title={appT.totalLinesTitle}>
             {activeTotal != null ? appT.countLines(activeTotal) : ""}
@@ -3592,16 +3715,6 @@ export default function App() {
             )}
           </button>
           <button
-            className="icon-btn lang-toggle"
-            onClick={toggleLang}
-            title={appT.switchLangTitle(lang)}
-          >
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
-              <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="1.2" />
-              <path d="M2 8h12M8 2c-4.5 3-4.5 9 0 12M8 2c4.5 3 4.5 9 0 12" stroke="currentColor" strokeWidth="1.2" />
-            </svg>
-          </button>
-          <button
             className="icon-btn always-on-top"
             onClick={toggleAlwaysOnTop}
             title={alwaysOnTop ? appT.alwaysOnTopOn : appT.alwaysOnTopOff}
@@ -3624,50 +3737,127 @@ export default function App() {
           >
             {theme === "dark" ? "☀" : "☾"}
           </button>
+        </div>
+        {/* 无边框窗口的自绘窗口按钮（最小化/最大化/关闭），位于首行最右。 */}
+        <div className="win-controls">
           <button
-            className="icon-btn about-btn"
-            onClick={() => setAboutOpen(true)}
-            title={appT.aboutTitle}
+            className="win-btn"
+            onClick={() => {
+              try {
+                void getCurrentWindow().minimize();
+              } catch {
+                /* ignore */
+              }
+            }}
+            title={appT.winMinimize}
           >
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
-              <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="1.2" />
-              <path d="M8 7.2v3.8" stroke="currentColor" strokeWidth="1.3" />
-              <circle cx="8" cy="4.9" r="0.9" fill="currentColor" />
+            <svg width="10" height="10" viewBox="0 0 10 10">
+              <path d="M0 5h10" stroke="currentColor" strokeWidth="1" />
+            </svg>
+          </button>
+          <button
+            className="win-btn"
+            onClick={toggleMaximize}
+            title={maximized ? appT.winRestore : appT.winMaximize}
+          >
+            {maximized ? (
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                <rect x="0.5" y="2.5" width="7" height="7" stroke="currentColor" strokeWidth="1" />
+                <path d="M2.5 2.5V0.5H9.5V7.5H7.5" stroke="currentColor" strokeWidth="1" fill="none" />
+              </svg>
+            ) : (
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                <rect x="0.5" y="0.5" width="9" height="9" stroke="currentColor" strokeWidth="1" />
+              </svg>
+            )}
+          </button>
+          <button
+            className="win-btn win-close"
+            onClick={() => {
+              try {
+                void getCurrentWindow().close();
+              } catch {
+                /* ignore */
+              }
+            }}
+            title={appT.winClose}
+          >
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+              <path d="M0.5 0.5L9.5 9.5M9.5 0.5L0.5 9.5" stroke="currentColor" strokeWidth="1" />
             </svg>
           </button>
         </div>
       </div>
 
-      {recentOpen && recentMenuPos
+      {menuOpen && menuPos
         ? createPortal(
             <div
-              className="recent-menu"
-              ref={recentMenuRef}
+              className="app-menu"
+              ref={menuRef}
               role="menu"
-              style={{ position: "fixed", left: recentMenuPos.left, top: recentMenuPos.top }}
+              style={{ position: "fixed", left: menuPos.left, top: menuPos.top }}
             >
-              {recentPaths.length === 0 ? (
-                <div className="recent-empty">{appT.recentEmpty}</div>
-              ) : (
-                recentPaths.map((p) => {
-                  const name = p.split(/[\\/]/).pop() || p;
-                  return (
-                    <div key={p.toLowerCase()} className="recent-item" role="menuitem" title={p}>
-                      <button className="recent-open" onClick={() => openRecent(p)}>
-                        <span className="recent-name">{name}</span>
-                        <span className="recent-path">{p}</span>
-                      </button>
-                      <button
-                        className="recent-del"
-                        onClick={() => removeRecent(p)}
-                        title={appT.recentDeleteTitle}
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  );
-                })
-              )}
+              <div className="app-menu-has-sub">
+                <button
+                  className="app-menu-item"
+                  role="menuitem"
+                  aria-expanded={historyOpen}
+                  onClick={() => setHistoryOpen((h) => !h)}
+                >
+                  <span>{appT.recentTitle}</span>
+                  <span className="app-menu-caret">{historyOpen ? "▾" : "▸"}</span>
+                </button>
+                {historyOpen ? (
+                  <div className="app-menu-sub" role="menu">
+                    {recentPaths.length === 0 ? (
+                      <div className="recent-empty">{appT.recentEmpty}</div>
+                    ) : (
+                      recentPaths.map((p) => {
+                        const name = p.split(/[\\/]/).pop() || p;
+                        return (
+                          <div key={p.toLowerCase()} className="recent-item" role="menuitem" title={p}>
+                            <button className="recent-open" onClick={() => openRecent(p)}>
+                              <span className="recent-name">{name}</span>
+                              <span className="recent-path">{p}</span>
+                            </button>
+                            <button
+                              className="recent-del"
+                              onClick={() => removeRecent(p)}
+                              title={appT.recentDeleteTitle}
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                ) : null}
+              </div>
+              <button
+                className="app-menu-item"
+                role="menuitem"
+                onClick={() => {
+                  closeMenu();
+                  toggleLang();
+                }}
+              >
+                {appT.menuLangTitle}
+              </button>
+              <button
+                className="app-menu-item"
+                role="menuitem"
+                onClick={() => {
+                  closeMenu();
+                  setAboutOpen(true);
+                }}
+              >
+                {appT.aboutTitle}
+              </button>
+              <div className="app-menu-sep" role="separator" />
+              <button className="app-menu-item app-menu-exit" role="menuitem" onClick={exitApp}>
+                {appT.menuExit}
+              </button>
             </div>,
             document.body
           )

@@ -11,8 +11,18 @@ Designed for large log files: follow them in real time and browse anywhere witho
 - **Sparse virtual scrolling** — the scrollbar maps the whole file; unloaded regions render as placeholders and load on demand, bidirectionally, with distance-prioritized prefetch.
 - **Line index** — a sampled (every 64 lines) byte-offset index makes line lookups and line counts O(sample gap) instead of a full file scan.
 - **Session restore** — reopens the tabs from the previous run; missing files show a warning instead of crashing.
-- **Extras** — multi-tab, jump-to-line, keyword highlighting, copy-view, recent-files dropdown (last 10 opens, keeps missing files), bilingual UI (中文 / English).
+- **Extras** — multi-tab, jump-to-line, keyword highlighting, copy-view, recent-files dropdown (last 10 opens, keeps missing files), bilingual UI (中文 / English), custom title bar (borderless window: the tab row is the title bar with custom min/max/close buttons; Aero Snap, double-click-to-maximize and Win11 rounded corners retained).
 - **Config-table viewer** — every file opens as a log by default; the top-right icon button (grid ⇄ lines) switches the *active* tab to a GM10 `client_cfg` config-table view (MemoryPack), parsed with the schema in `cfg_table_slots.json` (auto-located from the file path, or picked manually). Each tab's mode is independent; the table is virtualized with a sticky header and copy-view exports TSV. Format spec: [docs/client_cfg_bin_format.md](docs/client_cfg_bin_format.md).
+
+## Screenshot
+
+Multiple tabs, keyword highlighting (`ERROR` gold / `WARN` orange / `INFO` blue) and the self-drawn scrollbar. Sample log used for the shot: [`repro/sample_log.txt`](repro/sample_log.txt).
+
+![LogLens: multiple tabs with keyword highlighting](docs/screenshot.png)
+
+The top-left menu consolidates recent files (submenu), language, about and exit:
+
+![LogLens: main menu with recent-files submenu](docs/screenshot-menu.png)
 
 ## Requirements
 

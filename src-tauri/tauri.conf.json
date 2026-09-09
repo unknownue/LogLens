@@ -15,7 +15,10 @@
         "title": "LogLens",
         "width": 800,
         "height": 600,
-        "backgroundColor": "#1e1e1e"
+        "backgroundColor": "#1e1e1e",
+        "decorations": false,
+        "shadow": true,
+        "theme": "Dark"
       }
     ],
     "security": {

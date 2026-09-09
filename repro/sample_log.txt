@@ -1,0 +1,159 @@
+2026-10-01 09:14:02.118 INFO  [main] LogLens demo log — server startup sequence
+2026-10-01 09:14:02.211 INFO  [main] Loading configuration from config/server.toml
+2026-10-01 09:14:02.303 INFO  [main] Config loaded: 12 sections, 47 keys
+2026-10-01 09:14:02.354 WARN  [main] Deprecated option `cache_size_mb` detected, using `cache.memory` instead
+2026-10-01 09:14:02.401 INFO  [net] Binding TCP listener on 0.0.0.0:8000
+2026-10-01 09:14:02.522 INFO  [net] Binding UDP listener on 0.0.0.0:8001
+2026-10-01 09:14:02.640 INFO  [db] Connecting to database pool postgres://10.0.12.7:5432/game
+2026-10-01 09:14:02.718 INFO  [db] Pool ready: 8 connections, max 32
+2026-10-01 09:14:03.019 INFO  [cache] Redis cluster reachable: 3 masters, 3 replicas
+2026-10-01 09:14:03.187 INFO  [main] Server started in 1.07s, listening on 8000
+2026-10-01 09:14:05.440 INFO  [net] accept 10.0.1.23:52110 -> session 0x3f2a
+2026-10-01 09:14:05.441 INFO  [auth] session 0x3f2a handshake begin, protocol v7
+2026-10-01 09:14:05.508 INFO  [auth] session 0x3f2a login ok user=alice zone=1
+2026-10-01 09:14:06.002 INFO  [game] session 0x3f2a enter_scene scene=1001 pos=(128.0, 64.5, 9.8)
+2026-10-01 09:14:06.147 INFO  [game] session 0x3f2a load_assets 214 items in 88ms
+2026-10-01 09:14:07.230 WARN  [game] scene 1001 has 3 dangling colliders near (130, 68), auto-repaired
+2026-10-01 09:14:08.901 INFO  [chat] session 0x3f2a join channel world
+2026-10-01 09:14:09.013 INFO  [chat] session 0x3f2a msg="hello, anyone here?" len=19
+2026-10-01 09:14:09.552 INFO  [chat] broadcast channel=world msg_id=8841 targets=132
+2026-10-01 09:14:11.204 WARN  [net] session 0x3f2a ping latency 183ms > 150ms threshold
+2026-10-01 09:14:12.118 INFO  [db] slow query 212ms SELECT * FROM items WHERE owner=10233 ORDER BY slot
+2026-10-01 09:14:13.007 INFO  [db] slow query 341ms UPDATE inventory SET dirty=0 WHERE owner=10233
+2026-10-01 09:14:13.662 WARN  [db] connection 7 checked out for 2.1s, returning to pool
+2026-10-01 09:14:15.030 ERROR [trade] session 0x3f2a trade_offer failed: item 88213 not in backpack
+2026-10-01 09:14:15.031 ERROR [trade]   at TradeService.acceptOffer (trade.rs:412)
+2026-10-01 09:14:15.031 ERROR [trade]   at TradeSession.onPacket (session.rs:1203)
+2026-10-01 09:14:15.032 ERROR [trade]   at Session.dispatch (session.rs:884)
+2026-10-01 09:14:15.032 ERROR [trade]   at EventLoop.run (main.rs:256)
+2026-10-01 09:14:16.774 INFO  [game] session 0x3f2a use_item item=1001 count=1
+2026-10-01 09:14:17.115 INFO  [game] session 0x3f2a gain_exp +120 (total 8420)
+2026-10-01 09:14:18.203 INFO  [game] session 0x3f2a kill_monster id=50121 at (141, 70)
+2026-10-01 09:14:18.214 INFO  [drop] monster 50121 drops: 2 items, 1 gold
+2026-10-01 09:14:19.560 WARN  [game] session 0x3f2a movement speed anomaly: 32m/s for 400ms, clamped
+2026-10-01 09:14:20.885 INFO  [save] session 0x3f2a autosave in 46ms, 3 dirty rows
+2026-10-01 09:14:22.001 INFO  [task] daily task progress updated: 3/10
+2026-10-01 09:14:23.417 INFO  [mail] session 0x3f2a inbox refresh: 0 new
+2026-10-01 09:14:25.083 WARN  [net] accept queue depth 64/128 under burst
+2026-10-01 09:14:26.208 INFO  [net] accept 10.0.1.77:55321 -> session 0x3f2b
+2026-10-01 09:14:26.275 INFO  [auth] session 0x3f2b handshake begin, protocol v7
+2026-10-01 09:14:26.342 INFO  [auth] session 0x3f2b login ok user=bob zone=1
+2026-10-01 09:14:26.918 INFO  [game] session 0x3f2b enter_scene scene=1001 pos=(130.2, 63.1, 9.8)
+2026-10-01 09:14:27.604 INFO  [chat] session 0x3f2b join channel world
+2026-10-01 09:14:28.113 INFO  [chat] session 0x3f2b msg="lagging hard today" len=18
+2026-10-01 09:14:28.664 INFO  [chat] broadcast channel=world msg_id=8842 targets=133
+2026-10-01 09:14:30.421 WARN  [game] scene 1001 entity count 1204 approaching budget 1500
+2026-10-01 09:14:32.037 ERROR [net] session 0x3f2b recv timeout after 10s, closing fd
+2026-10-01 09:14:32.038 WARN  [net] session 0x3f2b disconnected (reason=timeout)
+2026-10-01 09:14:32.040 INFO  [save] session 0x3f2b flush pending state, 1 dirty row
+2026-10-01 09:14:33.912 INFO  [auth] session 0x3f2b re-login from 10.0.1.77:55330
+2026-10-01 09:14:34.118 INFO  [game] session 0x3f2b enter_scene scene=1001 pos=(130.2, 63.1, 9.8)
+2026-10-01 09:14:35.702 INFO  [game] session 0x3f2a begin_battle target=monster 50177
+2026-10-01 09:14:36.019 INFO  [battle] battle 99104 start: alice vs monster 50177
+2026-10-01 09:14:36.442 INFO  [battle] round 1 alice hit 204, crit
+2026-10-01 09:14:36.770 INFO  [battle] round 2 monster hit 38
+2026-10-01 09:14:37.105 INFO  [battle] round 3 alice hit 191
+2026-10-01 09:14:37.218 INFO  [battle] battle 99104 end in 1.2s, winner=alice
+2026-10-01 09:14:37.883 INFO  [game] session 0x3f2a gain_exp +340 (total 8760)
+2026-10-01 09:14:39.102 INFO  [game] session 0x3f2a level_up 8 -> 9, hp+120 mp+40
+2026-10-01 09:14:40.055 WARN  [cache] redis key game:10233 evicted before TTL (memory pressure 87%)
+2026-10-01 09:14:41.377 INFO  [task] quest 3041 completed, reward delivered
+2026-10-01 09:14:42.604 INFO  [mail] session 0x3f2a new mail from system: quest reward
+2026-10-01 09:14:44.229 ERROR [db] query failed after 3 retries: INSERT INTO txn_log ... (deadlock 40P01)
+2026-10-01 09:14:44.230 WARN  [db] falling back to async write queue for owner=10233
+2026-10-01 09:14:45.016 INFO  [db] async write queue flushed 3 rows
+2026-10-01 09:14:46.882 INFO  [stats] tick 60s: online=133 qps=421 avg_lat=18ms p99=87ms
+2026-10-01 09:14:48.031 INFO  [game] session 0x3f2a cast skill 2003 at (139, 66)
+2026-10-01 09:14:48.244 INFO  [battle] skill 2003 hits 3 targets, total dmg 521
+2026-10-01 09:14:48.901 WARN  [game] session 0x3f2b movement speed anomaly: 29m/s for 300ms, clamped
+2026-10-01 09:14:50.117 INFO  [chat] session 0x3f2a msg="gg, nice run" len=12
+2026-10-01 09:14:50.659 INFO  [chat] broadcast channel=world msg_id=8843 targets=133
+2026-10-01 09:14:52.003 INFO  [auth] token refresh ok user=alice expires=7200s
+2026-10-01 09:14:53.668 ERROR [trade] duplicate trade request: session 0x3f2a item 88213 (rate limited)
+2026-10-01 09:14:55.207 INFO  [game] session 0x3f2a enter_dungeon id=21 difficulty=hard
+2026-10-01 09:14:55.991 INFO  [game] dungeon 21 spawned: 8 groups, 43 monsters
+2026-10-01 09:14:57.314 WARN  [game] dungeon 21 mobs clipped through wall at (55, 91), reset positions
+2026-10-01 09:14:58.872 INFO  [battle] battle 99112 start: alice vs elite 50713
+2026-10-01 09:14:59.206 INFO  [battle] round 1 elite hit 211, blocked 88
+2026-10-01 09:14:59.655 INFO  [battle] round 2 alice hit 174
+2026-10-01 09:15:00.118 INFO  [battle] round 3 elite cast 8001, alice dodge
+2026-10-01 09:15:00.443 INFO  [battle] round 4 alice hit 331, crit
+2026-10-01 09:15:00.607 INFO  [battle] battle 99112 end in 1.7s, winner=alice
+2026-10-01 09:15:01.205 INFO  [game] session 0x3f2a gain_exp +512 (total 9272)
+2026-10-01 09:15:02.884 WARN  [net] session 0x3f2a send queue 180KB, flow control engaged
+2026-10-01 09:15:04.001 INFO  [save] session 0x3f2a autosave in 52ms, 5 dirty rows
+2026-10-01 09:15:05.777 INFO  [task] dungeon 21 progress: 14/43 killed
+2026-10-01 09:15:07.330 ERROR [game] session 0x3f2b invalid move command: target (9999, 9999) outside scene 1001
+2026-10-01 09:15:08.019 INFO  [game] session 0x3f2b corrected position to (130.2, 63.1)
+2026-10-01 09:15:09.541 INFO  [chat] session 0x3f2b msg="how do i beat this boss" len=25
+2026-10-01 09:15:09.998 INFO  [chat] broadcast channel=world msg_id=8844 targets=133
+2026-10-01 09:15:11.206 WARN  [game] scene 1001 entity count 1107, GC of idle entities scheduled
+2026-10-01 09:15:12.004 INFO  [game] scene 1001 GC removed 87 idle entities
+2026-10-01 09:15:13.662 INFO  [stats] tick 60s: online=134 qps=388 avg_lat=21ms p99=112ms
+2026-10-01 09:15:15.118 ERROR [net] session 0x3f2a encrypted handshake timeout, retrying key exchange
+2026-10-01 09:15:15.302 INFO  [net] session 0x3f2a key exchange ok, cipher aes-256-gcm
+2026-10-01 09:15:16.780 WARN  [db] connection pool at 75% (24/32), consider scaling
+2026-10-01 09:15:18.004 INFO  [game] session 0x3f2a leave_dungeon id=21 result=clear
+2026-10-01 09:15:18.441 INFO  [drop] dungeon 21 reward: 3 items, 12 gold, 1 gem
+2026-10-01 09:15:19.883 INFO  [task] dungeon 21 cleared, reward delivered
+2026-10-01 09:15:21.015 INFO  [mail] session 0x3f2a new mail from system: dungeon reward
+2026-10-01 09:15:22.601 WARN  [cache] redis connection retry 2/5 (backend 10.0.12.9:6379)
+2026-10-01 09:15:23.004 INFO  [cache] redis reconnect ok, 3 masters healthy
+2026-10-01 09:15:24.552 ERROR [trade] trade 70121 timeout: no response from session 0x3f2b in 30s
+2026-10-01 09:15:24.553 WARN  [trade] trade 70121 rolled back, items returned
+2026-10-01 09:15:26.018 INFO  [game] session 0x3f2a refine_item item=88001 level=3 -> 4 success
+2026-10-01 09:15:27.664 INFO  [game] session 0x3f2a equip item 88001 in slot weapon
+2026-10-01 09:15:29.001 INFO  [save] session 0x3f2a autosave in 49ms, 2 dirty rows
+2026-10-01 09:15:30.837 WARN  [game] session 0x3f2b afk for 180s, returning to lobby
+2026-10-01 09:15:32.208 INFO  [game] session 0x3f2a start_quest id=3050
+2026-10-01 09:15:33.115 INFO  [quest] quest 3050 objective 1/3 updated
+2026-10-01 09:15:34.902 ERROR [map] tile 1024x768 missing navmesh chunk, falling back to 2016 data
+2026-10-01 09:15:35.001 WARN  [map] navmesh fallback may cause path detours near (1024, 768)
+2026-10-01 09:15:36.664 INFO  [stats] tick 60s: online=133 qps=405 avg_lat=19ms p99=95ms
+2026-10-01 09:15:38.004 INFO  [battle] battle 99124 start: alice vs monster 50204
+2026-10-01 09:15:38.552 INFO  [battle] round 1 alice hit 228, crit
+2026-10-01 09:15:38.910 INFO  [battle] battle 99124 end in 0.9s, winner=alice
+2026-10-01 09:15:39.447 INFO  [drop] monster 50204 drops: 1 item
+2026-10-01 09:15:40.881 WARN  [net] accept queue empty, listener 8001 idle for 120s (UDP)
+2026-10-01 09:15:42.003 INFO  [chat] session 0x3f2a msg="ty for the help" len=16
+2026-10-01 09:15:43.118 INFO  [auth] session 0x3f2b logout, online time 16m47s
+2026-10-01 09:15:44.006 INFO  [net] session 0x3f2b closed by peer, fd released
+2026-10-01 09:15:45.229 ERROR [game] session 0x3f2a item 88001 durability warning 5/100
+2026-10-01 09:15:46.004 INFO  [game] session 0x3f2a repair item 88001 cost 42 gold
+2026-10-01 09:15:47.662 INFO  [save] session 0x3f2a autosave in 47ms, 1 dirty row
+2026-10-01 09:15:49.008 INFO  [task] daily quest 3050 progress: 2/3
+2026-10-01 09:15:50.554 WARN  [cache] redis key game:10233 expires in 30s, refreshing TTL
+2026-10-01 09:15:52.001 INFO  [game] session 0x3f2a open_chest id=40012
+2026-10-01 09:15:52.884 INFO  [drop] chest 40012 opened: 2 items, 5 gold
+2026-10-01 09:15:54.019 ERROR [db] connection pool exhausted: 32/32 in use, request queued 3.2s
+2026-10-01 09:15:54.112 INFO  [db] connection 11 released, queued request resumed
+2026-10-01 09:15:55.006 WARN  [db] consider raising max_connections for pool "game"
+2026-10-01 09:15:56.883 INFO  [stats] tick 60s: online=132 qps=391 avg_lat=22ms p99=131ms
+2026-10-01 09:15:58.004 INFO  [game] session 0x3f2a level_up 9 -> 10, hp+130 mp+45
+2026-10-01 09:15:59.662 INFO  [quest] quest 3050 objective 3/3 updated
+2026-10-01 09:16:00.215 INFO  [quest] quest 3050 completed, reward delivered
+2026-10-01 09:16:01.004 INFO  [mail] session 0x3f2a new mail from system: quest reward
+2026-10-01 09:16:02.778 WARN  [game] scene 1001 weather change: sunny -> rain
+2026-10-01 09:16:04.001 INFO  [game] scene 1001 rain particles warmed (256 emitters)
+2026-10-01 09:16:05.443 ERROR [net] session 0x3f2a packet 0x0f dropped: checksum mismatch (retry 1/3)
+2026-10-01 09:16:05.901 INFO  [net] session 0x3f2a packet 0x0f recovered via retransmit
+2026-10-01 09:16:07.115 WARN  [game] session 0x3f2a client clock skew 1.8s, resync sent
+2026-10-01 09:16:08.004 INFO  [save] session 0x3f2a autosave in 51ms, 3 dirty rows
+2026-10-01 09:16:09.882 INFO  [task] daily task progress updated: 7/10
+2026-10-01 09:16:11.006 INFO  [game] session 0x3f2a start_match type=arena
+2026-10-01 09:16:12.338 INFO  [match] arena match 31005 found: 3v3, waiting 2/6
+2026-10-01 09:16:14.004 INFO  [match] arena match 31005 full, teleporting players
+2026-10-01 09:16:15.881 WARN  [net] teleport burst 6 sessions, queue depth 82
+2026-10-01 09:16:17.004 INFO  [battle] arena 31005 round 1 start
+2026-10-01 09:16:18.552 ERROR [battle] arena 31005 skill 7003 cast on dead target, ignored
+2026-10-01 09:16:20.004 INFO  [battle] arena 31005 round 1 end, score 3:2
+2026-10-01 09:16:21.883 INFO  [stats] tick 60s: online=132 qps=412 avg_lat=18ms p99=88ms
+2026-10-01 09:16:23.004 INFO  [game] session 0x3f2a logout request, saving state
+2026-10-01 09:16:23.115 INFO  [save] session 0x3f2a final save in 88ms, 6 dirty rows
+2026-10-01 09:16:23.226 INFO  [auth] session 0x3f2a logout, online time 1h09m
+2026-10-01 09:16:23.307 INFO  [net] session 0x3f2a closed by peer, fd released
+2026-10-01 09:16:24.004 INFO  [main] graceful shutdown initiated (SIGTERM)
+2026-10-01 09:16:24.115 INFO  [net] listener 8000 draining, 0 active sessions
+2026-10-01 09:16:24.308 INFO  [db] pool closed, 8 connections returned
+2026-10-01 09:16:24.412 INFO  [cache] redis connections closed
+2026-10-01 09:16:24.505 INFO  [main] shutdown complete in 501ms, bye
