@@ -1,4 +1,8 @@
-//! 实时文本过滤：多关键词 Aho-Corasick 匹配（热路径），可选正则兜底。
+//! 实时文本过滤：多关键词 Aho-Corasick 匹配（热路径）与正则匹配两种**互斥**模式。
+//!
+//! 模式互斥由前端保证：任一时刻只填 keywords 或只填 regex，另一字段显式置空。
+//! 这里保留「任一命中即命中」的判断，是为了让两种模式各自独立生效；
+//! 若两者同时非空（非预期用法），语义退化为 OR 并集。
 //!
 //! 过滤发生在后端（Rust），前端只接收「已命中」的行，保证：
 //!   - 增量读取 + 增量过滤 + 增量渲染全部增量化
@@ -8,13 +12,17 @@ use aho_corasick::AhoCorasick;
 use regex::Regex;
 
 /// 过滤条件。
+///
+/// 正常用法下 `keywords` 与 `regex` 互斥（二选一，另一个为空）：
+/// 前端「关键词 / 正则」两个模式一次只填一个字段，切换模式即整表重扫。
 #[derive(Debug, Clone, Default)]
 pub struct FilterSpec {
     /// 普通关键词列表（OR 关系，大小写不敏感）。
     pub keywords: Vec<String>,
     /// 可选的正则表达式（编译后的）。
     pub regex: Option<String>,
-    /// 是否大小写敏感（默认 false，即不敏感）。
+    /// 是否大小写敏感（默认 false，即不敏感）。仅作用于关键词；
+    /// 正则要区分大小写请自行写内联标志 `(?i)`。
     pub case_sensitive: bool,
 }
 
@@ -50,6 +58,8 @@ impl Filter {
     }
 
     /// 判断一行文本是否命中过滤条件（空条件 = 全命中）。
+    ///
+    /// 两种模式互斥时，这里等价于「用当前模式匹配」：另一侧为 None，不参与判断。
     pub fn matches(&self, text: &str) -> bool {
         // 无任何条件 => 所有行都命中。
         if self.ac.is_none() && self.re.is_none() {

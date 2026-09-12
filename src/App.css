@@ -644,11 +644,31 @@ body,
   border-radius: 3px;
   font-family: inherit;
   font-size: 12px;
-  min-width: 80px; /* 可收缩到 80px，避免三个输入框的最小尺寸把布局撑出窗口 */
+  min-width: 80px; /* 可收缩到 80px，避免输入框的最小尺寸把布局撑出窗口 */
 }
 
-.filterbar .keyword {
+.filterbar .filter-input {
   flex: 1;
+}
+
+/* 模式切换按钮：位于共用输入框左侧，按钮上显示当前生效的模式
+   （关键词 / 正则），点击即切换。 */
+.filterbar .mode-btn {
+  flex-shrink: 0;
+  min-width: 52px;
+  padding: 4px 10px;
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--border-light);
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.filterbar .mode-btn:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+  border-color: var(--border);
 }
 
 /* 关键词大小写开关（Aa 图标按钮）：紧贴关键词输入框右侧。
@@ -685,10 +705,6 @@ body,
   background: var(--accent-hover);
   border-color: var(--accent-hover);
   color: #fff;
-}
-
-.filterbar .regex {
-  flex: 1;
 }
 
 .filterbar .highlight {

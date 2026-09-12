@@ -216,12 +216,34 @@ function pushRecentPath(list: string[], path: string): string[] {
 
 /**
  * 把关键词输入框的内容解析为关键词列表。
- * 关键词框视为「一个完整短语」匹配（空格是短语的一部分），
- * 多条件 OR 请在正则框输入，例如 `error|warn`。
+ * 关键词框视为「一个完整短语」匹配（空格是短语的一部分）；
+ * 多条件 OR 请切到正则模式输入，例如 `error|warn`。
  */
 function tokenizeKeywordInput(input: string): string[] {
   const trimmed = input.trim();
   return trimmed ? [trimmed] : [];
+}
+
+/**
+ * 过滤模式。关键词与正则是「互斥」的两种需求：同一时刻只有一种生效，
+ * 二者共享过滤栏上的同一个输入位（默认关键词模式）。
+ * 每种模式各自记住上一次的输入，切换回来时原样恢复，便于来回对比结果。
+ */
+type FilterMode = "keyword" | "regex";
+
+/**
+ * 把当前模式 + 当前输入解析为后端 FilterSpec 的载荷。
+ * 只填当前模式对应的那个字段，另一字段显式置空 —— 由这里保证两模式互斥。
+ */
+function buildFilterPayload(mode: FilterMode, rawInput: string): {
+  keywords: string[];
+  regex: string | null;
+} {
+  if (mode === "regex") {
+    const value = rawInput.trim();
+    return { keywords: [], regex: value ? value : null };
+  }
+  return { keywords: tokenizeKeywordInput(rawInput), regex: null };
 }
 
 let tabSeq = 0;
@@ -478,6 +500,9 @@ interface Messages {
   keywordCaseOnTitle: string;
   keywordCaseOffTitle: string;
   regexPlaceholder: string;
+  filterModeKeyword: string;
+  filterModeRegex: string;
+  filterModeSwitchTitle: string;
   highlightPlaceholder: string;
   applyFilter: string;
   countLines: (n: number) => string;
@@ -583,7 +608,10 @@ const MESSAGES: Record<Lang, Messages> = {
     keywordPlaceholder: "关键词（含空格作为完整短语匹配）",
     keywordCaseOnTitle: "关键词匹配区分大小写：开（点击关闭）",
     keywordCaseOffTitle: "关键词匹配区分大小写：关（点击开启，忽略大小写）",
-    regexPlaceholder: "正则（可选，多条件 OR 如 error|warn）",
+    regexPlaceholder: "正则（多条件 OR 如 error|warn）",
+    filterModeKeyword: "关键词",
+    filterModeRegex: "正则",
+    filterModeSwitchTitle: "点击切换过滤模式：关键词 / 正则（二者互斥，共用同一输入框）",
     highlightPlaceholder: "高亮关键词（空格分隔多个，实时生效）",
     applyFilter: "过滤",
     countLines: (n) => `${n} 行`,
@@ -687,7 +715,10 @@ const MESSAGES: Record<Lang, Messages> = {
     keywordPlaceholder: "Keyword (spaces match the whole phrase)",
     keywordCaseOnTitle: "Match keyword case: on (click to turn off)",
     keywordCaseOffTitle: "Match keyword case: off (click to turn on, ignore case)",
-    regexPlaceholder: "Regex (optional, OR conditions like error|warn)",
+    regexPlaceholder: "Regex (OR conditions like error|warn)",
+    filterModeKeyword: "Keyword",
+    filterModeRegex: "Regex",
+    filterModeSwitchTitle: "Click to switch filter mode: Keyword / Regex (mutually exclusive, same input box)",
     highlightPlaceholder: "Highlight keywords (space-separated, live)",
     applyFilter: "Filter",
     countLines: (n) => `${n} lines`,
@@ -849,8 +880,22 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
   /** 首屏内容绘制回执：只上报一次（供后端启动耗时打点）。 */
   const firstPaintReportedRef = useRef(false);
   const lastEvictRef = useRef(0);
-  const [keywordInput, setKeywordInput] = useState("");
-  const [regexInput, setRegexInput] = useState("");
+  // ---- 过滤：关键词 / 正则两种互斥模式，共用过滤栏上的同一个输入位 ----
+  // 默认关键词模式；两模式各自记住自己的输入，切换回来原样恢复。
+  const [filterMode, setFilterMode] = useState<FilterMode>("keyword");
+  const [filterKeywordInput, setFilterKeywordInput] = useState("");
+  const [filterRegexInput, setFilterRegexInput] = useState("");
+  const filterInput = filterMode === "keyword" ? filterKeywordInput : filterRegexInput;
+  const filterKeywordInputRef = useRef(filterKeywordInput);
+  const filterRegexInputRef = useRef(filterRegexInput);
+  const filterModeRef = useRef(filterMode);
+  // 这三个 ref 只服务「不能在渲染闭包里读到最新值」的场合，在渲染提交后同步。
+  // 过滤主路径不依赖它们：applyFilter 显式接收 mode/rawInput。
+  useEffect(() => {
+    filterModeRef.current = filterMode;
+    filterKeywordInputRef.current = filterKeywordInput;
+    filterRegexInputRef.current = filterRegexInput;
+  }, [filterMode, filterKeywordInput, filterRegexInput]);
   // 关键词匹配是否区分大小写（默认 false = 忽略大小写，与后端 FilterSpec 默认一致）。
   const [caseSensitive, setCaseSensitive] = useState(false);
   // 高亮关键词（输入框原始文本 + 解析后的列表，实时生效）。
@@ -1849,27 +1894,31 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
     setWrapLines(next);
   }, [virtualizer]);
 
+  /** 切换自动刷新：恢复过滤时按「当前模式 + 当前输入」重建过滤条件。 */
   const toggleAutoRefresh = useCallback(
     async (next: boolean) => {
       setAutoRefresh(next);
       // 仅旧窗口模型（过滤态）需要恢复过滤；稀疏模型的事件本就全量。
       if (next && filterActiveRef.current) {
         try {
-          const keywords = tokenizeKeywordInput(keywordInput);
-          const regex = regexInput.trim() || null;
+          const { keywords, regex } = buildFilterPayload(filterMode, filterInput);
           await invoke("set_filter", { tabId, keywords, regex, caseSensitive });
         } catch {
           /* 静默失败 */
         }
       }
     },
-    [tabId, keywordInput, regexInput, caseSensitive]
+    [tabId, caseSensitive, filterMode, filterInput]
   );
 
   const applyFilter = useCallback(
-    async (caseOverride?: boolean) => {
-      const keywords = tokenizeKeywordInput(keywordInput);
-      const regex = regexInput.trim() || null;
+    async (caseOverride?: boolean, use?: { mode: FilterMode; rawInput: string }) => {
+      // 模式与输入由调用方显式给出（或取本次渲染的闭包值），不读可变 ref：
+      // 否则「切换模式」这类在同一事件里既改状态又立刻重扫的路径，
+      // 会读到尚未同步的旧值，把上一个模式的输入当成新模式的条件用。
+      const md = use ? use.mode : filterMode;
+      const raw = use ? use.rawInput : filterInput;
+      const { keywords, regex } = buildFilterPayload(md, raw);
       // caseOverride 由大小写开关立即重扫时传入；否则用当前状态值。
       const cs = caseOverride ?? caseSensitive;
       const hasSpec = keywords.length > 0 || regex != null;
@@ -1917,15 +1966,34 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
         /* 静默失败 */
       }
     },
-    [tabId, keywordInput, regexInput, caseSensitive, lines, virtualizer]
+    [tabId, caseSensitive, lines, virtualizer, filterMode, filterInput]
   );
 
-  /** 关键词大小写开关：过滤已生效时立即用新设置重扫；
-   *  未生效时仅记录偏好，下次点击「过滤」时生效。 */
+  /**
+   * 切换过滤模式（关键词 ⇄ 正则）：二者互斥，共用同一个输入位。
+   * 每种模式的输入各自保留（切回来原样恢复）；只要过滤已生效就立即按新模式重扫，
+   * 新模式的输入为空时即等于清空过滤、回到稀疏模型。
+   */
+  const toggleFilterMode = useCallback(() => {
+    const next: FilterMode = filterModeRef.current === "keyword" ? "regex" : "keyword";
+    // 新模式对应的草稿（各自独立保存，切回来原样恢复）。
+    const nextRaw =
+      next === "keyword" ? filterKeywordInputRef.current : filterRegexInputRef.current;
+    filterModeRef.current = next; // 让同一事件内的后续读取也看到新值
+    setFilterMode(next);
+    if (filterActiveRef.current) {
+      // 显式把新模式的输入交给 applyFilter —— 本事件内状态还没提交，不能靠读状态。
+      void applyFilter(undefined, { mode: next, rawInput: nextRaw });
+    }
+  }, [applyFilter]);
+
+  /** 关键词大小写开关（仅关键词模式生效，正则要区分大小写请写内联 (?i)）：
+   *  过滤已生效时立即用新设置重扫；未生效时仅记录偏好，下次点击「过滤」时生效。 */
   const toggleCaseSensitive = useCallback(() => {
     const next = !caseSensitive;
     setCaseSensitive(next);
-    if (filterActiveRef.current) {
+    // 正则模式不受大小写开关影响，无需重扫。
+    if (filterActiveRef.current && filterModeRef.current === "keyword") {
       void applyFilter(next);
     }
   }, [caseSensitive, applyFilter]);
@@ -2304,44 +2372,55 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
       </div>
 
       <div className="filterbar">
-        <input
-          className="keyword"
-          value={keywordInput}
-          onChange={(e) => setKeywordInput(e.target.value)}
-          onKeyDown={onKeyDown}
-          placeholder={t.keywordPlaceholder}
-        />
         <button
-          className={`case-btn${caseSensitive ? " on" : ""}`}
-          onClick={toggleCaseSensitive}
-          title={caseSensitive ? t.keywordCaseOnTitle : t.keywordCaseOffTitle}
-          aria-pressed={caseSensitive}
+          className="mode-btn"
+          onClick={toggleFilterMode}
+          title={t.filterModeSwitchTitle}
+          aria-label={t.filterModeSwitchTitle}
         >
-          <svg width="18" height="13" viewBox="0 0 18 13" aria-hidden="true">
-            <text
-              x="9"
-              y="10"
-              textAnchor="middle"
-              fontSize="10.5"
-              fontWeight="700"
-              fill="currentColor"
-              fontFamily="inherit"
-            >
-              Aa
-            </text>
-            {/* 忽略大小写时给 Aa 加删除线；开启区分大小写时无删除线 */}
-            {!caseSensitive && (
-              <line x1="3" y1="12" x2="15" y2="12" stroke="currentColor" strokeWidth="1" />
-            )}
-          </svg>
+          {filterMode === "keyword" ? t.filterModeKeyword : t.filterModeRegex}
         </button>
         <input
-          className="regex"
-          value={regexInput}
-          onChange={(e) => setRegexInput(e.target.value)}
+          className={`filter-input ${filterMode}`}
+          value={filterInput}
+          onChange={(e) => {
+            // 只写当前模式的草稿，切换模式时另一份输入保持原值。
+            const { value } = e.currentTarget;
+            if (filterMode === "keyword") {
+              setFilterKeywordInput(value);
+            } else {
+              setFilterRegexInput(value);
+            }
+          }}
           onKeyDown={onKeyDown}
-          placeholder={t.regexPlaceholder}
+          placeholder={filterMode === "keyword" ? t.keywordPlaceholder : t.regexPlaceholder}
         />
+        {filterMode === "keyword" && (
+          <button
+            className={`case-btn${caseSensitive ? " on" : ""}`}
+            onClick={toggleCaseSensitive}
+            title={caseSensitive ? t.keywordCaseOnTitle : t.keywordCaseOffTitle}
+            aria-pressed={caseSensitive}
+          >
+            <svg width="18" height="13" viewBox="0 0 18 13" aria-hidden="true">
+              <text
+                x="9"
+                y="10"
+                textAnchor="middle"
+                fontSize="10.5"
+                fontWeight="700"
+                fill="currentColor"
+                fontFamily="inherit"
+              >
+                Aa
+              </text>
+              {/* 忽略大小写时给 Aa 加删除线；开启区分大小写时无删除线 */}
+              {!caseSensitive && (
+                <line x1="3" y1="12" x2="15" y2="12" stroke="currentColor" strokeWidth="1" />
+              )}
+            </svg>
+          </button>
+        )}
         <input
           className="highlight"
           value={highlightInput}

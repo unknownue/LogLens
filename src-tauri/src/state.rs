@@ -678,6 +678,50 @@ mod tests {
         assert_eq!(matched.len(), 2);
     }
 
+    /// 关键词模式与正则模式互斥：前端一次只填一个字段，
+    /// 切换模式即整表重扫，两模式各自得到独立的命中集合。
+    #[test]
+    fn keyword_and_regex_modes_are_mutually_exclusive() {
+        let lines = vec![
+            "INFO login uid=12345", // 只命中正则  \d+
+            "ERROR login failed",   // 只命中关键词 error
+            "INFO uid=abc",         // 两者都不命中
+        ];
+
+        // 关键词模式：正则字段为空 => 只有 error 命中。
+        let keyword_spec = FilterSpec {
+            keywords: vec!["error".to_string()],
+            regex: None,
+            case_sensitive: false,
+        };
+        let kw = session_with(lines.clone()).apply_filter(keyword_spec);
+        assert_eq!(kw.len(), 1);
+        assert_eq!(kw[0].text, "ERROR login failed");
+
+        // 正则模式：关键词字段为空 => 只有 uid=数字 命中。
+        let regex_spec = FilterSpec {
+            keywords: vec![],
+            regex: Some(r"uid=\d+".to_string()),
+            case_sensitive: false,
+        };
+        let re = session_with(lines.clone()).apply_filter(regex_spec);
+        assert_eq!(re.len(), 1);
+        assert_eq!(re[0].text, "INFO login uid=12345");
+
+        // 二者命中集合互不相同 —— 证明模式切换确实换掉了过滤语义，
+        // 而不是两种条件叠加（叠加会得到 2 行）。
+        assert_ne!(kw[0].file_line, re[0].file_line);
+
+        // 切回关键词模式：结果与第一次完全一致（模式切换可逆）。
+        let back = session_with(lines).apply_filter(FilterSpec {
+            keywords: vec!["error".to_string()],
+            regex: None,
+            case_sensitive: false,
+        });
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].text, "ERROR login failed");
+    }
+
     #[test]
     fn after_filter_new_lines_are_still_filtered() {
         let s = session_with(vec!["ERROR db error", "INFO ok"]);

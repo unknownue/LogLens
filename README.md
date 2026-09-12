@@ -7,7 +7,7 @@ Designed for large log files: follow them in real time and browse anywhere witho
 ## Features
 
 - **Live tail** — incremental reads from the end of the file; survives truncation, rotation, and full external rewrites (even same-size rewrites).
-- **Realtime filtering** — keyword (Aho-Corasick) and regex filtering in Rust; only matching lines reach the UI.
+- **Realtime filtering — two mutually exclusive modes** — keyword (Aho-Corasick) and regex filtering in Rust; only matching lines reach the UI. Keyword and regex are two *separate, mutually exclusive* modes sharing a single input box in the filter bar: click the mode button on the left to switch, which re-filters immediately. Each mode remembers its own last input, so switching back and forth compares results without retyping. Keyword is the default mode.
 - **Sparse virtual scrolling** — the scrollbar maps the whole file; unloaded regions render as placeholders and load on demand, bidirectionally, with distance-prioritized prefetch.
 - **Line index** — a sampled (every 64 lines) byte-offset index makes line lookups and line counts O(sample gap) instead of a full file scan.
 - **Session restore** — reopens the tabs from the previous run; missing files show a warning instead of crashing.
@@ -49,7 +49,7 @@ Installer output: `src-tauri/target/release/bundle/nsis/LogLens_<version>_x64-se
 |-------|----------|--------|
 | Incremental reads | byte-offset tailing with boundary / truncation / rotation handling | `src-tauri/src/tail.rs` |
 | Line index | sampled offsets, seeded on open, warmed to EOF in the background | `src-tauri/src/index.rs` |
-| Filtering | Aho-Corasick multi-keyword + optional regex | `src-tauri/src/filter.rs` |
+| Filtering | Aho-Corasick multi-keyword / regex, two mutually exclusive modes | `src-tauri/src/filter.rs` |
 | State & events | per-tab sessions, `notify` watcher, batched events | `src-tauri/src/state.rs` |
 | Rendering | sparse virtual list, placeholder rows, idle scroll anchoring, line-based wheel | `src/App.tsx` |
 
