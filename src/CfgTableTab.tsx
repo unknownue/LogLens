@@ -1,69 +1,15 @@
 import { useEffect, useMemo, useRef } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 
-// ==================== 类型（与后端 client_cfg.rs 序列化对齐） ====================
+import { computeColumnWidths } from "./cfg-columns";
+import { fmtValue } from "./cfg-types";
+import type { ClientCfgTable, CfgColumn, CfgValue } from "./cfg-types";
+import { langOfPath } from "./cfg-types";
 
-/** 单元格值（tagged JSON：t=类型，v=值）。 */
-export interface CfgValue {
-  t:
-    | "null"
-    | "bool"
-    | "byte"
-    | "int"
-    | "uint"
-    | "long"
-    | "ulong"
-    | "short"
-    | "ushort"
-    | "float"
-    | "double"
-    | "str"
-    | "array"
-    | "dict"
-    | "set";
-  v: unknown;
-}
-
-export interface CfgColumn {
-  name: string;
-  field_type: string;
-}
-
-export interface ClientCfgTable {
-  name: string;
-  columns: CfgColumn[];
-  keys: number[];
-  rows: CfgValue[][];
-}
-
-/** 把单元格值渲染成表格文本。 */
-export function fmtValue(v: CfgValue | undefined | null): string {
-  if (v == null || v.t === "null") {
-    return "";
-  }
-  switch (v.t) {
-    case "str":
-      return String(v.v);
-    case "bool":
-      return v.v ? "true" : "false";
-    case "array":
-      return (v.v as CfgValue[]).map(fmtValue).join(", ");
-    case "set":
-      return (v.v as CfgValue[]).map(fmtValue).join(", ");
-    case "dict":
-      return (v.v as [CfgValue, CfgValue][])
-        .map(([k, x]) => `${fmtValue(k)}: ${fmtValue(x)}`)
-        .join(", ");
-    default:
-      return String(v.v);
-  }
-}
-
-/** 从路径提取语言目录（.../client_cfg/<lang>/xxx.bin → <lang>）。 */
-function langOfPath(path: string): string | null {
-  const m = path.toLowerCase().match(/[\\/]client_cfg[\\/]([^\\/]+)[\\/][^\\/]+\.bin$/);
-  return m ? m[1] : null;
-}
+// 这些类型/纯函数已拆到 cfg-types.ts / cfg-columns.ts，此处原样再导出，
+// 保持既有 import 路径（App.tsx 等）不变。
+export type { ClientCfgTable, CfgColumn, CfgValue };
+export { fmtValue, computeColumnWidths };
 
 async function copyTextToClipboard(text: string): Promise<void> {
   try {
@@ -82,6 +28,27 @@ async function copyTextToClipboard(text: string): Promise<void> {
 
 const BASE_ROW_HEIGHT = 26;
 
+/**
+ * 工具栏最左侧的「切换视图」图标按钮。
+ * 表格视图下它是切回文本视图的唯一入口，所以三条渲染分支（解析中/解析失败/正常）
+ * 都必须带上它 —— 否则解析失败时用户会被困在表格视图里。
+ * 图标表示「将要切到的视图」：当前表格 → 显示文本图标。
+ */
+function ViewToggleButton({ title, onClick }: { title: string; onClick: () => void }) {
+  return (
+    <button
+      className="icon-btn toolbar-icon view-toggle on"
+      onClick={onClick}
+      aria-pressed={true}
+      title={title}
+    >
+      <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
+        <path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h6" stroke="currentColor" strokeWidth="1.55" />
+      </svg>
+    </button>
+  );
+}
+
 export function CfgTableTab({
   tabId,
   path,
@@ -91,6 +58,7 @@ export function CfgTableTab({
   fontSize,
   uiLang,
   onPickSchema,
+  onSwitchViewMode,
   registerCopy,
   reportTotal,
 }: {
@@ -106,6 +74,8 @@ export function CfgTableTab({
   uiLang: "zh" | "en";
   /** 用户手动选择 cfg_table_slots.json（解析失败/想换表时）。 */
   onPickSchema: () => void;
+  /** 打开视图模式选择框（切回文本视图的唯一入口，工具栏最左侧图标按钮）。 */
+  onSwitchViewMode: () => void;
   registerCopy: (tabId: string, fn: (() => Promise<string>) | null) => void;
   reportTotal: (tabId: string, total: number | null) => void;
 }) {
@@ -161,16 +131,31 @@ export function CfgTableTab({
 
   const cfgLang = langOfPath(path);
 
-  // 整表宽度：固定列宽 + 自适应；表头/表体用同一列宽（CSS grid）。
+  // 列宽：按表头 + 全表内容算出的固定像素，表头/表体用同一套（CSS grid 各自成格，
+  // 不共用轨道，所以必须显式算出同样的宽度，否则两处列宽会对不齐）。
+  // 依赖 rows/columns/fontSize：换表、重新解析、调字号都会重算。
+  const { keyWidth, colWidths } = useMemo(
+    () => computeColumnWidths(columns, rows, data?.keys ?? [], fontSize),
+    [columns, rows, data?.keys, fontSize]
+  );
+
   const gridTemplate = useMemo(() => {
-    const cols = ["64px", ...columns.map(() => "minmax(90px, 220px)")];
+    const cols = [`${keyWidth}px`, ...colWidths.map((w) => `${w}px`)];
     return cols.join(" ");
-  }, [columns]);
+  }, [keyWidth, colWidths]);
+
+  // 整表预计宽度：给 sticky 表头一个显式宽度，
+  // 保证它不会比表体窄（否则横向滚动到右侧时最后几列表头会缺失）。
+  const tableWidth = useMemo(
+    () => keyWidth + colWidths.reduce((a, b) => a + b, 0),
+    [keyWidth, colWidths]
+  );
 
   if (error) {
     return (
       <div className="cfg-tab">
         <div className="cfg-toolbar">
+          <ViewToggleButton title={zh ? "切换视图模式" : "Switch view mode"} onClick={onSwitchViewMode} />
           <span className="cfg-name">{path.split(/[\\/]/).pop()}</span>
           <span className="cfg-actions">
             <button className="cfg-btn" onClick={onPickSchema} title={error}>
@@ -189,6 +174,7 @@ export function CfgTableTab({
     return (
       <div className="cfg-tab">
         <div className="cfg-toolbar">
+          <ViewToggleButton title={zh ? "切换视图模式" : "Switch view mode"} onClick={onSwitchViewMode} />
           <span className="cfg-name">{path.split(/[\\/]/).pop()}</span>
         </div>
         <div className="cfg-error">
@@ -201,6 +187,7 @@ export function CfgTableTab({
   return (
     <div className="cfg-tab">
       <div className="cfg-toolbar">
+        <ViewToggleButton title={zh ? "切换视图模式" : "Switch view mode"} onClick={onSwitchViewMode} />
         <span className="cfg-name" title={path}>
           {data.name}
         </span>
@@ -219,6 +206,8 @@ export function CfgTableTab({
           {/* 表头（粘在滚动容器顶部；高度与行高一致，scrollMargin 已为其预留偏移） */}
           <div
             className="cfg-head"
+            data-testid="cfg-head"
+            data-col-widths={colWidths.join(",")}
             style={{
               display: "grid",
               gridTemplateColumns: gridTemplate,
@@ -226,7 +215,7 @@ export function CfgTableTab({
               top: 0,
               height: rowHeight,
               width: "max-content",
-              minWidth: "100%",
+              minWidth: tableWidth,
             }}
           >
             <div className="cfg-cell cfg-head-cell">key</div>
