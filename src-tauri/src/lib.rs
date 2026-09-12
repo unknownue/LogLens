@@ -4,12 +4,14 @@ mod client_cfg;
 mod filter;
 mod index;
 pub mod perf;
+mod search;
 mod state;
 mod tail;
 
 use std::sync::Arc;
 
 use filter::FilterSpec;
+use search::{MatchKind, SearchPage};
 use state::{start_watching_for_session, AppState, JumpPayload, LinesPayload};
 use tail::LogLine;
 use tauri::{Emitter, Manager};
@@ -197,6 +199,28 @@ fn jump_to_line(
     session.jump_to_line(line_no)
 }
 
+/// 正文内搜索（纯前向、不做全局计数）：从 `from_file_line`（1-based，含）向后扫，
+/// 返回一段命中窗口（封顶 [`search::SEARCH_HIT_CAP`]）。
+/// 范围随过滤状态切换：过滤生效时搜过滤后的行，否则从磁盘流式搜整个文件。
+/// 只做字符串匹配（无正则），大小写/全字可开关。
+/// IPC key：`tabId` / `query` / `kind`（"substring" | "wholeword"）/
+/// `caseSensitive` / `fromFileLine`。
+#[instrument(skip(state, query), fields(tab_id = %tab_id, kind = ?kind, from_file_line))]
+#[tauri::command]
+fn search_lines(
+    state: tauri::State<'_, Arc<AppState>>,
+    tab_id: String,
+    query: String,
+    kind: MatchKind,
+    case_sensitive: bool,
+    from_file_line: u64,
+) -> Result<SearchPage, String> {
+    let session = state
+        .get(&tab_id)
+        .ok_or_else(|| format!("tab 不存在: {}", tab_id))?;
+    session.search_forward(&query, kind, case_sensitive, from_file_line)
+}
+
 /// 前端首次绘制正文后的回执（打点用）：由前端在首屏内容渲染完成后调用一次。
 #[tauri::command]
 fn report_first_paint() {
@@ -247,6 +271,7 @@ pub fn run() {
             load_history,
             get_range,
             jump_to_line,
+            search_lines,
             get_total_lines,
             get_block_avg_lens,
             report_first_paint,

@@ -21,6 +21,26 @@ interface LogLine {
   text: string;
 }
 
+/** 后端 search_lines 命令的单条命中（与 Rust SearchHit 对应）。 */
+interface SearchHit {
+  /** 命中所处的文件行号（1-based）。 */
+  file_line: number;
+  /** 命中在**原始行文本**中的字符偏移（用于定位当前命中并加重高亮）。 */
+  offset: number;
+}
+
+/** 后端 search_lines 命令的返回负载（与 Rust SearchPage 对应）。 */
+interface SearchPage {
+  hits: SearchHit[];
+  /** true = 已扫到搜索范围末尾；false = 触发 10 万命中封顶，后面可能还有。 */
+  complete: boolean;
+  /** 搜索范围总行数（过滤态 = 过滤后行数；否则 = 文件总行数）。 */
+  scope_total: number;
+}
+
+/** 单次前向搜索回传的命中数上限（与后端 SEARCH_HIT_CAP 保持一致）。 */
+const SEARCH_HIT_CAP = 100_000;
+
 /** 后端 log-lines 事件负载（带 tab_id）。 */
 interface LinesPayload {
   tab_id: string;
@@ -503,6 +523,24 @@ interface Messages {
   filterModeKeyword: string;
   filterModeRegex: string;
   filterModeSwitchTitle: string;
+  search: string;
+  searchTitle: string;
+  searchPlaceholder: string;
+  searchCaseTitle: string;
+  searchWholeWordTitle: string;
+  searchNextTitle: string;
+  searchPrevTitle: string;
+  searchCloseTitle: string;
+  searchScanning: string;
+  searchNoResults: string;
+  searchGo: string;
+  searchGoTitle: string;
+  searchDirtyHint: string;
+  searchFilteredScope: string;
+  searchFileScope: string;
+  searchCappedHint: string;
+  searchScopeFiltered: (n: number) => string;
+  searchScopeFile: (n: number) => string;
   highlightPlaceholder: string;
   applyFilter: string;
   countLines: (n: number) => string;
@@ -612,6 +650,24 @@ const MESSAGES: Record<Lang, Messages> = {
     filterModeKeyword: "关键词",
     filterModeRegex: "正则",
     filterModeSwitchTitle: "点击切换过滤模式：关键词 / 正则（二者互斥，共用同一输入框）",
+    search: "搜索",
+    searchTitle: "在正文中搜索（Ctrl+F）",
+    searchPlaceholder: "查找",
+    searchCaseTitle: "区分大小写",
+    searchWholeWordTitle: "全字匹配",
+    searchNextTitle: "下一个匹配（Enter）",
+    searchPrevTitle: "上一个匹配（Shift+Enter）",
+    searchCloseTitle: "关闭搜索（Esc）",
+    searchScanning: "搜索中…",
+    searchNoResults: "无结果",
+    searchGo: "查找",
+    searchGoTitle: "查找（Enter）",
+    searchDirtyHint: "按 Enter 查找",
+    searchFilteredScope: "搜索范围：过滤后的行",
+    searchFileScope: "搜索范围：整个文件",
+    searchCappedHint: "已达到显示上限，按 Enter 继续向后搜索",
+    searchScopeFiltered: (n) => `过滤后 ${n} 行`,
+    searchScopeFile: (n) => `全文件 ${n} 行`,
     highlightPlaceholder: "高亮关键词（空格分隔多个，实时生效）",
     applyFilter: "过滤",
     countLines: (n) => `${n} 行`,
@@ -719,6 +775,24 @@ const MESSAGES: Record<Lang, Messages> = {
     filterModeKeyword: "Keyword",
     filterModeRegex: "Regex",
     filterModeSwitchTitle: "Click to switch filter mode: Keyword / Regex (mutually exclusive, same input box)",
+    search: "Find",
+    searchTitle: "Search in the content (Ctrl+F)",
+    searchPlaceholder: "Find",
+    searchCaseTitle: "Match case",
+    searchWholeWordTitle: "Match whole word",
+    searchNextTitle: "Next match (Enter)",
+    searchPrevTitle: "Previous match (Shift+Enter)",
+    searchCloseTitle: "Close search (Esc)",
+    searchScanning: "Searching…",
+    searchNoResults: "No results",
+    searchGo: "Find",
+    searchGoTitle: "Find (Enter)",
+    searchDirtyHint: "Press Enter to find",
+    searchFilteredScope: "Scope: filtered lines",
+    searchFileScope: "Scope: whole file",
+    searchCappedHint: "Display cap reached; press Enter to keep searching forward",
+    searchScopeFiltered: (n) => `${n} filtered lines`,
+    searchScopeFile: (n) => `${n} lines in file`,
     highlightPlaceholder: "Highlight keywords (space-separated, live)",
     applyFilter: "Filter",
     countLines: (n) => `${n} lines`,
@@ -809,8 +883,12 @@ function parseHighlightKeywords(input: string): string[] {
     .filter(Boolean);
 }
 
-/** 高亮片段的两种类型：普通文本 | 命中关键词（携带关键词索引用于取色）。 */
-type HighlightPart = string | { kw: string; colorIndex: number };
+/** 高亮片段的两种类型：普通文本 | 命中关键词（携带关键词索引用于取色） |
+ *  搜索命中（isCurrent 标记当前跳转到的那一处，用更重的颜色强调）。 */
+type HighlightPart =
+  | string
+  | { kw: string; colorIndex: number }
+  | { find: string; isCurrent: boolean };
 
 /** 预编译的高亮器：正则 + 小写关键词表（避免每行渲染时重复构建正则）。 */
 interface HighlightMatcher {
@@ -830,6 +908,78 @@ function buildHighlightMatcher(keywords: string[]): HighlightMatcher | null {
   };
 }
 
+/** 搜索匹配器：字符串匹配（非正则），支持大小写敏感与全字匹配。 */
+interface SearchMatcher {
+  term: string;
+  caseSensitive: boolean;
+  wholeWord: boolean;
+}
+
+/**
+ * 全字匹配的边界判断：命中片段两侧不能紧邻「词字符」。
+ * 用 Unicode 属性（\p{L}\p{N}_）而不是 ASCII 判断，中文/日文等非 ASCII 文本
+ * 才能得到正确边界（否则「错误err」也会被判成独立单词）。
+ */
+const WORD_CHAR_RE = /[\p{L}\p{N}_]/u;
+
+function isWordChar(ch: string): boolean {
+  return ch.length > 0 && WORD_CHAR_RE.test(ch);
+}
+
+/**
+ * 在一行文本里找出搜索词的所有命中位置（返回 [start, end) 的 UTF-16 下标）。
+ * 与后端保持一致：大小写不敏感时按 ASCII 折叠比较，不做 Unicode 大小写折叠。
+ */
+function findSpans(text: string, m: SearchMatcher): [number, number][] {
+  if (!m.term) {
+    return [];
+  }
+  const needle = m.caseSensitive ? m.term : m.term.toLowerCase();
+  const hay = m.caseSensitive ? text : text.toLowerCase();
+  const spans: [number, number][] = [];
+  let i = 0;
+  while (i <= hay.length - needle.length) {
+    const at = hay.indexOf(needle, i);
+    if (at < 0) {
+      break;
+    }
+    const end = at + needle.length;
+    if (!m.wholeWord || (!isWordChar(text.charAt(at - 1)) && !isWordChar(text.charAt(end)))) {
+      spans.push([at, end]);
+    }
+    i = at + 1; // 允许重叠命中（aaaa 里搜 aa）
+  }
+  return spans;
+}
+
+/**
+ * 把一行文本切分为「搜索命中 / 关键词命中 / 普通文本」交替的片段。
+ * 搜索命中优先：关键词高亮只作用于搜索命中之间的空隙，避免两套高亮互相打断。
+ */
+function splitLineBySearch(
+  text: string,
+  matcher: SearchMatcher | null,
+  currentCharOffset: number | null
+): HighlightPart[] {
+  const spans = matcher ? findSpans(text, matcher) : [];
+  if (spans.length === 0) {
+    return [text];
+  }
+  const out: HighlightPart[] = [];
+  let cursor = 0;
+  for (const [s, e] of spans) {
+    if (s > cursor) {
+      out.push(text.slice(cursor, s));
+    }
+    out.push({ find: text.slice(s, e), isCurrent: currentCharOffset != null && s === currentCharOffset });
+    cursor = e;
+  }
+  if (cursor < text.length) {
+    out.push(text.slice(cursor));
+  }
+  return out;
+}
+
 /**
  * 用预编译的高亮匹配器把一行文本切分为高亮片段。
  * 返回数组：普通文本为 string，命中关键词为 { kw, colorIndex } 对象。
@@ -842,6 +992,36 @@ function splitByMatcher(text: string, matcher: HighlightMatcher): HighlightPart[
     const idx = lowerKeywords.findIndex((k) => k === lower);
     return idx >= 0 ? { kw: part, colorIndex: idx } : part;
   });
+}
+
+/**
+ * 带搜索高亮的切分：搜索命中优先成段，其余部分再交给关键词匹配器上色。
+ * 这样两套高亮可以共存而不会把对方切断。
+ */
+function splitWithSearchAndKeywords(
+  text: string,
+  search: SearchMatcher | null,
+  currentCharOffset: number | null,
+  keywords: HighlightMatcher | null
+): HighlightPart[] {
+  const searchParts = splitLineBySearch(text, search, currentCharOffset);
+  const hasSearchHit = searchParts.some((p) => typeof p !== "string");
+  if (!hasSearchHit) {
+    // 没有搜索命中：等价于原来的纯关键词切分。
+    return keywords ? splitByMatcher(text, keywords) : [text];
+  }
+  if (!keywords) {
+    return searchParts;
+  }
+  const out: HighlightPart[] = [];
+  for (const part of searchParts) {
+    if (typeof part === "string") {
+      out.push(...splitByMatcher(part, keywords));
+    } else {
+      out.push(part);
+    }
+  }
+  return out;
 }
 
 /** 单个日志 tab：独立的状态（行、过滤、滚动、高亮）与事件监听。 */
@@ -907,6 +1087,49 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
     [highlightInput]
   );
   const [followTail, setFollowTail] = useState(true);
+  // ---- 正文内搜索（VSCode 风格悬浮框） ----
+  // 语义：过滤生效时搜「过滤后的行」，未生效时搜整个文件（后端按 filter 状态决定范围）。
+  // 纯前向搜索、不做全局计数：结果是从 from_file_line 起向后扫出的命中窗口。
+  const [searchOpen, setSearchOpen] = useState(false);
+  /** 输入框里的文本（打字时实时变化，但**不**触发搜索）。 */
+  const [searchInput, setSearchInput] = useState("");
+  /** 已提交的查询（回车后才更新）—— 搜索、高亮、上下条导航都以它为准。 */
+  const [searchQuery, setSearchQuery] = useState("");
+  /** 每次「回车提交」自增：驱动搜索 effect，替代「按输入变化搜索」。 */
+  const [searchEpoch, setSearchEpoch] = useState(0);
+  /** 上次真正发起搜索时的开关组合，用于判断当前开关是否已偏离结果。 */
+  const [searchOptionsAtRun, setSearchOptionsAtRun] = useState({ cs: false, ww: false });
+  const [searchCaseSensitive, setSearchCaseSensitive] = useState(false);
+  const [searchWholeWord, setSearchWholeWord] = useState(false);
+  /** 已扫出的命中窗口（≤ SEARCH_HIT_CAP）。 */
+  const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
+  /** 当前命中在 searchHits 中的下标；-1 = 尚未定位。 */
+  const [searchIndex, setSearchIndex] = useState(-1);
+  /** 本次扫描是否已到范围末尾（false = 触发封顶，后面还有命中）。 */
+  const [searchComplete, setSearchComplete] = useState(true);
+  const [searchBusy, setSearchBusy] = useState(false);
+  /** 搜索范围总行数（过滤态 = 命中行数；否则 = 文件总行数）。 */
+  const [searchScopeTotal, setSearchScopeTotal] = useState(0);
+  /** 搜索无结果提示（区别于「尚未搜索」）。 */
+  const [searchEmpty, setSearchEmpty] = useState(false);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const searchReqIdRef = useRef(0);
+  /** 当前停留的命中（行号 + 行内偏移），供正文里「加重高亮」用；null = 无。 */
+  const currentHit = searchIndex >= 0 ? searchHits[searchIndex] ?? null : null;
+  /** 当前搜索匹配器（供行渲染高亮用）。用**已提交**的查询，打字途中不改高亮。 */
+  const searchMatcher = useMemo<SearchMatcher | null>(
+    () => (searchQuery ? {
+      term: searchQuery,
+      caseSensitive: searchOptionsAtRun.cs,
+      wholeWord: searchOptionsAtRun.ww,
+    } : null),
+    [searchQuery, searchOptionsAtRun]
+  );
+  /** 输入框与已提交查询不一致 => 需要按回车才生效。 */
+  const searchDirty =
+    searchInput !== searchQuery ||
+    searchCaseSensitive !== searchOptionsAtRun.cs ||
+    searchWholeWord !== searchOptionsAtRun.ww;
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [wrapLines, setWrapLines] = useState(true);
   // ---- 跳转到指定行（模态框输入） ----
@@ -930,6 +1153,19 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
   // 避免 scrollToIndex 在新内容提交前执行（该库的 reconcile 会固化
   // 首次计算的偏移，若首次基于旧视图计算，落点就错到别处）。
   const [jumpRequest, setJumpRequest] = useState<{ target: number } | null>(null);
+  // 同一帧内的多次跳转只落地最后一个目标（供搜索连跳用）。
+  // 中间目标没人看得见，却要各自付一次「重渲染 + 行高重测 + 拉块」的代价；
+  // 合并后按住回车最多按帧率推进，不会随按键重复率线性变慢。
+  const jumpCoalesceRef = useRef<number | null>(null);
+  const jumpTo = useCallback((target: number) => {
+    if (jumpCoalesceRef.current != null) {
+      window.cancelAnimationFrame(jumpCoalesceRef.current);
+    }
+    jumpCoalesceRef.current = window.requestAnimationFrame(() => {
+      jumpCoalesceRef.current = null;
+      setJumpRequest({ target });
+    });
+  }, []);
   const listRef = useRef<HTMLDivElement>(null);
   const innerRef = useRef<HTMLDivElement>(null);
   const autoRefreshRef = useRef(autoRefresh);
@@ -960,6 +1196,9 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
   // 跳转定位的用户滚动保护：程序写入时间戳与最近一次用户滚动时间戳。
   const lastProgrammaticWriteRef = useRef(0);
   const lastUserScrollRef = useRef(0);
+  // 跳转重居中的取消令牌与定时器：连跳时新跳转作废旧链，避免定时器链叠加。
+  const recenterTokenRef = useRef(0);
+  const recenterTimerRef = useRef<number | null>(null);
 
   // ---- JS 驱动的垂直滚动（接管原生滚动条） ----
   // 大文件换行模式下虚拟总高可超过 Chromium 元素高度硬上限（2^25 = 33,554,432px，
@@ -973,6 +1212,8 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
   const offsetCbRef = useRef<((offset: number, isScrolling: boolean) => void) | null>(null);
   /** thumb 位置渲染用的偏移镜像（与 virtualTopRef 同步，驱动重渲染）。 */
   const [scrollOffsetUi, setScrollOffsetUi] = useState(0);
+  /** 落点高亮的删除定时器（单例；连跳时复用，避免定时器堆积）。 */
+  const flashTimerRef = useRef<number | null>(null);
   /** 统一的偏移写入入口（实现在 virtualizer 定义之后赋值）。 */
   const applyVirtualTopRef = useRef<(next: number, source: "user" | "programmatic") => void>(() => {});
 
@@ -1446,23 +1687,30 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
 
   // 高亮指定行 1s（与追加行的淡出高亮机制一致）：
   // 跳转/置顶/置底后高亮落点行，便于快速定位。
+  /**
+   * 高亮落点行约 1s（行渲染后自动套用 .highlight，移除时经 CSS 过渡淡出）。
+   *
+   * 只保留**最近一次**高亮并复用同一个删除定时器：
+   * 搜索连跳时每次跳转都会调用它，若每次各自 add + 各起一个 1s 定时器，
+   * 按住回车会在 1 秒后集中触发几十次 Set 重建（每次 O(n) 克隆 + 一次全视图重渲染），
+   * 形成明显的帧尖峰。视觉上同一时刻也只需要一个落点高亮。
+   */
   const flashLine = useCallback((offset: number | null | undefined) => {
     if (offset == null) {
       return;
     }
-    setHighlightOffsets((prev) => {
-      const next = new Set(prev);
-      next.add(offset);
-      return next;
-    });
-    window.setTimeout(() => {
-      setHighlightOffsets((prev) => {
-        const next = new Set(prev);
-        next.delete(offset);
-        return next;
-      });
+    if (flashTimerRef.current != null) {
+      window.clearTimeout(flashTimerRef.current);
+    }
+    setHighlightOffsets(new Set([offset]));
+    flashTimerRef.current = window.setTimeout(() => {
+      flashTimerRef.current = null;
+      setHighlightOffsets((prev) => (prev.size === 0 ? prev : new Set()));
     }, 1000);
   }, []);
+
+  // 未过滤（稀疏）模式下跳转后拉块的防抖定时器：连续连跳期间不逐次拉块，等停下来再拉。
+  const jumpBlockFetchRef = useRef<number | null>(null);
 
   // 跳转定位：在 lines 替换**提交之后**执行（effect 时机保证新视图已在 DOM）。
   // scrollToIndex 的 reconcile 只追「首次计算」的固定偏移，不会按 index 重算；
@@ -1470,6 +1718,13 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
   // 每次按当前实测位置重算居中偏移，偏差 >2px 则重写，居中即停（最多 6 次）。
   // 用户滚动保护：程序写入后 120ms 内的 scroll 事件视为回读；其余视为用户
   // 滚动，之后 500ms 内不再干预。
+  //
+  // 性能要点（按住回车连续跳转时会暴露）：
+  //   1) 写入偏移（applyVirtualTopRef）会经 setScrollOffsetUi 触发一次整视图重渲染，
+  //      所以这条重试链**必须可取消**，否则每次跳转都留下自己的定时器链，
+  //      几十次连跳会让「重渲染 + 行高重测」互相叠加，表现为明显卡顿。
+  //   2) 同一帧内的多次连跳只落地最后一个目标（中间目标没人看得见，却要付全程代价）。
+  //   3) 稀疏模式下目标块的拉取也一起防抖，避免连跳时反复抢占 4 个并发位。
   useEffect(() => {
     if (!jumpRequest) {
       return;
@@ -1477,7 +1732,12 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
     const { target } = jumpRequest;
     const listCount = filterActiveRef.current ? lines.length : (totalLines ?? 0);
     if (target >= 0 && target < listCount) {
+      const token = ++recenterTokenRef.current;
+      const stillCurrent = () => recenterTokenRef.current === token;
       const attemptRecenter = (left: number) => {
+        if (!stillCurrent()) {
+          return; // 已被更新的跳转作废
+        }
         if (left <= 0) {
           return;
         }
@@ -1491,22 +1751,61 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
         }
         lastProgrammaticWriteRef.current = Date.now();
         virtualizer.scrollToIndex(target, { align: "center" });
-        window.setTimeout(() => attemptRecenter(left - 1), 250);
+        recenterTimerRef.current = window.setTimeout(() => attemptRecenter(left - 1), 250);
       };
       lastProgrammaticWriteRef.current = Date.now();
       virtualizer.scrollToIndex(target, { align: "center" });
-      if (!filterActiveRef.current) {
-        ensureVisibleBlocks(); // 稀疏：目标块未加载时立即拉取
-      }
-      window.setTimeout(() => attemptRecenter(6), 250);
+      recenterTimerRef.current = window.setTimeout(() => attemptRecenter(6), 250);
       // 高亮落点行 1s（行渲染后自动套用 .highlight，移除时经 CSS 过渡淡出）。
       const targetLine = filterActiveRef.current
         ? lines[target]
         : segLineAt(segmentsRef.current, target);
       flashLine(targetLine?.file_offset);
+      // 稀疏：目标所在块优先拉（命中要看得见，不能等防抖），
+      // 视口范围的补块与淘汰扫描则防抖到停止连跳之后，避免反复抢并发位。
+      if (!filterActiveRef.current) {
+        const targetBlock = Math.floor(target / SPARSE_BLOCK_LINES);
+        if (
+          !inflightRef.current.has(targetBlock) &&
+          !blockComplete(segmentsRef.current, targetBlock, totalLines ?? 0)
+        ) {
+          void fetchBlock(targetBlock);
+        }
+        if (jumpBlockFetchRef.current != null) {
+          window.clearTimeout(jumpBlockFetchRef.current);
+        }
+        jumpBlockFetchRef.current = window.setTimeout(() => {
+          jumpBlockFetchRef.current = null;
+          ensureVisibleBlocks();
+        }, 150);
+      }
     }
     setJumpRequest(null);
+    // 清理：新跳转到来时作废旧链、取消在途定时器（防抖的拉块除外，它按 120ms 自行收敛）。
+    return () => {
+      recenterTokenRef.current += 1;
+      if (recenterTimerRef.current != null) {
+        window.clearTimeout(recenterTimerRef.current);
+        recenterTimerRef.current = null;
+      }
+    };
   }, [jumpRequest, lines, virtualizer, flashLine, totalLines, ensureVisibleBlocks]);
+
+  // 卸载时清掉可能残留的定时器。
+  useEffect(() => () => {
+    if (recenterTimerRef.current != null) {
+      window.clearTimeout(recenterTimerRef.current);
+    }
+    if (jumpBlockFetchRef.current != null) {
+      window.clearTimeout(jumpBlockFetchRef.current);
+    }
+    if (flashTimerRef.current != null) {
+      window.clearTimeout(flashTimerRef.current);
+    }
+    if (jumpCoalesceRef.current != null) {
+      window.cancelAnimationFrame(jumpCoalesceRef.current);
+    }
+  }, []);
 
   // tab 从隐藏变为显示时，重新测量虚拟滚动（display:none 期间尺寸为 0）。
   useEffect(() => {
@@ -2090,6 +2389,305 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
     }
   };
 
+  // ==================== 正文内搜索 ====================
+  //
+  // 与过滤的关系（需求约定）：
+  //   - 过滤生效 => 搜索范围是**过滤后的行**（后端扫过滤结果集，scope_total = 命中行数）
+  //   - 未过滤   => 搜索范围是**整个文件**（后端从起点流式扫描，不整份载入内存）
+  // 前向搜索、不做全局计数：一次调用返回「从起点向后扫出的命中窗口」（封顶 10 万），
+  // 因此 UI 显示的是「当前位置 / 本次已扫出数」，不是全局总数。
+
+  /** 命中数显示文本：当前位置 / 已扫出数，并标注是否已扫完该范围。 */
+  const searchCountText = (): string => {
+    // 打字改了查询但还没回车：结果仍是上一次的，明确提示「尚未生效」。
+    if (searchDirty) {
+      return searchBusy ? t.searchScanning : t.searchDirtyHint;
+    }
+    if (!searchQuery) {
+      return "";
+    }
+    if (searchBusy) {
+      return t.searchScanning;
+    }
+    if (searchHits.length === 0) {
+      return searchEmpty ? t.searchNoResults : "";
+    }
+    const capped = !searchComplete || searchHits.length >= SEARCH_HIT_CAP;
+    return `${searchIndex + 1}/${searchHits.length}${capped ? "+" : ""}`;
+  };
+
+  /** 悬浮框的范围提示：说明这次搜索作用于哪一层（过滤后 / 整个文件）。 */
+  const searchScopeText = (): string => {
+    if (!searchScopeTotal) {
+      return "";
+    }
+    return filterActive
+      ? t.searchScopeFiltered(searchScopeTotal)
+      : t.searchScopeFile(searchScopeTotal);
+  };
+
+  /**
+   * 由命中行号算出虚拟列表的显示 index。
+   * 过滤态下 lines 是稠密的「过滤后命中行」，其 file_line 并不等于下标，
+   * 需要查表；非过滤态下显示 index 就是 file_line - 1（滚动条映射全文件）。
+   */
+  const displayIndexOfHit = useCallback(
+    (hit: SearchHit): number => {
+      if (!filterActiveRef.current) {
+        return Math.max(0, hit.file_line - 1);
+      }
+      const at = lines.findIndex((l) => l.file_line === hit.file_line);
+      return at;
+    },
+    [lines]
+  );
+
+  /** 滚动到指定命中并闪光标记；同时把它设为「当前命中」以加重高亮。 */
+  const goToHit = useCallback(
+    (hit: SearchHit, index: number) => {
+      setSearchIndex(index);
+      const target = displayIndexOfHit(hit);
+      if (target < 0) {
+        return; // 目标不在当前视图（过滤条件刚变过），等下一次扫描
+      }
+      setFollowTail(false);
+      // 走合并入口：按住回车连跳时，同一帧内只有最后一个目标会真正落地。
+      jumpTo(target);
+    },
+    [displayIndexOfHit, jumpTo]
+  );
+
+  /**
+   * 前向搜索：从 `fromLine`（1-based，含）向后扫，结果替换命中窗口。
+   * 注意不做防抖：回车/切换开关是离散操作；输入框实时触发由调用方决定何时调用。
+   */
+  const runSearch = useCallback(
+    async (fromLine: number, opts?: { keepIndex?: number }) => {
+      const query = searchQuery;
+      if (!query) {
+        setSearchHits([]);
+        setSearchIndex(-1);
+        setSearchEmpty(false);
+        setSearchComplete(true);
+        setSearchScopeTotal(filterActiveRef.current ? lines.length : (totalLines ?? 0));
+        return;
+      }
+      const reqId = ++searchReqIdRef.current;
+      setSearchBusy(true);
+      try {
+        const page = await invoke<SearchPage>("search_lines", {
+          tabId,
+          query,
+          kind: searchWholeWord ? "wholeword" : "substring",
+          caseSensitive: searchCaseSensitive,
+          fromFileLine: fromLine,
+        });
+        if (reqId !== searchReqIdRef.current) {
+          return; // 有更新的搜索请求，丢弃这次结果
+        }
+        setSearchHits(page.hits);
+        setSearchComplete(page.complete);
+        setSearchScopeTotal(page.scope_total);
+        setSearchEmpty(page.hits.length === 0);
+        if (page.hits.length === 0) {
+          setSearchIndex(-1);
+          return;
+        }
+        // 命中窗口刷新后，当前下标回到第一处（keepIndex 用于保留既有位置）。
+        const idx = opts?.keepIndex != null && opts.keepIndex < page.hits.length ? opts.keepIndex : 0;
+        setSearchIndex(idx);
+        goToHit(page.hits[idx], idx);
+      } catch {
+        if (reqId === searchReqIdRef.current) {
+          setSearchHits([]);
+          setSearchIndex(-1);
+          setSearchEmpty(true);
+          setSearchComplete(true);
+        }
+      } finally {
+        if (reqId === searchReqIdRef.current) {
+          setSearchBusy(false);
+        }
+      }
+    },
+    [tabId, searchQuery, searchCaseSensitive, searchWholeWord, lines.length, totalLines, goToHit]
+  );
+
+  /** 当前视口顶部对应的文件行号（1-based）——用户点「下一个」时的前向起点。 */
+  const viewportFirstFileLine = useCallback((): number => {
+    const items = virtualizer.getVirtualItems();
+    const first = items.length > 0 ? items[0].index : 0;
+    if (filterActiveRef.current) {
+      return lines[first]?.file_line ?? 1;
+    }
+    return first + 1;
+  }, [virtualizer, lines]);
+
+  /** 回车 / 点「下一个」：在当前命中窗口内前进；到窗口末尾且未扫完就续扫下一段。 */
+  const searchNext = useCallback(async () => {
+    if (!searchQuery) {
+      return;
+    }
+    if (searchIndex + 1 < searchHits.length) {
+      goToHit(searchHits[searchIndex + 1], searchIndex + 1);
+      return;
+    }
+    // 窗口已到末尾：已扫完 => 回绕到第一个；未扫完（封顶）=> 从最后一条之后续扫。
+    if (searchComplete) {
+      if (searchHits.length > 0) {
+        goToHit(searchHits[0], 0);
+      }
+      return;
+    }
+    const last = searchHits[searchHits.length - 1];
+    if (last) {
+      await runSearch(last.file_line + 1);
+    }
+  }, [searchQuery, searchIndex, searchHits, searchComplete, goToHit, runSearch]);
+
+  /** Shift+回车 / 点「上一个」：窗口内后退；到窗口开头就回绕到末尾。 */
+  const searchPrev = useCallback(() => {
+    if (!searchQuery || searchHits.length === 0) {
+      return;
+    }
+    const next = searchIndex - 1;
+    if (next >= 0) {
+      goToHit(searchHits[next], next);
+    } else {
+      const lastIdx = searchHits.length - 1;
+      goToHit(searchHits[lastIdx], lastIdx);
+    }
+  }, [searchQuery, searchHits, searchIndex, goToHit]);
+
+  /** 打开搜索框（Ctrl+F / 工具栏按钮）：聚焦并全选已有查询。 */
+  const openSearch = useCallback(() => {
+    setSearchOpen(true);
+    window.setTimeout(() => searchInputRef.current?.select(), 0);
+  }, []);
+
+  /** 关闭搜索框：清空查询与命中，正文恢复无搜索高亮。 */
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearchInput("");
+    setSearchQuery("");
+    setSearchHits([]);
+    setSearchIndex(-1);
+    setSearchEmpty(false);
+    setSearchComplete(true);
+  }, []);
+
+  /** 回车提交并搜索；Shift+回车在已提交的命中之间后退。 */
+  const onSearchKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      if (e.shiftKey) {
+        // 后退不重新扫描：直接用上一次的命中窗口（没有则先跑一次）。
+        if (searchQuery) {
+          searchPrev();
+        } else {
+          runSearchAt(searchInput, searchCaseSensitive, searchWholeWord);
+        }
+      } else {
+        runSearchAt(searchInput, searchCaseSensitive, searchWholeWord);
+      }
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      closeSearch();
+    }
+  };
+
+  /**
+   * 一次搜索的扫描起点。
+   * 过滤态下命中集通常不大，从文件头扫才能让「上一条/下一条」在两个方向上都有内容；
+   * 未过滤态面对整个文件，从当前视口往后扫，符合「从眼下位置往后找」的直觉。
+   */
+  const searchStartLine = useCallback((): number => {
+    return filterActiveRef.current ? 1 : viewportFirstFileLine();
+  }, [viewportFirstFileLine]);
+
+  /**
+   * 提交并搜索：把输入框内容与当前开关「提交」为生效查询。
+   *
+   * 搜索**只在回车（或点「下一个/上一个」、切换开关）时触发**，输入框打字不搜 ——
+   * 大文件上每次击键都全文件扫描代价太高，且打字途中反复跳转会打乱视线。
+   * 因此输入框文本与生效查询分离：打字只改 searchInput，不影响结果与高亮。
+   * 若提交的内容与上次完全一致，则退化为「跳到下一个」，让回车既能开始搜索也能连续跳转。
+   */
+  const runSearchAt = useCallback(
+    (rawInput: string, cs: boolean, ww: boolean) => {
+      const sameAsCommitted =
+        rawInput === searchQuery && cs === searchOptionsAtRun.cs && ww === searchOptionsAtRun.ww;
+      // 逐项比较后再写：字面量对象每次都是新引用，直接 set 会让 React 认为「变了」，
+      // 于是每次回车都白跑一次重渲染（并让 searchMatcher / 全部可见行的高亮重算）。
+      setSearchQuery((prev) => (prev === rawInput ? prev : rawInput));
+      setSearchOptionsAtRun((prev) =>
+        prev.cs === cs && prev.ww === ww ? prev : { cs, ww }
+      );
+      if (!rawInput) {
+        // 输入被清空：直接清结果，不必再往后端问一趟。
+        setSearchHits([]);
+        setSearchIndex(-1);
+        setSearchEmpty(false);
+        setSearchComplete(true);
+        return;
+      }
+      if (sameAsCommitted) {
+        void searchNext();
+        return;
+      }
+      setSearchEpoch((n) => n + 1); // 真正的新查询：交给 effect 发起扫描
+    },
+    [searchQuery, searchOptionsAtRun, searchNext]
+  );
+
+  /**
+   * 回车提交后执行搜索（由 searchEpoch 驱动）。
+   * 用 epoch 而不是监听 searchQuery：这样「过滤状态变化触发的重扫」可以走自己的路径，
+   * 不会因为查询文本没变而漏掉或重复跑。
+   */
+  const searchEpochRef = useRef(0);
+  useEffect(() => {
+    if (searchEpoch === searchEpochRef.current) {
+      return; // 不是一次新的提交
+    }
+    searchEpochRef.current = searchEpoch;
+    if (!searchOpen || !searchQuery) {
+      return;
+    }
+    void runSearch(searchStartLine());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchEpoch]);
+
+  /** Ctrl+F 打开搜索框（Ctrl+F 未被其他快捷键占用）。 */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === "f" || e.key === "F")) {
+        e.preventDefault();
+        openSearch();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [openSearch]);
+
+  /**
+   * 过滤状态变化后按新范围重搜：过滤生效时范围变成「过滤后的行」，
+   * 关闭过滤时回到整个文件 —— 这就是「兼容 filter 前后」的落点。
+   * 这是「环境变了」而非「用户打字」，所以直接重扫，不需要再按回车。
+   */
+  const prevFilterActiveRef = useRef(filterActiveRef.current);
+  useEffect(() => {
+    if (prevFilterActiveRef.current === filterActive) {
+      return;
+    }
+    prevFilterActiveRef.current = filterActive;
+    if (searchQuery) {
+      // 过滤刚生效时 lines 才刚被替换，起点统一用 1（范围已限定在过滤结果内，代价可控）。
+      void runSearch(1);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filterActive]);
+
   // 置顶：文件头已加载则直接滚动（保留已加载内容），否则跳转到第 1 行。
   const gotoTop = useCallback(() => {
     setFollowTail(false);
@@ -2369,6 +2967,9 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
         <button onClick={openJumpModal} title={t.jumpTitle}>
           {t.jump}
         </button>
+        <button onClick={openSearch} title={t.searchTitle}>
+          {t.search}
+        </button>
       </div>
 
       <div className="filterbar">
@@ -2444,6 +3045,77 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
       </div>
 
       <div className="list-wrap" ref={wrapRef}>
+        {searchOpen && (
+          <div className="find-widget" role="search">
+            <input
+              ref={searchInputRef}
+              className="find-input"
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
+              onKeyDown={onSearchKeyDown}
+              placeholder={t.searchPlaceholder}
+              aria-label={t.searchTitle}
+            />
+            <button
+              className={`find-toggle${searchCaseSensitive ? " on" : ""}`}
+              onClick={() => setSearchCaseSensitive((v) => !v)}
+              title={t.searchCaseTitle}
+              aria-pressed={searchCaseSensitive}
+            >
+              Aa
+            </button>
+            <button
+              className={`find-toggle${searchWholeWord ? " on" : ""}`}
+              onClick={() => setSearchWholeWord((v) => !v)}
+              title={t.searchWholeWordTitle}
+              aria-pressed={searchWholeWord}
+            >
+              ab|
+            </button>
+            <button
+              className={`find-go${searchDirty ? " dirty" : ""}`}
+              onClick={() => runSearchAt(searchInput, searchCaseSensitive, searchWholeWord)}
+              title={t.searchGoTitle}
+            >
+              {t.searchGo}
+            </button>
+            <span className="find-range" title={
+              (filterActive ? t.searchFilteredScope : t.searchFileScope)
+              + (searchComplete ? "" : " · " + t.searchCappedHint)
+            }>
+              {searchScopeText()}
+            </span>
+            <span className="find-count">
+              {searchCountText()}
+            </span>
+            <button
+              className="find-nav"
+              onClick={() => searchPrev()}
+              disabled={searchHits.length === 0}
+              title={t.searchPrevTitle}
+              aria-label={t.searchPrevTitle}
+            >
+              ↑
+            </button>
+            <button
+              className="find-nav"
+              onClick={() => void searchNext()}
+              disabled={searchHits.length === 0}
+              title={t.searchNextTitle}
+              aria-label={t.searchNextTitle}
+            >
+              ↓
+            </button>
+            <button
+              className="find-close"
+              onClick={closeSearch}
+              title={t.searchCloseTitle}
+              aria-label={t.searchCloseTitle}
+            >
+              ✕
+            </button>
+          </div>
+        )}
         <div className={`list ${wrapLines ? "wrap" : "nowrap"}`} ref={listRef}>
           <div
             className="list-inner"
@@ -2487,9 +3159,14 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
             // 用截断后的显示文本渲染（与估算一致）；复制按钮仍复制完整原文。
             const displayText = displayTextOf(line.text, lang);
             const truncated = displayText !== line.text;
-            const textParts = highlightMatcher
-              ? splitByMatcher(displayText, highlightMatcher)
-              : [displayText];
+            // 当前命中的加重标记只作用于它所在的那一行（其余命中由搜索匹配器统一标黄）。
+            const curOffset =
+              currentHit && currentHit.file_line === line.file_line ? currentHit.offset : null;
+            const textParts = searchMatcher
+              ? splitWithSearchAndKeywords(displayText, searchMatcher, curOffset, highlightMatcher)
+              : highlightMatcher
+                ? splitByMatcher(displayText, highlightMatcher)
+                : [displayText];
             return (
               <div
                 key={vi.key}
@@ -2525,6 +3202,13 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
                   {textParts.map((part, i) =>
                     typeof part === "string" ? (
                       <span key={i}>{part}</span>
+                    ) : "find" in part ? (
+                      <mark
+                        key={i}
+                        className={`find-mark${part.isCurrent ? " current" : ""}`}
+                      >
+                        {part.find}
+                      </mark>
                     ) : (
                       <mark key={i} className={`kw-mark kw-c${part.colorIndex % 8}`}>{part.kw}</mark>
                     )

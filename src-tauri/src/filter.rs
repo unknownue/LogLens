@@ -57,6 +57,15 @@ impl Filter {
         Self { ac, re }
     }
 
+    /// 当前是否**真的**在过滤（关键词与正则两侧都为空 = 不过滤，视图即全量）。
+    ///
+    /// 正文内搜索据此决定范围：生效 → 只搜「过滤后的行」（用户看得见的那些行）；
+    /// 未生效 → 从磁盘流式搜整个文件。注意与「过滤条件为空」区分：正则编译失败
+    /// （超长/非法）时两侧均为 None，视图本来就是全量，搜索也应按整文件处理。
+    pub fn is_active(&self) -> bool {
+        self.ac.is_some() || self.re.is_some()
+    }
+
     /// 判断一行文本是否命中过滤条件（空条件 = 全命中）。
     ///
     /// 两种模式互斥时，这里等价于「用当前模式匹配」：另一侧为 None，不参与判断。
@@ -143,6 +152,48 @@ mod tests {
         // 超长正则被拒绝 => 空过滤，全命中（不崩溃）。
         let f = Filter::new(spec);
         assert!(f.matches("any"));
+    }
+
+    /// 正文搜索靠 `is_active()` 决定范围（过滤后的行 vs 整个文件）。
+    /// 编译失败的正则会被静默丢弃，此时视图本身就是全量，
+    /// 因此必须报告「未过滤」，否则搜索会把整文件的内容当成过滤结果来搜。
+    #[test]
+    fn is_active_is_false_when_regex_fails_to_compile() {
+        // 正常编译的正则 => 真的在过滤。
+        let ok = Filter::new(FilterSpec {
+            keywords: vec![],
+            regex: Some(r"uid=\d+".to_string()),
+            case_sensitive: false,
+        });
+        assert!(ok.is_active());
+
+        // 关键词同样算「在过滤」。
+        let kw = Filter::new(FilterSpec {
+            keywords: vec!["error".to_string()],
+            regex: None,
+            case_sensitive: false,
+        });
+        assert!(kw.is_active());
+
+        // 非法正则被丢弃 => 空过滤 => 未过滤（视图全量）。
+        let bad = Filter::new(FilterSpec {
+            keywords: vec![],
+            regex: Some("(".to_string()),
+            case_sensitive: false,
+        });
+        assert!(bad.matches("anything"), "空过滤应全命中");
+        assert!(!bad.is_active(), "正则编译失败后不应报告为「在过滤」");
+
+        // 超长正则会同上被丢弃。
+        let huge = Filter::new(FilterSpec {
+            keywords: vec![],
+            regex: Some("a".repeat(600)),
+            case_sensitive: false,
+        });
+        assert!(!huge.is_active());
+
+        // 空条件 => 未过滤。
+        assert!(!Filter::new(FilterSpec::default()).is_active());
     }
 
     #[test]

@@ -757,6 +757,158 @@ body,
   -webkit-user-select: none !important;
 }
 
+/* ---- 正文内搜索悬浮框（VSCode 风格，固定在正文右上角） ---- */
+.find-widget {
+  position: absolute;
+  top: 8px;
+  right: 18px; /* 右侧留出滚动条宽度 */
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 6px;
+  background: var(--bg-bar);
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.35);
+}
+
+.find-widget .find-input {
+  width: 200px;
+  padding: 3px 6px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border-light);
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.find-widget .find-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* Aa / ab| 开关：与过滤栏的 case-btn 观感一致，选中时用 accent 反白。 */
+.find-widget .find-toggle {
+  min-width: 26px;
+  height: 22px;
+  padding: 0 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--border-light);
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+  font-family: inherit;
+}
+
+.find-widget .find-toggle:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+
+.find-widget .find-toggle.on {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+/* 「查找」按钮：回车提交的等价入口。有未提交的改动时高亮，提示需要按一下。 */
+.find-widget .find-go {
+  height: 22px;
+  padding: 0 8px;
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--border-light);
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+  font-family: inherit;
+  white-space: nowrap;
+}
+
+.find-widget .find-go:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+
+.find-widget .find-go.dirty {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.find-widget .find-range {
+  font-size: 11px;
+  color: var(--text-faint);
+  white-space: nowrap;
+  padding: 0 2px;
+}
+
+.find-widget .find-count {
+  min-width: 44px;
+  padding: 0 4px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.find-widget .find-nav,
+.find-widget .find-close {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: var(--text-dim);
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.find-widget .find-nav:hover:not(:disabled),
+.find-widget .find-close:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+
+.find-widget .find-nav:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* 搜索命中：与关键词高亮（8 色调色板）**刻意不用同一套视觉语言**。
+   关键词调色板已铺满整个色相环（金/橙/红/绿/蓝/紫/青/粉），单靠换个颜色必然
+   会与某个关键词撞色 —— 例如常见的「VSCode 橙」与 kw-c1 橙的 ΔE 仅 12.6。
+   因此搜索改用「反色实心块 + 发光环」：
+     - 普通命中 = 靛蓝实心块（与最近的关键词色 ΔE 34.5，白字对比度 7.04:1）
+     - 当前命中 = 深品红实心块 + 亮环发光（ΔE 27.4，白字 5.87:1，另加外环）
+   两主题共用这一套固定色：块色与页面底色在深浅两主题下的对比度均 ≥2.3:1。
+   数值由 tools/check-highlight-contrast.mjs 用 CIELAB ΔE*ab + WCAG 对比度校验。 */
+.row .text .find-mark {
+  background: #4b3fd6;
+  color: #ffffff;
+  border-radius: 2px;
+  padding: 0 1px; /* 与 .kw-mark 一致，避免两种高亮互相嵌套时字距跳动 */
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.22);
+}
+
+.row .text .find-mark.current {
+  background: #c2185b;
+  color: #ffffff;
+  /* 亮环发光：即使与红色系关键词同处一行，也能一眼分出「就是这一处」 */
+  box-shadow: 0 0 0 1px #ffffff, 0 0 6px 1px rgba(255, 255, 255, 0.75);
+}
+
 .list {
   flex: 1;
   min-width: 0;

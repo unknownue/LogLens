@@ -11,6 +11,7 @@ Designed for large log files: follow them in real time and browse anywhere witho
 - **Sparse virtual scrolling** — the scrollbar maps the whole file; unloaded regions render as placeholders and load on demand, bidirectionally, with distance-prioritized prefetch.
 - **Line index** — a sampled (every 64 lines) byte-offset index makes line lookups and line counts O(sample gap) instead of a full file scan.
 - **Session restore** — reopens the tabs from the previous run; missing files show a warning instead of crashing.
+- **Find in content** — a VSCode-style floating find widget in the top-right corner of the content; also `Ctrl+F` or the toolbar button right of *Jump*. Search runs **on Enter**, not while typing: the box keeps your text and the widget flags unsent changes until you commit, so keystrokes never trigger whole-file scans. Pure **forward** search with no global count: it scans on from your position and reports *current / found-so-far* (a `+` means the 100k display cap was hit and Enter keeps scanning). Match-case and whole-word toggles; `Enter` commits / advances, `Shift+Enter` steps back. All matches are highlighted and the current one is emphasized, using a deliberately different visual language from keyword highlighting (inverted solid blocks + a glow ring, vs. the keyword palette's flat fills) so the two never collapse into the same colour. **Its scope follows the filter**: with a filter active it searches the filtered lines, otherwise the whole file, streamed from disk and never fully loaded.
 - **Extras** — multi-tab, jump-to-line, keyword highlighting, copy-view, recent-files dropdown (last 10 opens, keeps missing files), bilingual UI (中文 / English), custom title bar (borderless window: the tab row is the title bar with custom min/max/close buttons; Aero Snap, double-click-to-maximize and Win11 rounded corners retained).
 - **Config-table viewer** — every file opens as a log by default; the top-right icon button (grid ⇄ lines) switches the *active* tab to a GM10 `client_cfg` config-table view (MemoryPack), parsed with the schema in `cfg_table_slots.json` (auto-located from the file path, or picked manually). Each tab's mode is independent; the table is virtualized with a sticky header and copy-view exports TSV. Format spec: [docs/client_cfg_bin_format.md](docs/client_cfg_bin_format.md).
 
@@ -50,6 +51,7 @@ Installer output: `src-tauri/target/release/bundle/nsis/LogLens_<version>_x64-se
 | Incremental reads | byte-offset tailing with boundary / truncation / rotation handling | `src-tauri/src/tail.rs` |
 | Line index | sampled offsets, seeded on open, warmed to EOF in the background | `src-tauri/src/index.rs` |
 | Filtering | Aho-Corasick multi-keyword / regex, two mutually exclusive modes | `src-tauri/src/filter.rs` |
+| Find in content | forward scan, filtered-aware scope, 100k hit cap, case / whole-word | `src-tauri/src/search.rs` |
 | State & events | per-tab sessions, `notify` watcher, batched events | `src-tauri/src/state.rs` |
 | Rendering | sparse virtual list, placeholder rows, idle scroll anchoring, line-based wheel | `src/App.tsx` |
 

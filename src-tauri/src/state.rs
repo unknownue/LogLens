@@ -17,6 +17,7 @@ use tracing::{info_span, instrument};
 use crate::filter::{Filter, FilterSpec};
 use crate::index::{LineIndex, SharedIndex, SCAN_CHUNK_BYTES};
 use crate::perf;
+use crate::search::{self, MatchKind, SearchHit, SearchPage};
 use crate::tail::{LogLine, TailEvent, TailReader};
 
 /// 传给前端的一批行事件负载（带 tab_id 用于前端路由到对应 tab）。
@@ -280,6 +281,88 @@ impl TabSession {
             items.push(LogLine::new(off, file_line, text));
         }
         Ok(items)
+    }
+
+    /// 正文内搜索：纯前向、不做全局计数（产品决策），一次调用返回一段命中窗口。
+    ///
+    /// - **范围随过滤状态切换**：过滤生效时搜「过滤后的行」（用户看得见的那些行）；
+    ///   未生效时从 `from_file_line` 对应的字节偏移起**流式**扫描整个文件
+    ///   （分块读取，不把文件读进内存）。
+    /// - `from_file_line` 为 1-based 且**含**该行；起点超出文件末尾 → 空页（不报错）。
+    /// - 空/全空白查询 → 空页（`complete: true`），不报错。
+    /// - 命中封顶 [`search::SEARCH_HIT_CAP`]：越限时 `complete = false`（后面可能还有）。
+    ///
+    /// 锁：只在「定位起始行」时短暂持有行索引锁（与 [`Self::get_range`] 一致），
+    /// 随后的整文件扫描只用独立文件句柄，不长时间挡住 tail / 后台索引线程。
+    #[instrument(skip(self), fields(from_file_line, query_len = query.chars().count()))]
+    pub fn search_forward(
+        &self,
+        query: &str,
+        kind: MatchKind,
+        case_sensitive: bool,
+        from_file_line: u64,
+    ) -> Result<SearchPage, String> {
+        let from = from_file_line.max(1);
+        let filter_active = self.filter.lock().is_active();
+
+        // 空/全空白查询：空页（不回落到「命中所有行」，也不报错）。
+        if query.trim().is_empty() {
+            let scope_total = if filter_active {
+                self.current_view().len() as u64
+            } else {
+                self.ensure_total_lines().unwrap_or(0)
+            };
+            return Ok(SearchPage::empty(scope_total));
+        }
+
+        // 过滤态：范围就是「过滤后的行」——前端当前渲染的那些行。
+        // 先取出视图再扫描（扫描期间不持锁），避免长时间阻塞 tail 线程的追加。
+        if filter_active {
+            let view = self.current_view();
+            let scope_total = view.len() as u64;
+            let ac = search::build_matcher(query, case_sensitive)?;
+            let mut hits: Vec<SearchHit> = Vec::new();
+            let mut capped = false;
+            for line in &view {
+                if line.file_line < from {
+                    continue;
+                }
+                if search::collect_line_hits(&ac, kind, &line.text, line.file_line, &mut hits) {
+                    capped = true;
+                    break;
+                }
+            }
+            return Ok(SearchPage {
+                hits,
+                complete: !capped,
+                scope_total,
+            });
+        }
+
+        // 未过滤态：整文件流式扫描（不依赖已加载窗口，也不整文件入内存）。
+        let path = self
+            .file_path
+            .lock()
+            .clone()
+            .ok_or_else(|| "tab 未打开文件".to_string())?;
+        let total = self.ensure_total_lines()?;
+        // 起始行 → 字节偏移：短锁内定位（行索引内部按需补扫），随后释放锁再扫描。
+        let start_off = {
+            let shared = self.idx();
+            let mut idx = shared.lock();
+            idx.locate_line(&path, from)
+                .map_err(|e| format!("定位行失败: {e}"))?
+        };
+        let Some(start_off) = start_off else {
+            return Ok(SearchPage::empty(total)); // 起点已超出文件末尾
+        };
+        let ac = search::build_matcher(query, case_sensitive)?;
+        let (hits, complete) = search::scan_file_from(&path, start_off, from, &ac, kind)?;
+        Ok(SearchPage {
+            hits,
+            complete,
+            scope_total: total,
+        })
     }
 
     /// 失效总行数缓存（文件截断/轮转/重新打开时调用）。
