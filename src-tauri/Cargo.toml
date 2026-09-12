@@ -1,6 +1,6 @@
 [package]
 name = "loglens"
-version = "0.2.0"
+version = "0.3.0"
 description = "LogLens — 大日志实时查看器（tail-follow + 过滤 + 稀疏虚拟滚动）"
 authors = ["you"]
 edition = "2021"

@@ -7,6 +7,7 @@ pub mod perf;
 mod search;
 mod state;
 mod tail;
+mod window_state;
 
 use std::sync::Arc;
 
@@ -259,8 +260,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(AppState::new()))
-        .setup(|_app| {
+        .setup(|app| {
             perf::mark("webview:ready");
+            // 沿用上次的窗口尺寸（在窗口首次显示前应用，避免可见的尺寸跳变），
+            // 并挂上 resize 监听用于持久化。
+            window_state::install(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
