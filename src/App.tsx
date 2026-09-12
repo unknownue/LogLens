@@ -1025,7 +1025,7 @@ function splitWithSearchAndKeywords(
 }
 
 /** 单个日志 tab：独立的状态（行、过滤、滚动、高亮）与事件监听。 */
-function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, registerCopy, reportTotal }: {
+function LogTab({ tabId, path, openError, active, fontSize, lang, viewMode, onSwitchViewMode, onClose, registerCopy, reportTotal }: {
   tabId: string;
   path: string;
   /** 打开失败信息（恢复会话时文件已不存在等）；有值时工具栏显示警告。 */
@@ -1033,6 +1033,10 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
   active: boolean;
   fontSize: number;
   lang: Lang;
+  /** 当前视图模式；工具栏最左侧的图标按钮据此显示「切换到哪种视图」。 */
+  viewMode: "text" | "cfg";
+  /** 打开视图模式选择框（切换动作本身在 App 侧完成）。 */
+  onSwitchViewMode: () => void;
   onClose: () => void;
   /** 注册「复制当前视图」函数：激活时注册、失活/卸载时注销（App 右上角按钮用）。 */
   registerCopy: (tabId: string, fn: (() => Promise<string>) | null) => void;
@@ -2938,6 +2942,25 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, onClose, regis
   return (
     <div className="tab-content">
       <div className="toolbar">
+        <button
+          className={`icon-btn toolbar-icon view-toggle${viewMode === "cfg" ? " on" : ""}`}
+          onClick={onSwitchViewMode}
+          aria-pressed={viewMode === "cfg"}
+          title={t.viewModeButtonTitle}
+        >
+          {viewMode === "cfg" ? (
+            /* 当前是表格视图：图标表示「切回文本」，多行文字 */
+            <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
+              <path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h6" stroke="currentColor" strokeWidth="1.55" />
+            </svg>
+          ) : (
+            /* 当前是文本视图：图标表示「切到表格」，网格 */
+            <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
+              <rect x="1.9" y="2.9" width="12.2" height="10.2" rx="1" stroke="currentColor" strokeWidth="1.45" />
+              <path d="M1.9 6.3h12.2M1.9 9.7h12.2M6.1 2.9v10.2M9.9 2.9v10.2" stroke="currentColor" strokeWidth="1.45" />
+            </svg>
+          )}
+        </button>
         <span className={`tab-path${openError ? " open-error" : ""}`} title={openError ?? path}>
           {openError ? <span className="path-warn">⚠ </span> : null}
           {path || t.pathPlaceholder}
@@ -4321,9 +4344,8 @@ export default function App() {
     return () => document.removeEventListener("keydown", onKey);
   }, [tabDrag, finishTabDrag]);
 
-  /** 当前激活 tab 及其视图模式（右上角「表格/文本」切换图标用）。 */
+  /** 当前激活 tab（用于标题栏同步 / 视图模式选择框的目标）。 */
   const activeTab = tabs.find((t) => t.id === activeTabId);
-  const activeIsCfg = activeTab?.viewMode === "cfg";
 
   // 原生标题条已与首行融合（Overlay）：把窗口标题同步为当前激活 tab 的文件名，
   // 任务栏 / Alt+Tab 上能直接看到正在看哪个日志；无 tab 时回落为应用名。
@@ -4425,29 +4447,6 @@ export default function App() {
             disabled={fontSize >= 20}
           >
             A+
-          </button>
-          <button
-            className={`icon-btn cfg-toggle${activeIsCfg ? " on" : ""}`}
-            onClick={() => {
-              setSchemaError(false);
-              setViewModeOpen(true);
-            }}
-            disabled={!activeTab}
-            aria-pressed={activeIsCfg}
-            title={appT.viewModeButtonTitle}
-          >
-            {activeIsCfg ? (
-              /* 文本视图图标：多行文字 */
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
-                <path d="M3 4h10M3 8h10M3 12h6" stroke="currentColor" strokeWidth="1.3" />
-              </svg>
-            ) : (
-              /* 表格视图图标：网格 */
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
-                <rect x="2.5" y="3.5" width="11" height="9" rx="1" stroke="currentColor" strokeWidth="1.2" />
-                <path d="M2.5 6.5h11M2.5 9.5h11M6.2 3.5v9M9.8 3.5v9" stroke="currentColor" strokeWidth="1.2" />
-              </svg>
-            )}
           </button>
           <button
             className="icon-btn copy-view"
@@ -4733,6 +4732,10 @@ export default function App() {
                   onPickSchema={() => void pickCfgSchema(t.id, t.path)}
                   registerCopy={registerCopy}
                   reportTotal={reportTotal}
+                  onSwitchViewMode={() => {
+                    setSchemaError(false);
+                    setViewModeOpen(true);
+                  }}
                 />
               ) : (
                 <LogTab
@@ -4742,6 +4745,11 @@ export default function App() {
                   active={t.id === activeTabId}
                   fontSize={fontSize}
                   lang={lang}
+                  viewMode={t.viewMode ?? "text"}
+                  onSwitchViewMode={() => {
+                    setSchemaError(false);
+                    setViewModeOpen(true);
+                  }}
                   onClose={() => closeTab(t.id)}
                   registerCopy={registerCopy}
                   reportTotal={reportTotal}

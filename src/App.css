@@ -581,6 +581,44 @@ body,
   cursor: default;
 }
 
+/* 工具栏内的图标按钮（视图切换）：位于第一行最左侧、路径文本之前。
+   尺寸按第一行的高度定：行内是 `padding: 8px` + 文字按钮（约 26px 高），
+   所以这里用 26x26 的按钮配 18px 图标，视觉重量与相邻的文字按钮相当；
+   比顶栏的 22x22 更大，因为顶栏所在行本身更矮。
+
+   间距处理：图标靠右对齐，并用负的右外边距抵消掉 `.toolbar` 的 gap 8px 中的 5px，
+   使图标右缘到路径文字只剩约 5px。
+   若用默认居中 + 零 margin，图标与路径之间会有约 14px 空档（内部 4px + gap 8px + margin 2px），
+   而图标左侧同样有 4px 内部留白 —— 整体会显得「浮」在半空中。
+   26px 的点击区域保持不变（hover 背景仍是一个完整方块），只是把它向路径方向挪一点。 */
+.icon-btn.toolbar-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  margin: 0 -5px 0 0;
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  color: var(--text-dim);
+  cursor: pointer;
+  line-height: 1;
+}
+
+.icon-btn.toolbar-icon:hover {
+  color: var(--text-bright);
+  background-color: var(--bg-hover);
+}
+
+/* 表格视图下高亮，提示「当前不在文本视图」 */
+.icon-btn.toolbar-icon.on {
+  color: var(--accent-soft);
+  background-color: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
 .toolbar .tab-path {
   flex: 1;
   min-width: 0; /* 允许收缩到省略号，避免长路径把工具栏撑出窗口 */
@@ -1739,9 +1777,4 @@ body,
 
 .cfg-key {
   color: var(--lineno);
-}
-
-/* 右上角「表格/文本」模式切换图标：表格模式激活时高亮 */
-.icon-btn.cfg-toggle.on {
-  color: var(--accent-soft);
 }
