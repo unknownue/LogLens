@@ -14,6 +14,7 @@ Designed for large log files: follow them in real time and browse anywhere witho
 - **Session restore** — reopens the previous tabs, and reuses the last window size.
 - **Extras** — multi-tab, jump-to-line, keyword highlighting, copy-view, recent files, bilingual UI (中文 / English), custom borderless title bar.
 - **Config-table viewer** — switch a tab to a GM10 `client_cfg` (MemoryPack) table view via the icon button at the left of its toolbar; columns size themselves to their content. Format spec: [docs/client_cfg_bin_format.md](docs/client_cfg_bin_format.md).
+- **Body pages** — the content area is a small page framework (text / table / file-missing / open-error). A tab whose file was deleted or moved (recent files, session restore) shows a one-line “File not found: <path>” notice instead of a blank body; reopening the same path re-checks it. Guide: [docs/body-views.md](docs/body-views.md).
 
 ## Screenshot
 
@@ -33,6 +34,8 @@ make loglens-build      # rebuild release (--no-bundle)
 make loglens-package    # build the NSIS installer
 make loglens-dev        # dev mode (Vite dev server on 5173)
 cd src-tauri && cargo test --lib   # backend tests
+node --test tools/verify-body-views.test.mjs   # body-page rules (no browser needed)
+node tools/e2e-file-missing.mjs --launch       # browser E2E (run `pnpm run dev` first)
 ```
 
 Installer output: `src-tauri/target/release/bundle/nsis/LogLens_<version>_x64-setup.exe`.
@@ -47,6 +50,7 @@ Installer output: `src-tauri/target/release/bundle/nsis/LogLens_<version>_x64-se
 | Find in content | `src-tauri/src/search.rs` |
 | State & events | `src-tauri/src/state.rs` |
 | Window size memory | `src-tauri/src/window_state.rs` |
+| Body pages (text / table / file-missing / open-error) | `src/views/` — see [docs/body-views.md](docs/body-views.md) |
 | Rendering | `src/App.tsx` |
 
 Release profile (`src-tauri/Cargo.toml`): `opt-level = 3`, fat LTO, `codegen-units = 1`, `strip = true`, `panic = "abort"`.

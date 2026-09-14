@@ -9,6 +9,20 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { CfgTableTab, type ClientCfgTable } from "./CfgTableTab";
+import { copyTextToClipboard } from "./clipboard";
+import {
+  APP_BODY_VIEWS,
+  BodyViewHost,
+  BodyViewRegistry,
+  FileMissingView,
+  OpenErrorView,
+  classifyOpenError,
+  useBodyViewEffects,
+  type AppBodyViewId,
+  type BodyViewProps,
+  type OpenErrorInfo,
+  type ViewLang,
+} from "./views";
 import "./App.css";
 
 /** 一行日志（与后端 LogLine 对应）。 */
@@ -478,23 +492,10 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** 复制文本到剪贴板（clipboard API + 旧 execCommand 兜底，WebView2 兼容）。 */
-async function copyTextToClipboard(text: string): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    const ta = document.createElement("textarea");
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand("copy");
-    document.body.removeChild(ta);
-  }
-}
-
 // ==================== 多语言（zh / en） ====================
 
-type Lang = "zh" | "en";
+/** 界面语言。与正文页面框架共用同一联合类型（`src/views/body-view.ts`），避免两处漂移。 */
+type Lang = ViewLang;
 
 /** 界面文案字典：所有 UI 字符串集中于此，便于中英文切换与维护。 */
 interface Messages {
@@ -1024,25 +1025,29 @@ function splitWithSearchAndKeywords(
   return out;
 }
 
-/** 单个日志 tab：独立的状态（行、过滤、滚动、高亮）与事件监听。 */
-function LogTab({ tabId, path, openError, active, fontSize, lang, viewMode, onSwitchViewMode, onClose, registerCopy, reportTotal }: {
-  tabId: string;
-  path: string;
-  /** 打开失败信息（恢复会话时文件已不存在等）；有值时工具栏显示警告。 */
+/** 文本日志页面的专属属性（公共属性见 `BodyViewProps`）。 */
+interface LogTabProps extends BodyViewProps {
+  /** 打开失败信息（恢复会话时文件已不存在等）。正常情况下打开失败会由状态页面
+   *  整体接管（见下方 bodyViews 注册表），这里保留 ⚠ 提示作为兜底。 */
   openError?: string;
-  active: boolean;
-  fontSize: number;
-  lang: Lang;
   /** 当前视图模式；工具栏最左侧的图标按钮据此显示「切换到哪种视图」。 */
   viewMode: "text" | "cfg";
-  /** 打开视图模式选择框（切换动作本身在 App 侧完成）。 */
-  onSwitchViewMode: () => void;
-  onClose: () => void;
-  /** 注册「复制当前视图」函数：激活时注册、失活/卸载时注销（App 右上角按钮用）。 */
-  registerCopy: (tabId: string, fn: (() => Promise<string>) | null) => void;
-  /** 上报本 tab 的文件总行数（激活时实时同步给 App 右上角显示）。 */
-  reportTotal: (tabId: string, total: number | null) => void;
-}) {
+}
+
+/** 单个日志 tab：独立的状态（行、过滤、滚动、高亮）与事件监听。 */
+function LogTab(props: LogTabProps) {
+  // registerCopy / reportTotal 由公共生命周期 hook 直接从 props 取，这里不重复解构。
+  const {
+    tabId,
+    path,
+    openError,
+    active,
+    fontSize,
+    lang,
+    viewMode,
+    onSwitchViewMode,
+    onClose,
+  } = props;
   const t = MESSAGES[lang];
   const [lines, setLines] = useState<LogLine[]>([]);
   // ---- 稀疏虚拟列表（无过滤态）状态 ----
@@ -2923,21 +2928,9 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, viewMode, onSw
     return text;
   }, [lines]);
 
-  // 激活时向 App 注册复制函数（供右上角按钮调用）。
-  useEffect(() => {
-    if (active) {
-      registerCopy(tabId, copyViewText);
-      return () => registerCopy(tabId, null);
-    }
-  }, [active, tabId, copyViewText, registerCopy]);
-
-  // 激活时把文件总行数实时同步给 App（窗口右上角显示）。
-  useEffect(() => {
-    if (active) {
-      reportTotal(tabId, totalLines);
-      return () => reportTotal(tabId, null);
-    }
-  }, [active, tabId, totalLines, reportTotal]);
+  // 激活时向 App 注册「复制当前视图」与文件总行数（失活 / 卸载时自动注销）。
+  // 公共生命周期统一走框架 hook：注销分支只写一遍，所有页面语义一致。
+  useBodyViewEffects(props, { copy: copyViewText, total: totalLines });
 
   return (
     <div className="tab-content">
@@ -3403,6 +3396,82 @@ function LogTab({ tabId, path, openError, active, fontSize, lang, viewMode, onSw
   );
 }
 
+// ==================== 正文页面注册表（多类页面框架） ====================
+//
+// 「一个 tab 的正文显示什么」只在两处定义：规则（id / 优先级 / 命中）在
+// src/views/app-body-views.ts，渲染实现在下面的 APP_BODY_VIEW_RENDERERS。
+// 新增页面 = 写一个组件 + 这两处各加一条，App 的渲染树不用改（步骤见
+// docs/body-views.md）。
+
+/** 页面命中判定与渲染所需的 App 侧上下文（当前渲染的快照，每次渲染重建）。 */
+interface AppBodyViewCtx {
+  /** 目标 tab。 */
+  tab: TabInfo;
+  /** `tab.openError` 的分类结果（`kind === "none"` = 正常）。 */
+  error: OpenErrorInfo;
+  /** 表格视图数据（表格页用；null = 尚未解析成功）。 */
+  cfg: ClientCfgTable | null;
+  /** 表格视图重新选择 schema 文件。 */
+  pickSchema: (tabId: string, path: string) => void;
+}
+
+/**
+ * 各页面的渲染实现（与 {@link APP_BODY_VIEWS} 的 id 一一对应）。
+ *
+ * 页面选择规则（优先级 + 命中）在 `src/views/app-body-views.ts` 里，是纯数据、可单测；
+ * 这里只回答「选中的页面怎么渲染」—— 页面专属属性在各自的 render 里组装。
+ */
+const APP_BODY_VIEW_RENDERERS: Record<
+  AppBodyViewId,
+  (base: BodyViewProps, ctx: AppBodyViewCtx) => React.ReactNode
+> = {
+  "file-missing": (base) => <FileMissingView {...base} />,
+  "cfg-table": (base, ctx) => (
+    <CfgTableTab
+      tabId={base.tabId}
+      path={base.path}
+      data={ctx.cfg}
+      error={ctx.tab.openError}
+      active={base.active}
+      fontSize={base.fontSize}
+      uiLang={base.lang}
+      onPickSchema={() => ctx.pickSchema(ctx.tab.id, ctx.tab.path)}
+      onSwitchViewMode={base.onSwitchViewMode}
+      registerCopy={base.registerCopy}
+      reportTotal={base.reportTotal}
+    />
+  ),
+  "open-error": (base, ctx) => (
+    <OpenErrorView {...base} kind={ctx.error.kind} error={ctx.tab.openError} />
+  ),
+  "text-log": (base, ctx) => (
+    <LogTab {...base} openError={ctx.tab.openError} viewMode={ctx.tab.viewMode ?? "text"} />
+  ),
+};
+
+/** 页面标题（aria-label / 调试用）。 */
+const APP_BODY_VIEW_TITLES: Record<AppBodyViewId, (lang: ViewLang) => string> = {
+  "file-missing": (lang) => (lang === "zh" ? "文件不存在" : "File not found"),
+  "cfg-table": (lang) => (lang === "zh" ? "配置表视图" : "Table view"),
+  "open-error": (lang) => (lang === "zh" ? "无法打开" : "Cannot open"),
+  "text-log": (lang) => (lang === "zh" ? "文本视图" : "Text view"),
+};
+
+/**
+ * 正文页面注册表：规则来自 {@link APP_BODY_VIEWS}（纯数据），渲染来自上面的实现表。
+ * 「一个 tab 的正文显示什么」只有一个事实来源，App 的渲染树不再出现视图分支。
+ */
+const bodyViews = new BodyViewRegistry<AppBodyViewCtx>(
+  APP_BODY_VIEWS.map((spec) => ({
+    id: spec.id,
+    priority: spec.priority,
+    fallback: spec.fallback,
+    title: APP_BODY_VIEW_TITLES[spec.id],
+    match: (ctx) => spec.match({ viewMode: ctx.tab.viewMode, error: ctx.error }),
+    render: (base, ctx) => APP_BODY_VIEW_RENDERERS[spec.id](base, ctx),
+  }))
+);
+
 export default function App() {
   const [tabs, setTabs] = useState<TabInfo[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
@@ -3639,9 +3708,12 @@ export default function App() {
   // ---- client_cfg 表格数据（.bin tab 的解析结果，key 为 tabId） ----
   const [cfgTables, setCfgTables] = useState<Record<string, ClientCfgTable>>({});
 
-  /** 解析一个 client_cfg bin：成功存表数据，失败标记到该 tab。schema 必须手动指定。 */
+  /**
+   * 解析一个 client_cfg bin：成功存表数据，失败标记到该 tab。schema 必须手动指定。
+   * 返回是否成功 —— 状态页的「重新检测」要据此决定给不给失败提示。
+   */
   const parseCfg = useCallback(
-    async (tabId: string, binPath: string, slotsPath: string) => {
+    async (tabId: string, binPath: string, slotsPath: string): Promise<boolean> => {
       try {
         const table = await invoke<ClientCfgTable>("parse_client_cfg_bin", {
           path: binPath,
@@ -3651,10 +3723,12 @@ export default function App() {
         setTabs((prev) =>
           prev.map((t) => (t.id === tabId ? { ...t, openError: undefined } : t))
         );
+        return true;
       } catch (e) {
         setTabs((prev) =>
           prev.map((t) => (t.id === tabId ? { ...t, openError: String(e) } : t))
         );
+        return false;
       }
     },
     []
@@ -3755,12 +3829,9 @@ export default function App() {
     setTabs(list);
     setActiveTabId(list[saved.active]?.id ?? list[list.length - 1]?.id ?? null);
     for (const t of list) {
-      // 逐个打开；文件已删除等失败情况记录到 tab，界面显示 ⚠ 提示。
-      void invoke("open_log_file", { tabId: t.id, path: t.path }).catch((e) => {
-        setTabs((prev) =>
-          prev.map((x) => (x.id === t.id ? { ...x, openError: String(e) } : x))
-        );
-      });
+      // 逐个打开；文件已被删除/移动时失败信息记到 tab，正文区显示
+      // 「文件不存在」定制页（含重新检测 / 重新定位等修复入口）。
+      void openTabFile(t.id, t.path);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -3950,33 +4021,74 @@ export default function App() {
     window.setTimeout(() => setCopyFeedback("idle"), 1200);
   }, []);
 
+  // ---- 打开 / 重新打开 tab 的文件 ----
+
+  /**
+   * 让后端按文本方式打开指定 tab 的路径（成功清除错误标记，失败记录到 tab）。
+   *
+   * 只有成功才清错误标记：先清后读会让正文区在失败时闪一次
+   * （状态页 → 日志页 → 状态页），空正文一闪而过，观感很差。
+   */
+  const openTabFile = useCallback(async (tabId: string, path: string): Promise<boolean> => {
+    try {
+      await invoke("open_log_file", { tabId, path });
+      setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, openError: undefined } : t)));
+      return true;
+    } catch (e) {
+      // 打开失败：错误记在 tab 上，正文区按分类显示对应状态页（见 bodyViews）。
+      setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, openError: String(e) } : t)));
+      return false;
+    }
+  }, []);
+
+  // ---- 失败 tab 的重新检测 ----
+  //
+  // 状态页本身只有一行说明、没有按钮，所以这里只保留一条**隐式**的恢复路径：
+  // 从历史记录 / 拖放 / 命令行再次打开同一路径时，顺手重试那个失败 tab。
+  // 没有它的话，文件恢复后 tab 会一直停在「文件不存在」，界面就说了假话。
+
+  /** 按 tab 当前的视图模式重新打开它（返回是否成功）。 */
+  const reopenTab = useCallback(
+    (tab: TabInfo): Promise<boolean> => {
+      const mode = tab.viewMode ?? "text";
+      return mode === "cfg" && tab.slotsPath
+        ? parseCfg(tab.id, tab.path, tab.slotsPath)
+        : openTabFile(tab.id, tab.path);
+    },
+    [openTabFile, parseCfg]
+  );
+
   // 打开新文件：新建一个 tab（默认文本视图；MemoryPack 表格视图由用户手动切换）。
-  // 同路径（Windows 大小写不敏感）已打开且未失败时直接激活，不重复打开。
+  // 同路径（Windows 大小写不敏感）已有 tab 时直接激活，不重复打开。
   const tabsRef = useRef<TabInfo[]>([]);
   tabsRef.current = tabs;
 
   /** 打开指定路径（对话框选中后 / 自动化钩子 / 会话恢复共用）。 */
-  const openPath = useCallback(async (selected: string) => {
-    const key = selected.toLowerCase();
-    const existing = tabsRef.current.find((t) => t.path.toLowerCase() === key && !t.openError);
-    if (existing) {
-      setActiveTabId(existing.id);
-      return;
-    }
-    const id = nextTabId();
-    const name = selected.split(/[\\/]/).pop() || selected;
-    // 记录到最近打开历史（去重、上限 10 条；不做存在性检查）。
-    setRecentPaths((prev) => pushRecentPath(prev, selected));
-    // 先建 tab，再让后端打开文件。
-    setTabs((prev) => [...prev, { id, title: name, path: selected }]);
-    setActiveTabId(id);
-    try {
-      await invoke("open_log_file", { tabId: id, path: selected });
-    } catch (e) {
-      // 打开失败：错误标记到该 tab（工具栏显示 ⚠，悬停看原因）。
-      setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, openError: String(e) } : t)));
-    }
-  }, []);
+  const openPath = useCallback(
+    async (selected: string) => {
+      const key = selected.toLowerCase();
+      const existing = tabsRef.current.find((t) => t.path.toLowerCase() === key);
+      if (existing) {
+        setActiveTabId(existing.id);
+        // 该 tab 处于失败态（打开时文件不存在）：再打开一次等价于重新检测，
+        // 文件已恢复就直接切回内容视图，否则继续显示那一行说明。
+        if (existing.openError) {
+          void reopenTab(existing);
+        }
+        return;
+      }
+      const id = nextTabId();
+      const name = selected.split(/[\\/]/).pop() || selected;
+      // 记录到最近打开历史（去重、上限 10 条；不做存在性检查，失效路径由
+      // 正文区的「文件不存在」状态页负责说明）。
+      setRecentPaths((prev) => pushRecentPath(prev, selected));
+      // 先建 tab，再让后端打开文件；失败时正文区显示对应状态页。
+      setTabs((prev) => [...prev, { id, title: name, path: selected }]);
+      setActiveTabId(id);
+      await openTabFile(id, selected);
+    },
+    [openTabFile, reopenTab]
+  );
 
   /** 切换指定 tab 的视图模式；切到表格时按该 tab 选择的 schema 解析（必须手动指定）。 */
   const switchViewMode = useCallback(
@@ -4406,6 +4518,13 @@ export default function App() {
               onPointerCancel={() => finishTabDrag(false)}
             >
               <span className="tab-title">{t.title}</span>
+              {/* 打开失败的 tab：标题后加警告标记，不必切过去就知道哪个 tab 有问题
+                  （正文区的完整解释由状态页面负责，见 bodyViews）。 */}
+              {t.openError ? (
+                <span className="tab-warn" title={t.openError} aria-label={t.openError}>
+                  ⚠
+                </span>
+              ) : null}
               <button
                 className="tab-close"
                 onClick={(e) => {
@@ -4720,41 +4839,31 @@ export default function App() {
               className="tab-panel"
               style={{ display: t.id === activeTabId ? "flex" : "none" }}
             >
-              {t.viewMode === "cfg" ? (
-                <CfgTableTab
-                  tabId={t.id}
-                  path={t.path}
-                  data={cfgTables[t.id] ?? null}
-                  error={t.openError}
-                  active={t.id === activeTabId}
-                  fontSize={fontSize}
-                  uiLang={lang}
-                  onPickSchema={() => void pickCfgSchema(t.id, t.path)}
-                  registerCopy={registerCopy}
-                  reportTotal={reportTotal}
-                  onSwitchViewMode={() => {
+              {/* 正文渲染交给页面框架：由注册表按 tab 状态选出唯一页面
+                  （文件不存在 / 打开失败 / 表格 / 文本），见 bodyViews。 */}
+              <BodyViewHost
+                registry={bodyViews}
+                ctx={{
+                  tab: t,
+                  error: classifyOpenError(t.openError),
+                  cfg: cfgTables[t.id] ?? null,
+                  pickSchema: (tabId, path) => void pickCfgSchema(tabId, path),
+                }}
+                base={{
+                  tabId: t.id,
+                  path: t.path,
+                  active: t.id === activeTabId,
+                  fontSize,
+                  lang,
+                  onSwitchViewMode: () => {
                     setSchemaError(false);
                     setViewModeOpen(true);
-                  }}
-                />
-              ) : (
-                <LogTab
-                  tabId={t.id}
-                  path={t.path}
-                  openError={t.openError}
-                  active={t.id === activeTabId}
-                  fontSize={fontSize}
-                  lang={lang}
-                  viewMode={t.viewMode ?? "text"}
-                  onSwitchViewMode={() => {
-                    setSchemaError(false);
-                    setViewModeOpen(true);
-                  }}
-                  onClose={() => closeTab(t.id)}
-                  registerCopy={registerCopy}
-                  reportTotal={reportTotal}
-                />
-              )}
+                  },
+                  onClose: () => closeTab(t.id),
+                  registerCopy,
+                  reportTotal,
+                }}
+              />
             </div>
           ))}
         </>

@@ -1,28 +1,17 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 
+import { copyTextToClipboard } from "./clipboard";
 import { computeColumnWidths } from "./cfg-columns";
 import { fmtValue } from "./cfg-types";
 import type { ClientCfgTable, CfgColumn, CfgValue } from "./cfg-types";
 import { langOfPath } from "./cfg-types";
+import { useBodyViewEffects, type BodyViewProps, type ViewLang } from "./views";
 
 // 这些类型/纯函数已拆到 cfg-types.ts / cfg-columns.ts，此处原样再导出，
 // 保持既有 import 路径（App.tsx 等）不变。
 export type { ClientCfgTable, CfgColumn, CfgValue };
 export { fmtValue, computeColumnWidths };
-
-async function copyTextToClipboard(text: string): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    const ta = document.createElement("textarea");
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand("copy");
-    document.body.removeChild(ta);
-  }
-}
 
 // ==================== 组件 ====================
 
@@ -49,36 +38,32 @@ function ViewToggleButton({ title, onClick }: { title: string; onClick: () => vo
   );
 }
 
-export function CfgTableTab({
-  tabId,
-  path,
-  data,
-  error,
-  active,
-  fontSize,
-  uiLang,
-  onPickSchema,
-  onSwitchViewMode,
-  registerCopy,
-  reportTotal,
-}: {
-  tabId: string;
-  path: string;
+/** 表格视图的专属属性（`lang` 在本页叫 `uiLang`：与配置数据语言区分）。 */
+export interface CfgTableTabProps
+  extends Pick<
+    BodyViewProps,
+    | "tabId"
+    | "path"
+    | "active"
+    | "fontSize"
+    | "onSwitchViewMode"
+    | "registerCopy"
+    | "reportTotal"
+  > {
+  /** 界面语言（App 全局设置，与配置数据语言无关）。 */
+  uiLang: ViewLang;
   /** 解析成功的表格数据；null = 尚未解析成功。 */
   data: ClientCfgTable | null;
   /** 解析失败信息（有值时显示错误面板）。 */
   error?: string;
-  active: boolean;
-  fontSize: number;
-  /** 界面语言（App 全局设置，与配置数据语言无关）。 */
-  uiLang: "zh" | "en";
   /** 用户手动选择 cfg_table_slots.json（解析失败/想换表时）。 */
   onPickSchema: () => void;
-  /** 打开视图模式选择框（切回文本视图的唯一入口，工具栏最左侧图标按钮）。 */
-  onSwitchViewMode: () => void;
-  registerCopy: (tabId: string, fn: (() => Promise<string>) | null) => void;
-  reportTotal: (tabId: string, total: number | null) => void;
-}) {
+}
+
+export function CfgTableTab(props: CfgTableTabProps) {
+  // tabId / active / registerCopy / reportTotal 由公共生命周期 hook 直接从 props 取，
+  // 这里只解构渲染真正用到的字段。
+  const { path, data, error, fontSize, uiLang, onPickSchema, onSwitchViewMode } = props;
   const zh = uiLang === "zh";
   const scrollRef = useRef<HTMLDivElement>(null);
   const rows = data?.rows ?? [];
@@ -102,32 +87,28 @@ export function CfgTableTab({
     virtualizer.measure();
   }, [rowHeight, virtualizer]);
 
-  // 激活时上报行数（右上角“N 行”显示）+ 注册“复制当前视图”（TSV）。
-  useEffect(() => {
-    if (!active) {
-      return;
+  // 复制当前表格为 TSV（首行 key + 全部数据行）；行数一起供右上角显示。
+  const copyAsTsv = useCallback(async (): Promise<string> => {
+    if (!data) {
+      return "";
     }
-    if (data) {
-      reportTotal(tabId, rows.length);
-      registerCopy(tabId, async () => {
-        const lines: string[] = [];
-        lines.push(["key", ...columns.map((c) => c.name)].join("\t"));
-        for (let i = 0; i < rows.length; i++) {
-          lines.push(
-            [String(data.keys[i] ?? ""), ...rows[i].map((cell) => fmtValue(cell))].join("\t")
-          );
-        }
-        await copyTextToClipboard(lines.join("\r\n"));
-        return lines.join("\r\n");
-      });
-    } else {
-      reportTotal(tabId, null);
+    const lines: string[] = [["key", ...columns.map((c) => c.name)].join("\t")];
+    for (let i = 0; i < rows.length; i++) {
+      lines.push(
+        [String(data.keys[i] ?? ""), ...rows[i].map((cell) => fmtValue(cell))].join("\t")
+      );
     }
-    return () => {
-      reportTotal(tabId, null);
-      registerCopy(tabId, null);
-    };
-  }, [active, data, rows.length, tabId, registerCopy, reportTotal, columns]);
+    const text = lines.join("\r\n");
+    await copyTextToClipboard(text);
+    return text;
+  }, [data, columns, rows]);
+
+  // 激活时注册「复制当前视图」并上报行数；失活 / 卸载时由 hook 注销。
+  // 尚未解析出数据时两者都不适用（reportTotal(null) 会清空右上角的行数显示）。
+  useBodyViewEffects(props, {
+    copy: data ? copyAsTsv : null,
+    total: data ? rows.length : null,
+  });
 
   const cfgLang = langOfPath(path);
 

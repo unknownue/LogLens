@@ -22,6 +22,9 @@
   --lineno: #858585;
   /* 错误提示（跳转模态框等） */
   --error: #f14c4c;
+  /* 警告提示（打开失败标记 / 状态页提示文字）：浅色主题下必须换成深琥珀，
+     否则 #e6b422 在近白底上对比度不足 2:1，根本看不清。 */
+  --warn: #e6b422;
   /* 日志字体大小（App 内联覆盖） */
   --log-font-size: 12px;
 }
@@ -48,6 +51,7 @@
   --row-highlight-hover: #ffe9a0;
   --lineno: #a0a0a0;
   --error: #c50f1f;
+  --warn: #8a6100;
 }
 
 :root {
@@ -138,6 +142,15 @@ body,
   max-width: 180px;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* 打开失败的 tab：标题后的警告标记（不必切过去就知道哪个 tab 有问题；
+   完整解释与修复入口在正文区的状态页面里，见 .notice-page）。 */
+.tabbar .tab .tab-warn {
+  flex: 0 0 auto;
+  color: var(--warn);
+  font-size: 11px;
+  cursor: help;
 }
 
 .tabbar .tab-close {
@@ -528,6 +541,18 @@ body,
   min-width: 0;
 }
 
+/* ===== 正文页面舞台（src/views 的多页面框架） =====
+   每个 tab 的正文都渲染在 .body-view 内，具体显示哪个页面由注册表决定
+   （文本视图 / 表格视图 / 文件不存在 / 打开失败）。这里只负责把页面撑满，
+   各页面内部照旧用自己的 flex:1 布局。 */
+.body-view {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .empty {
   flex: 1;
   display: flex;
@@ -632,7 +657,7 @@ body,
 
 /* 打开失败（如恢复会话时文件已被删除）：路径前加警告标记 */
 .toolbar .tab-path .path-warn {
-  color: #e6b422;
+  color: var(--warn);
 }
 .toolbar .tab-path.open-error {
   color: var(--text-dim);
@@ -1777,4 +1802,42 @@ body,
 
 .cfg-key {
   color: var(--lineno);
+}
+
+/* ==================== 正文状态页面（文件不存在 / 打开失败） ====================
+   由 src/views 的框架渲染：正文区正中的一行说明文字（含完整路径）。
+   刻意保持最简（无图标 / 无按钮 / 无折叠详情）—— 这类页面只有一句话的信息量。
+   与 .empty（未打开任何文件）刻意区分：那里是「还没有文件、给你个入口」，
+   这里是「打开了文件但读不到」，只需要说清是哪件事、哪个路径。 */
+
+.notice-page {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.notice-line {
+  max-width: 100%;
+  /* 这一行是页面上唯一的信息，字号取正文默认字号的两倍（13px → 26px）：
+     窗口里只有它一句话，太小会显得像残留提示、离远了看不清。
+     注：不跟随 A-/A+ 的正文字号设置 —— 那是给日志正文用的，这里是状态提示。 */
+  font-size: 26px;
+  line-height: 1.5;
+  text-align: center;
+  /* 长路径按字符换行，不撑破窗口；可选中复制 */
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+/* 基调：warn = 可恢复（文件不存在）；error = 打开/解析失败。 */
+.notice-page.warn .notice-line {
+  color: var(--warn);
+}
+
+.notice-page.error .notice-line {
+  color: var(--error);
 }
