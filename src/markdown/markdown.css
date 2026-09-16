@@ -173,7 +173,8 @@
 .md-source {
   margin: 0;
   padding: 12px 16px;
-  font-family: Consolas, "Cascadia Mono", monospace;
+  /* 源码视图与日志正文共用设置页的字体栈（--font-stack：非中文字体 + 中文字体） */
+  font-family: var(--font-stack);
   font-size: var(--log-font-size);
   line-height: 1.5;
   color: var(--text);
@@ -186,6 +187,9 @@
 .md-body {
   /* 宽度交给 .md-column 的百分比设置（用户可调）；这里只负责内边距与排版 */
   padding: 16px 24px 64px;
+  /* 显式声明（而不是靠继承）：Markdown 正文同样跟随设置页的字体，
+      中文正文用「中文字体」项、西文用「非中文字体」项 */
+  font-family: var(--font-stack);
   font-size: var(--log-font-size);
   line-height: 1.75;
   color: var(--text);
@@ -345,7 +349,7 @@
 
 /* 行内代码 */
 .md-body code {
-  font-family: Consolas, "Cascadia Mono", monospace;
+  font-family: var(--font-stack);
   font-size: 0.92em;
   background: var(--bg-hover);
   border: 1px solid var(--border);

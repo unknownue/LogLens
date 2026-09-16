@@ -1,0 +1,406 @@
+/* ==================== 设置模态框（SettingsModal.tsx） ====================
+ *
+ * 与其他模态框一样渲染在 `.loglens` 容器内（非 portal），因此直接继承
+ * `:root` 上的 `--font-stack` 与容器上的 `--log-font-size`：
+ * 改字体时这个对话框自身的观感也在实时预览里 —— 包括预览区里的
+ * 日志行 / Markdown / 表格三种样式，它们刻意复用与真实视图相同的
+ * 字号变量和边框口径，做到「预览什么样、正文就什么样」。
+ */
+
+.settings-modal {
+  display: flex;
+  flex-direction: column;
+  width: min(620px, calc(100vw - 40px));
+  max-height: min(86vh, 760px);
+  background-color: var(--bg-bar);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+}
+
+.settings-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.settings-title {
+  flex: 1;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-bright);
+}
+
+.settings-x {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.settings-x:hover {
+  background: var(--bg-hover);
+  color: var(--text-bright);
+}
+
+.settings-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 14px 14px;
+}
+
+/* 分组小标题（外观 / 字体 / 预览） */
+.settings-section {
+  margin: 10px 0 5px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--accent-soft);
+  text-transform: uppercase;
+}
+
+.settings-scroll > .settings-section:first-child {
+  margin-top: 2px;
+}
+
+.settings-hint {
+  margin-bottom: 7px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+
+/* ---- 通用「标签 + 控件」行 ---- */
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 26px;
+  margin-bottom: 6px;
+}
+
+.settings-label {
+  flex-shrink: 0;
+  width: 88px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.settings-control {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 分段选择（主题 / 语言） */
+.settings-seg {
+  display: inline-flex;
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.settings-seg button {
+  padding: 3px 12px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.settings-seg button + button {
+  border-left: 1px solid var(--border-light);
+}
+
+.settings-seg button:hover {
+  background: var(--bg-hover);
+}
+
+.settings-seg button.on {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* ---- 字体项 ---- */
+.settings-field {
+  margin-bottom: 10px;
+}
+
+.settings-field-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.settings-field-head .settings-label {
+  width: auto;
+}
+
+.settings-sub {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* 搜索行：系统字体动辄两三百个，靠它把列表收窄（右侧显示条数与数据来源） */
+.settings-search-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 5px;
+}
+
+.settings-search {
+  flex: 0 0 280px;
+  max-width: 60%;
+  height: 24px;
+  padding: 0 6px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border-light);
+  border-radius: 3px;
+  font-size: 12px;
+  font-family: inherit;
+}
+
+.settings-search:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.settings-search::-webkit-search-cancel-button {
+  cursor: pointer;
+}
+
+.settings-count {
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.settings-field-body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-select,
+.settings-input {
+  height: 24px;
+  padding: 0 6px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border-light);
+  border-radius: 3px;
+  font-size: 12px;
+  font-family: inherit;
+  min-width: 0;
+}
+
+.settings-select {
+  flex: 0 0 280px;
+  max-width: 60%;
+  cursor: pointer;
+}
+
+.settings-input {
+  flex: 1;
+}
+
+.settings-select:focus,
+.settings-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.settings-note {
+  margin-top: 4px;
+  padding-left: 2px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+/* ---- 字号 ---- */
+.settings-range {
+  flex: 0 0 220px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.settings-value {
+  min-width: 44px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.settings-mini {
+  padding: 2px 8px;
+  border: 1px solid var(--border-light);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.settings-mini:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.settings-mini:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ---- 预览区 ----
+   三种视图各来一小段：日志行复用行号+正文的排版，Markdown 复用标题/正文/行内代码，
+   表格复用 cfg 表格的边框与内边距口径。字体栈由祖先继承（就是当前设置的那条）。 */
+.settings-preview {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 2px 8px;
+  background: var(--bg);
+  overflow: auto;
+}
+
+.settings-preview-cap {
+  padding: 2px 10px 4px;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.settings-preview-log {
+  display: flex;
+  align-items: flex-start;
+  font-size: var(--log-font-size);
+  line-height: 1.4;
+  padding: 1px 10px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.settings-preview-lineno {
+  flex-shrink: 0;
+  width: 28px;
+  padding-right: 8px;
+  text-align: right;
+  color: var(--lineno);
+}
+
+.settings-preview-text {
+  color: var(--text);
+}
+
+.settings-preview-md {
+  padding: 2px 10px;
+  font-size: var(--log-font-size);
+  line-height: 1.5;
+}
+
+.settings-preview-h {
+  font-weight: 600;
+  color: var(--text-bright);
+}
+
+.settings-preview-p {
+  color: var(--text);
+}
+
+.settings-preview-code {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--bg-hover);
+  color: var(--text-bright);
+}
+
+.settings-preview-table {
+  margin: 2px 10px 4px;
+  border-collapse: collapse;
+  font-size: var(--log-font-size);
+  color: var(--text);
+}
+
+.settings-preview-table th,
+.settings-preview-table td {
+  padding: 3px 8px;
+  border: 1px solid var(--row-border);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.settings-preview-table th {
+  color: var(--accent-soft);
+  font-weight: 600;
+}
+
+.settings-preview-table td:first-child {
+  color: var(--lineno);
+}
+
+/* 实际生效的字体栈（技术细节，等宽小字） */
+.settings-stack {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: -2px 0 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.settings-stack-key {
+  flex-shrink: 0;
+}
+
+.settings-stack-value {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.settings-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.settings-foot .settings-reset {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border-light);
+}
+
+.settings-foot .settings-reset:hover {
+  background: var(--bg-hover);
+  color: var(--text-bright);
+}
+
+.settings-foot .body-modal-btn {
+  cursor: pointer;
+}

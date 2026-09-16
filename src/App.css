@@ -33,6 +33,22 @@
   --warn: #e6b422;
   /* 日志字体大小（App 内联覆盖） */
   --log-font-size: 12px;
+
+  /* ===== 字体（设置页可改，App 把 --font-latin / --font-cjk 写到 <html> 上） =====
+   *
+   * 应用里所有文字共用一条字体栈，由「非中文字体 + 中文字体」两段拼成，浏览器
+   * **逐字符**回退：西文命中前者，中文跳过前者落到后者。两段分别对应设置页的
+   * 「非中文字体 / 中文字体」，值由 src/settings 生成（含引号处理），下面这两条
+   * 只是 JS 生效前的初值 —— 默认值必须与 src/settings/font-catalog.ts 的
+   * DEFAULT_LATIN_FAMILIES / DEFAULT_CJK_FAMILIES 一致（tools/verify-settings.test.mjs 会卡）。
+   *
+   * 排在前面的非中文字体必须**不含中文字形**，否则中文也会被它渲染：
+   * Consolas / Cascadia Mono / Courier New 都不含 CJK，是安全的西文段。
+   */
+  --font-latin: "Consolas", "Cascadia Mono", "Courier New";
+  --font-cjk: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC",
+    "Source Han Sans SC";
+  --font-stack: var(--font-latin), var(--font-cjk), monospace;
 }
 
 :root[data-theme="light"] {
@@ -63,7 +79,8 @@
 }
 
 :root {
-  font-family: "Consolas", "Cascadia Mono", "Courier New", monospace;
+  /* 界面与正文共用一条字体栈（非中文字体在前、中文字体在后，见文件头的字体变量说明） */
+  font-family: var(--font-stack);
   line-height: 1.4;
   color: var(--text);
   background-color: var(--bg);
@@ -1108,7 +1125,8 @@ body,
   display: flex;
   align-items: flex-start;
   font-size: var(--log-font-size);
-  font-family: "Consolas", "Cascadia Mono", "Courier New", monospace;
+  /* 日志正文跟随设置页的字体（非中文 / 中文两段） */
+  font-family: var(--font-stack);
   border-bottom: 1px solid var(--row-border);
   /* 高亮淡出的过渡（配合 .highlight 的移除） */
   transition: background-color 0.5s ease;
@@ -1640,7 +1658,8 @@ body,
   display: flex;
   align-items: flex-start;
   font-size: var(--log-font-size);
-  font-family: "Consolas", "Cascadia Mono", "Courier New", monospace;
+  /* 与日志正文同一套字体（复制视图弹窗里的内容也要跟着设置走） */
+  font-family: var(--font-stack);
   padding: 2px 12px;
   border-bottom: 1px solid var(--row-border);
 }
@@ -1798,7 +1817,8 @@ body,
   flex: 1;
   min-height: 0;
   overflow: auto;
-  font-family: Consolas, "Courier New", monospace;
+  /* 表格视图（配置表）与日志视图共用同一套字体设置 */
+  font-family: var(--font-stack);
   font-size: var(--log-font-size);
 }
 

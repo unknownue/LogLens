@@ -3,6 +3,7 @@
 mod client_cfg;
 mod document;
 mod filter;
+mod fonts;
 mod index;
 pub mod perf;
 mod search;
@@ -253,6 +254,16 @@ fn get_startup_paths() -> Vec<String> {
         .collect()
 }
 
+/// 本机所有可用字体（设置页的字体下拉）。
+///
+/// `lang` 只影响展示名（中文界面下显示「微软雅黑」而不是 `Microsoft YaHei`），
+/// 写进 CSS 的 `family` 始终是英文名。枚举走 DirectWrite 的系统字体集，
+/// 详见 `fonts.rs` 头部注释；结果在后端缓存（进程内只枚举一次）。
+#[tauri::command]
+fn list_system_fonts(lang: Option<String>) -> Result<Vec<fonts::SystemFont>, String> {
+    fonts::list_system_fonts(lang.as_deref())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     perf::mark("run:start");
@@ -286,7 +297,8 @@ pub fn run() {
             client_cfg::remove_schema_file,
             document::read_text_file,
             document::stat_text_file,
-            get_startup_paths
+            get_startup_paths,
+            list_system_fonts
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,6 +1,6 @@
 [package]
 name = "loglens"
-version = "0.3.0"
+version = "0.4.0"
 description = "LogLens — 大日志实时查看器（tail-follow + 过滤 + 稀疏虚拟滚动）"
 authors = ["you"]
 edition = "2021"
@@ -37,6 +37,9 @@ regex = "1"
 aho-corasick = "1"
 parking_lot = "0.12"
 tracing = "0.1"
+# 设置页要枚举「本机所有可用字体」：走 DirectWrite 的系统字体集（与 WebView2 取字体
+# 用的是同一份集合）。版本与 tauri 传递依赖的版本一致，不会多编译一份。
+windows = { version = "0.61", features = ["Win32_Graphics_DirectWrite"] }
 tracing-tracy = { version = "0.11", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
 

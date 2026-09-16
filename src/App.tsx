@@ -21,6 +21,16 @@ import { CfgTableTab, type ClientCfgTable } from "./CfgTableTab";
 import { copyTextToClipboard } from "./clipboard";
 import { isMarkdownPath } from "./markdown/paths.ts";
 import {
+  SettingsModal,
+  FONT_SIZE_MAX,
+  FONT_SIZE_MIN,
+  applyFontSettings,
+  clampFontSize,
+  readSettings,
+  writeSettings,
+  type AppSettings,
+} from "./settings";
+import {
   APP_BODY_VIEWS,
   BodyViewHost,
   BodyViewRegistry,
@@ -684,6 +694,10 @@ interface Messages {
   aboutVersionLabel: string;
   aboutDesc: string;
   aboutTech: string;
+  /** 总菜单里的设置项文案。 */
+  settingsTitle: string;
+  /** 工具栏齿轮按钮的悬浮提示 / aria。 */
+  settingsOpenTitle: string;
   winMinimize: string;
   winMaximize: string;
   winRestore: string;
@@ -814,6 +828,8 @@ const MESSAGES: Record<Lang, Messages> = {
     aboutVersionLabel: "版本",
     aboutDesc: "大日志实时查看器：tail-follow 实时跟随、关键词/正则过滤、稀疏虚拟滚动，流畅浏览千万行级日志。",
     aboutTech: "Tauri 2 · React · Rust",
+    settingsTitle: "设置…",
+    settingsOpenTitle: "设置（字体 / 外观）",
     winMinimize: "最小化",
     winMaximize: "最大化",
     winRestore: "还原",
@@ -941,6 +957,8 @@ const MESSAGES: Record<Lang, Messages> = {
     aboutVersionLabel: "Version",
     aboutDesc: "A realtime large-log viewer: tail-follow, keyword/regex filtering and sparse virtual scrolling for logs with millions of lines.",
     aboutTech: "Tauri 2 · React · Rust",
+    settingsTitle: "Settings…",
+    settingsOpenTitle: "Settings (fonts / appearance)",
     winMinimize: "Minimize",
     winMaximize: "Maximize",
     winRestore: "Restore",
@@ -3660,6 +3678,11 @@ export default function App() {
   /** 应用版本（tauri.conf.json）：core:app 插件默认注册，浏览器 mock 下回退内置值。 */
   const [appVersion, setAppVersion] = useState("0.1.0");
 
+  // ---- 设置模态框（外观 / 字体定制 / 正文字号） ----
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  /** 关闭设置页：引用稳定，供 SettingsModal 的 Esc / 遮罩点击复用。 */
+  const closeSettings = useCallback(() => setSettingsOpen(false), []);
+
   // ---- 视图模式选择模态框（文本 / 表格） ----
   const [viewModeOpen, setViewModeOpen] = useState(false);
   /** 未选 schema 就尝试切表格视图：模态框内显示提示。 */
@@ -4083,15 +4106,28 @@ export default function App() {
     }
   });
 
-  // 日志字体大小（10–20px），持久化。
-  const [fontSize, setFontSize] = useState(() => {
-    try {
-      const v = Number(localStorage.getItem("lv-fontsize"));
-      return v >= 10 && v <= 20 ? v : 12;
-    } catch {
-      return 12;
-    }
+  // ---- 设置：字体定制（非中文字体 / 中文字体）与正文字号 ----
+  //
+  // 一个字面量状态（`lv-settings`），旧版本只存过标量字号（`lv-fontsize`），
+  // `readSettings` 负责把它迁进来。这里**在首次渲染前**就把字体变量写到 <html> 上：
+  // 放到 effect 里做的话，首屏会先用默认字体画一遍再跳变 —— 字体跳变比主题跳变显眼。
+  const [settings, setSettings] = useState<AppSettings>(() => {
+    const initial = readSettings();
+    applyFontSettings(initial);
+    return initial;
   });
+  /** 正文字号（工具栏 A-/A+ 与设置页共用同一个值）。 */
+  const fontSize = settings.fontSize;
+
+  const updateSettings = useCallback((patch: Partial<AppSettings>) => {
+    setSettings((prev) => ({ ...prev, ...patch }));
+  }, []);
+
+  // 设置变化：写 CSS 变量 + 持久化。
+  useEffect(() => {
+    applyFontSettings(settings);
+    writeSettings(settings);
+  }, [settings]);
 
   // 界面语言（zh/en），持久化；默认中文。
   const [lang, setLang] = useState<Lang>(() => {
@@ -4122,14 +4158,6 @@ export default function App() {
       /* 浏览器复现环境无窗口对象：忽略 */
     }
   }, [theme]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem("lv-fontsize", String(fontSize));
-    } catch {
-      /* ignore */
-    }
-  }, [fontSize]);
 
   useEffect(() => {
     document.documentElement.lang = lang;
@@ -4209,7 +4237,10 @@ export default function App() {
   }, []);
 
   const changeFontSize = useCallback((delta: number) => {
-    setFontSize((f) => Math.min(20, Math.max(10, f + delta)));
+    setSettings((prev) => ({
+      ...prev,
+      fontSize: clampFontSize(prev.fontSize + delta),
+    }));
   }, []);
 
   // ---- 右上角「复制当前视图」按钮 ----
@@ -4848,7 +4879,7 @@ export default function App() {
             className="icon-btn"
             onClick={() => changeFontSize(-1)}
             title={appT.fontSizeSmaller}
-            disabled={fontSize <= 10}
+            disabled={fontSize <= FONT_SIZE_MIN}
           >
             A-
           </button>
@@ -4857,7 +4888,7 @@ export default function App() {
             className="icon-btn"
             onClick={() => changeFontSize(1)}
             title={appT.fontSizeBigger}
-            disabled={fontSize >= 20}
+            disabled={fontSize >= FONT_SIZE_MAX}
           >
             A+
           </button>
@@ -4911,6 +4942,28 @@ export default function App() {
             title={theme === "dark" ? appT.switchToLight : appT.switchToDark}
           >
             {theme === "dark" ? "☀" : "☾"}
+          </button>
+          {/* 设置（含字体定制）：齿轮放在工具栏最右，与主题切换相邻。 */}
+          <button
+            className="icon-btn settings-btn"
+            onClick={() => setSettingsOpen(true)}
+            title={appT.settingsOpenTitle}
+            aria-haspopup="dialog"
+            aria-expanded={settingsOpen}
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path
+                d="M8 10.2a2.2 2.2 0 1 0 0-4.4 2.2 2.2 0 0 0 0 4.4Z"
+                stroke="currentColor"
+                strokeWidth="1.2"
+              />
+              <path
+                d="M13.2 8c0-.35-.04-.69-.1-1.02l1.4-1.05-1.5-2.6-1.62.66a5.2 5.2 0 0 0-1.77-1.03L9.4 1.3H6.6l-.21 1.66a5.2 5.2 0 0 0-1.77 1.03l-1.62-.66-1.5 2.6 1.4 1.05a5.3 5.3 0 0 0 0 2.04l-1.4 1.05 1.5 2.6 1.62-.66c.52.45 1.12.8 1.77 1.03l.21 1.66h2.8l.21-1.66a5.2 5.2 0 0 0 1.77-1.03l1.62.66 1.5-2.6-1.4-1.05c.06-.33.1-.67.1-1.02Z"
+                stroke="currentColor"
+                strokeWidth="1.2"
+                strokeLinejoin="round"
+              />
+            </svg>
           </button>
         </div>
         {/* 无边框窗口的自绘窗口按钮（最小化/最大化/关闭），位于首行最右。 */}
@@ -5018,6 +5071,16 @@ export default function App() {
                 }}
               >
                 {appT.menuLangTitle}
+              </button>
+              <button
+                className="app-menu-item"
+                role="menuitem"
+                onClick={() => {
+                  closeMenu();
+                  setSettingsOpen(true);
+                }}
+              >
+                {appT.settingsTitle}
               </button>
               <button
                 className="app-menu-item"
@@ -5181,6 +5244,18 @@ export default function App() {
           </button>
         </div>
       )}
+
+      {settingsOpen ? (
+        <SettingsModal
+          lang={lang}
+          settings={settings}
+          onChange={updateSettings}
+          theme={theme}
+          onSetTheme={setTheme}
+          onSetLang={setLang}
+          onClose={closeSettings}
+        />
+      ) : null}
 
       {aboutOpen ? (
         <div className="body-modal-overlay" onClick={() => setAboutOpen(false)}>
