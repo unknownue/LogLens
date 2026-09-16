@@ -15,16 +15,19 @@
 // 见 tools/verify-body-views.test.mjs 与 tsconfig 的 allowImportingTsExtensions。
 import { BodyViewRegistry, type OpenErrorInfo } from "./body-view.ts";
 
+/** tab 的视图模式（`undefined` 视为 `text`）。 */
+export type ViewMode = "text" | "cfg" | "md";
+
 /** 解析「该显示哪个页面」所需的 tab 状态子集（与 App 的 TabInfo 结构兼容）。 */
 export interface BodyViewState {
   /** 该 tab 的视图模式（undefined 视为 `text`）。 */
-  viewMode?: "text" | "cfg";
+  viewMode?: ViewMode;
   /** 打开/解析失败信息的分类结果（`kind === "none"` = 正常）。 */
   error: OpenErrorInfo;
 }
 
 /** 应用内置的正文页面 id（与 App.tsx 的渲染实现表一一对应）。 */
-export type AppBodyViewId = "file-missing" | "cfg-table" | "open-error" | "text-log";
+export type AppBodyViewId = "file-missing" | "md-view" | "cfg-table" | "open-error" | "text-log";
 
 /** 一条页面规则。 */
 export interface AppBodyViewSpec {
@@ -43,11 +46,16 @@ export interface AppBodyViewSpec {
  *
  * 1. `file-missing` —— 文件不存在（定制页）。优先级最高：内容根本加载不出来，
  *    先给出解释与修复入口；表格视图下 bin 丢了也走这里。
- * 2. `cfg-table` —— 表格视图。它自带错误面板（解析失败 / 缺 schema 时能重选
- *    schema），所以排在通用错误页之前；「文件本体不存在」已被 1 号页面接走。
- * 3. `open-error` —— 其它打开失败（权限、IO、格式…）的通用状态页。没它的话任何
+ * 2. `md-view` —— Markdown 预览。排在通用错误页之前：它自带「读取失败 + 重试」面板
+ *    （文件被外部改动、编解码失败都要能在原地重读，而不是被换成一行通用报错）。
+ * 3. `cfg-table` —— 表格视图。它自带错误面板（解析失败 / 缺 schema 时能重选
+ *    schema），同样排在通用错误页之前；「文件本体不存在」已被 1 号页面接走。
+ * 4. `open-error` —— 其它打开失败（权限、IO、格式…）的通用状态页。没它的话任何
  *    未预料的失败都会退化成「空白正文 + 一句错误文本」。
- * 4. `text-log` —— 文本日志视图（fallback：没被上面命中的 tab 都按日志文本显示）。
+ * 5. `text-log` —— 文本日志视图（fallback：没被上面命中的 tab 都按日志文本显示）。
+ *
+ * `md-view` 与 `cfg-table` 由 viewMode 决定、互斥，优先级只影响「谁先被检查」；
+ * 两者都必须高于 `open-error`，否则它们各自的错误面板永远没机会出现。
  */
 export const APP_BODY_VIEWS: readonly AppBodyViewSpec[] = [
   {
@@ -57,6 +65,11 @@ export const APP_BODY_VIEWS: readonly AppBodyViewSpec[] = [
     // 那种情况该在表格视图里重选 schema，不能拿本页面顶替（否则会把**存在**的
     // bin 路径当成缺失文件展示，且「重新定位」还会再次指向 bin）。
     match: (state) => state.error.kind === "missing" && state.error.subject !== "schema",
+  },
+  {
+    id: "md-view",
+    priority: 40,
+    match: (state) => (state.viewMode ?? "text") === "md",
   },
   {
     id: "cfg-table",

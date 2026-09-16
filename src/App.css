@@ -1,5 +1,11 @@
 /* ===== 主题变量（dark 默认 / light 覆盖） ===== */
 :root {
+  /* 告诉浏览器这个页面是深色的：原生滚动条、勾选框、下拉、范围滑块等
+     一律按深色渲染。缺了它，WebView2 会按**系统**亮/暗画滚动条 ——
+     深色主题下正文里就挂着一根接近白色的滚动条（日志列表看不出问题，
+     因为那里是自绘滚动条；表格 / Markdown / 大纲用的是原生滚动）。 */
+  color-scheme: dark;
+
   --bg: #1e1e1e;
   --bg-bar: #252526;
   --bg-hover: #2a2a2a;
@@ -30,6 +36,8 @@
 }
 
 :root[data-theme="light"] {
+  color-scheme: light;
+
   --bg: #ffffff;
   --bg-bar: #f0f0f0;
   --bg-hover: #e6e6e6;
@@ -65,6 +73,41 @@
   box-sizing: border-box;
   margin: 0;
   padding: 0;
+}
+
+/* ===== 原生滚动条外观 =====
+ *
+ * `color-scheme`（见上方主题变量）已经能修掉「深色页面挂白色滚动条」，
+ * 但它的观感由平台决定；这里再把滚动条画成与本应用自绘滚动条同一套
+ * （见下方 .list.nowrap 的水平滚动条与 .vscrollbar）：
+ * 轨道透明、拇指 --border-light、hover 提亮、四边缩进后用圆角收边。
+ *
+ * 只改外观、不改行为：惯性滚动、横向滚轮、Shift+滚轮都不受影响。
+ * 日志列表（.list）的纵向滚动条是自绘的，不在此列。 */
+::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-light);
+  /* 伪元素不支持 margin：用透明边框外扩 + padding-box 裁剪，让拇指四周各缩进 2px */
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  border-radius: 6px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-dim);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 html,

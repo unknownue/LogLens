@@ -35,6 +35,7 @@
 | 优先级 | 页面 id | 命中条件 | 说明 |
 |-------|---------|---------|------|
 | 100 | `file-missing` | 错误分类 = `missing` 且缺的是**文件本体** | 内容根本加载不出来，直接说明是哪件事、哪个路径 |
+| 40 | `md-view` | `viewMode === "md"` | Markdown 预览（自带「读取失败 + 重试」面板） |
 | 30 | `cfg-table` | `viewMode === "cfg"` | 表格视图自带错误面板（可重选 schema），故排在通用错误页之前 |
 | 20 | `open-error` | 错误分类 = `denied` / `other` | 通用状态页，兜住未预料的失败 |
 | 0 | `text-log` | 永远命中（`fallback`） | 文本日志视图 |
@@ -45,8 +46,9 @@
   不放按钮。理由：这类页面只有一句话的信息量，堆操作反而把「看一眼就知道怎么回事」
   变成了「先读一排按钮」；要重新定位文件直接再打开一次即可。
 - **`file-missing` 优先于一切内容视图**：文件不在，表格 / 文本都没有数据可显示。
-- **`cfg-table` 优先于 `open-error`**：表格视图的解析错误需要它自己的错误面板
-  （里面才有「选择 schema…」），不能被通用错误页顶掉。
+- **内容视图（`md-view` / `cfg-table`）优先于 `open-error`**：它们各自带错误面板
+  （Markdown 页能原地重读，表格页能重选 schema），不能被通用错误页顶掉。
+  两者的 `match` 由 `viewMode` 决定、互斥，优先级只影响「谁先被检查」。
 - **「缺 schema」不是「缺文件」**：`classifyOpenError` 把
   `schema 文件不存在: …` 归到 `subject: "schema"`，此时仍留在表格视图里重选 schema ——
   否则页面会把**存在**的 bin 路径当成缺失文件展示。
@@ -94,6 +96,12 @@
 > 提取文案：视图模块自带中英文案（与 `CfgTableTab` 一致），不反向依赖 App 的 i18n 字典
 > （App → views 是单向依赖，避免循环引用）。
 
+**例外：`MarkdownView` 不从 `src/views/index.ts` 导出。** 它带着 marked + KaTeX +
+highlight.js（约 600 KB JS 与 KaTeX 全部字体），必须由 App 用
+`React.lazy(() => import("./views/MarkdownView"))` 按需加载；一旦进了 index，
+App 的静态 import 就会把它拖回主 chunk，每次启动都要解析这些代码与字体。
+其余页面照旧从 index 导出（`ViewToggleButton` 这类共用件也在 index 里）。
+
 ## 约定与陷阱
 
 - **状态页保持一行**：这类页面只有一句话的信息量，刻意不放按钮 / 图标 / 折叠详情
@@ -119,9 +127,11 @@
 ```powershell
 pnpm run build                                  # tsc + vite（类型与打包）
 node --test tools/verify-body-views.test.mjs    # 规则单测：错误分类 / 页面优先级（无需浏览器）
+node --test tools/verify-markdown.test.mjs      # Markdown 页的管线规则（无需浏览器）
 
 pnpm run dev                                    # 另开一个终端：Vite dev server (127.0.0.1:5173)
 node tools/e2e-file-missing.mjs --launch        # 浏览器端到端：CDP + mock 后端驱动真实交互
+node tools/e2e-markdown.mjs --launch            # Markdown 预览页的端到端（清洗/公式/查找/链接）
 node tools/e2e-file-missing.mjs --launch --theme light --shot %TEMP%\loglens-e2e
                                                 # 浅色主题 + 导出成品截图
 ```
@@ -129,3 +139,5 @@ node tools/e2e-file-missing.mjs --launch --theme light --shot %TEMP%\loglens-e2e
 端到端脚本覆盖的场景：会话恢复到一个已删除的文件 → 正文是一行「文件不存在：<路径>」
 （无按钮）→ 同一路径再次打开不新增 tab → 文件恢复后再次打开自动切回文本视图 →
 拒绝访问走通用错误页 → 表格视图选 schema / 渲染 / 复制 / 切回文本。
+Markdown 页另有一份端到端脚本（`tools/e2e-markdown.mjs`），覆盖内容见
+[markdown-view.md](markdown-view.md) 的「验证」一节。

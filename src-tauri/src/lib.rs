@@ -1,6 +1,7 @@
 //! Tauri 后端入口：注册命令、初始化后台日志监控。
 
 mod client_cfg;
+mod document;
 mod filter;
 mod index;
 pub mod perf;
@@ -283,6 +284,8 @@ pub fn run() {
             client_cfg::parse_client_cfg_bin,
             client_cfg::save_schema,
             client_cfg::remove_schema_file,
+            document::read_text_file,
+            document::stat_text_file,
             get_startup_paths
         ])
         .run(tauri::generate_context!())

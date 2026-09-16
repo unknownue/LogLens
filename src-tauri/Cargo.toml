@@ -24,7 +24,10 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# protocol-asset：Markdown 预览要显示文档旁边的本地图片（asset 协议）。
+# tauri-build 会校验它和 tauri.conf.json 里的 assetProtocol.enable 是否一致 ——
+# 只开配置不加 feature 会直接编译失败（build script 报 allowlist 不匹配）。
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }

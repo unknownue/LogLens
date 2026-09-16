@@ -1,15 +1,25 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  Suspense,
+  lazy,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { CfgTableTab, type ClientCfgTable } from "./CfgTableTab";
 import { copyTextToClipboard } from "./clipboard";
+import { isMarkdownPath } from "./markdown/paths.ts";
 import {
   APP_BODY_VIEWS,
   BodyViewHost,
@@ -22,8 +32,24 @@ import {
   type BodyViewProps,
   type OpenErrorInfo,
   type ViewLang,
+  type ViewMode,
 } from "./views";
+import type { MdDoc } from "./views/MarkdownView";
 import "./App.css";
+
+/**
+ * Markdown 预览页**按需加载**。
+ *
+ * 这一页带着 marked + KaTeX + highlight.js（约 600 KB JS，外加 KaTeX 的全部字体），
+ * 而绝大多数会话根本不会打开 .md 文件。用 `lazy` + 动态 import 把它切成独立 chunk：
+ * 文本视图的启动路径（解析 JS、拉字体）完全不受影响，代价只是第一次切到
+ * Markdown 时多一次本地 chunk 加载（毫秒级，页面内已有「渲染中…」占位）。
+ *
+ * 注意：`src/views/index.ts` 因此**不导出** MarkdownView（否则这里就退化回静态依赖）。
+ */
+const LazyMarkdownView = lazy(() =>
+  import("./views/MarkdownView").then((m) => ({ default: m.MarkdownView }))
+);
 
 /** 一行日志（与后端 LogLine 对应）。 */
 interface LogLine {
@@ -87,8 +113,27 @@ interface TabInfo {
   id: string;
   title: string;
   path: string;
-  /** 当前视图模式：默认文本（日志），用户可手动切换为 client_cfg 表格。 */
-  viewMode?: "text" | "cfg";
+  /** 当前视图模式：默认文本（日志）；.md/.markdown 打开时自动进 Markdown 预览，
+   *  用户也可手动切换文本 / 表格 / Markdown（见 views/app-body-views.ts）。 */
+  viewMode?: ViewMode;
+  /**
+   * 打开本 tab 时要跳转到的锚点（`other.md#sec` 这类跨文档链接带入）。
+   *
+   * 放在 tab 状态里而不是「渲染时读的 ref 表」：锚点是**一次性的指令**，
+   * 需要一次状态更新把它送到目标页面（ref 表在「目标 tab 恰好已是激活态」等
+   * 边界下不会触发重渲染，锚点就悄悄丢了）；页面消费后再写回 undefined。
+   */
+  anchor?: string;
+  /**
+   * 是否已为该 tab 建立过**文本 tail 会话**（open_log_file）。
+   *
+   * Markdown / 表格视图直接打开的 tab 不走文本会话，切回文本视图时要补一次
+   * `open_log_file`，否则正文是空的（文本视图只 `get_lines`，不会自己开文件）。
+   * 反过来也不能无条件补：`open_log_file` 会清空会话并重启一个 tail 线程
+   * （见 state.rs 的 start_watching_for_session），对已打开的 tab 重复调用
+   * 会把已加载内容清掉、还会多留一个 watcher。
+   */
+  textOpened?: boolean;
   /** 打开失败（如恢复上次会话时文件已被删除）时的错误信息；成功打开为 undefined。 */
   openError?: string;
   /** 表格视图解析用的 schema 文件路径（手动指定）；null/undefined = 尚未选择。 */
@@ -142,6 +187,8 @@ interface SavedTabs {
   active: number;
   /** 每个 tab 选择的 schema 文件路径（与 paths 下标对齐；null = 自动定位）。 */
   schemas?: (string | null)[];
+  /** 每个 tab 的视图模式（与 paths 下标对齐；null/缺失 = 按扩展名推断）。 */
+  modes?: (ViewMode | null)[];
 }
 
 /** 读取上次会话的标签页（无数据/损坏时返回 null）。 */
@@ -164,15 +211,34 @@ function readSavedTabs(): SavedTabs | null {
           typeof s === "string" && s.length > 0 ? s : null
         )
       : undefined;
+    // 老存档没有 modes 字段：留给下方按扩展名推断（Markdown 文件仍会自动进预览）。
+    const modes = Array.isArray(v.modes)
+      ? v.modes.slice(0, paths.length).map((m) =>
+          m === "text" || m === "cfg" || m === "md" ? m : null
+        )
+      : undefined;
     return {
       paths,
       active: typeof v.active === "number" ? v.active : paths.length - 1,
       schemas,
+      modes,
     };
   } catch {
     return null;
   }
 }
+
+/** 按扩展名推断默认视图模式：Markdown 文件直接进预览，其余按文本日志打开。 */
+function defaultViewModeFor(path: string): ViewMode {
+  return isMarkdownPath(path) ? "md" : "text";
+}
+
+/** 读取 Markdown 文件的大小上限（字节）。
+ *
+ * 后端默认上限是 4 MiB，这里主动收窄到 2 MiB：整篇 Markdown 要在主线程解析并排版，
+ * 更大的文件会让切页明显卡顿，而「截断预览 + 横幅提示」比卡住的界面诚实得多。
+ * 需要看全文时切到文本视图（那边是稀疏读取，不吃这个上限）。 */
+const MD_MAX_BYTES = 2 * 1024 * 1024;
 
 // ==================== schema 文件记录（表格视图解析用） ====================
 //
@@ -602,6 +668,8 @@ interface Messages {
   viewModeTextDesc: string;
   viewModeCfgName: string;
   viewModeCfgDesc: string;
+  viewModeMdName: string;
+  viewModeMdDesc: string;
   viewModeCurrent: string;
   viewModeSchemaTitle: string;
   viewModeSchemaAdd: string;
@@ -729,6 +797,9 @@ const MESSAGES: Record<Lang, Messages> = {
     viewModeCfgName: "表格视图",
     viewModeCfgDesc:
       "以 client_cfg 配置表格式解析当前文件。数据为 MemoryPack 二进制序列化格式，解析依赖表结构描述文件 cfg_table_slots.json。",
+    viewModeMdName: "Markdown 预览",
+    viewModeMdDesc:
+      "按文档排版渲染当前文件：支持表格、任务列表、代码高亮与 LaTeX 公式（$…$ / $$…$$），并带大纲与页内查找。图片以占位符显示（本地图片可在资源管理器中定位）。",
     viewModeCurrent: "当前",
     viewModeSchemaTitle: "Schema 文件（表格解析用）",
     viewModeSchemaAdd: "添加 schema 文件…",
@@ -853,6 +924,9 @@ const MESSAGES: Record<Lang, Messages> = {
     viewModeTextDesc: "View the file as log text: tail-follow live updates, keyword/regex filtering, highlighting and sparse virtual scrolling.",
     viewModeCfgName: "Table view",
     viewModeCfgDesc: "Parse the current file as a client_cfg config table. The data uses the MemoryPack binary serialization format; parsing requires the cfg_table_slots.json schema description.",
+    viewModeMdName: "Markdown preview",
+    viewModeMdDesc:
+      "Render the file as a document: tables, task lists, syntax-highlighted code and LaTeX math ($…$ / $$…$$), plus an outline and in-page find. Images show as placeholders (local ones can be revealed in File Explorer).",
     viewModeCurrent: "Current",
     viewModeSchemaTitle: "Schema files (for table parsing)",
     viewModeSchemaAdd: "Add schema file…",
@@ -1031,7 +1105,7 @@ interface LogTabProps extends BodyViewProps {
    *  整体接管（见下方 bodyViews 注册表），这里保留 ⚠ 提示作为兜底。 */
   openError?: string;
   /** 当前视图模式；工具栏最左侧的图标按钮据此显示「切换到哪种视图」。 */
-  viewMode: "text" | "cfg";
+  viewMode: ViewMode;
 }
 
 /** 单个日志 tab：独立的状态（行、过滤、滚动、高亮）与事件监听。 */
@@ -2936,18 +3010,18 @@ function LogTab(props: LogTabProps) {
     <div className="tab-content">
       <div className="toolbar">
         <button
-          className={`icon-btn toolbar-icon view-toggle${viewMode === "cfg" ? " on" : ""}`}
+          className={`icon-btn toolbar-icon view-toggle${viewMode !== "text" ? " on" : ""}`}
           onClick={onSwitchViewMode}
-          aria-pressed={viewMode === "cfg"}
+          aria-pressed={viewMode !== "text"}
           title={t.viewModeButtonTitle}
         >
-          {viewMode === "cfg" ? (
-            /* 当前是表格视图：图标表示「切回文本」，多行文字 */
+          {viewMode !== "text" ? (
+            /* 当前不是文本视图（表格 / Markdown）：图标表示「切回文本」，多行文字 */
             <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
               <path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h6" stroke="currentColor" strokeWidth="1.55" />
             </svg>
           ) : (
-            /* 当前是文本视图：图标表示「切到表格」，网格 */
+            /* 当前是文本视图：图标表示「还有别的视图」，网格 */
             <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
               <rect x="1.9" y="2.9" width="12.2" height="10.2" rx="1" stroke="currentColor" strokeWidth="1.45" />
               <path d="M1.9 6.3h12.2M1.9 9.7h12.2M6.1 2.9v10.2M9.9 2.9v10.2" stroke="currentColor" strokeWidth="1.45" />
@@ -3413,6 +3487,39 @@ interface AppBodyViewCtx {
   cfg: ClientCfgTable | null;
   /** 表格视图重新选择 schema 文件。 */
   pickSchema: (tabId: string, path: string) => void;
+  /** Markdown 全文（Markdown 页用；null = 尚未读到）。 */
+  md: MdDoc | null;
+  /** 重新读取（文件被外部编辑后手动刷新）。 */
+  reloadMd: (tabId: string, path: string) => void;
+  /** 重新读取，但仅在内容确实变化时替换正文；返回是否变化（「跟随」轮询用）。 */
+  reloadMdIfChanged: (tabId: string, path: string) => Promise<boolean>;
+  /** 打开另一个文档（Markdown 页里的相对链接走这里，复用 App 的开文件规则）。 */
+  openDoc: (path: string, anchor?: string) => void;
+  /** 该 tab 打开时待跳转的锚点（`other.md#sec` 带过来的），已消费则为 null。 */
+  anchor: string | null;
+  /** 锚点已消费：写回 undefined，避免重渲染时重复跳转。 */
+  consumeAnchor: () => void;
+  /** 查询文件 mtime/大小（Markdown 页的自动刷新轮询用）。 */
+  statFile: (path: string) => Promise<{ mtimeMs: number; size: number }>;
+}
+
+/** 本地路径 → asset 协议 URL（Markdown 页里的图片）。 */
+function toAssetUrl(path: string): string {
+  return convertFileSrc(path);
+}
+
+/** 在资源管理器中定位本地文件（Markdown 页里的图片占位与非文档链接）。 */
+function revealPath(path: string): void {
+  void revealItemInDir(path).catch((e) => {
+    console.error("revealItemInDir failed:", path, e);
+  });
+}
+
+/** 用系统默认浏览器打开外部链接：Tauri 的 WebView 若自己导航，应用页面会被顶掉。 */
+function openExternal(url: string): void {
+  void openUrl(url).catch((e) => {
+    console.error("openUrl failed:", url, e);
+  });
 }
 
 /**
@@ -3426,6 +3533,41 @@ const APP_BODY_VIEW_RENDERERS: Record<
   (base: BodyViewProps, ctx: AppBodyViewCtx) => React.ReactNode
 > = {
   "file-missing": (base) => <FileMissingView {...base} />,
+  "md-view": (base, ctx) => (
+    // 懒加载页面必须自带兜底：chunk 还在下载时正文区不能是一片空白。
+    <Suspense fallback={<div className="md-notice">loading…</div>}>
+      <LazyMarkdownView
+        tabId={base.tabId}
+        path={base.path}
+        active={base.active}
+        fontSize={base.fontSize}
+        lang={base.lang}
+        doc={ctx.md}
+        error={ctx.tab.openError}
+        onSwitchViewMode={base.onSwitchViewMode}
+        registerCopy={base.registerCopy}
+        reportTotal={base.reportTotal}
+        onReload={() => ctx.reloadMd(ctx.tab.id, ctx.tab.path)}
+        // 自动刷新走「变了才换正文」的那条：内容逐字未变（编辑器空保存）时不重排版，
+        // 返回值告诉页面该闪「已刷新」还是「无变化」。手动「重新读取」仍走 onReload。
+        onReloadIfChanged={() => ctx.reloadMdIfChanged(ctx.tab.id, ctx.tab.path)}
+        // 相对链接指向的 Markdown：复用 App 的 openPath（同路径不重复开 tab、
+        // 失效路径会落到「文件不存在」状态页），不在页面里自己开 tab。
+        onOpenDoc={ctx.openDoc}
+        // 本地文件（图片 / 非 Markdown 链接）：在资源管理器中定位。
+        // 刻意不用 opener 的 openPath（会交给系统默认程序执行）：那需要额外申请
+        // `opener:allow-open-path` 权限，且「点一下文档里的链接就启动本机程序」
+        // 是文档视图不该有的能力。
+        onOpenLocal={revealPath}
+        onOpenUrl={openExternal}
+        // 图片走 Tauri 的 asset 协议（后端在读取文档时动态授权了该文档所在目录）
+        toAssetUrl={toAssetUrl}
+        statFile={ctx.statFile}
+        initialAnchor={ctx.anchor}
+        onAnchorConsumed={ctx.consumeAnchor}
+      />
+    </Suspense>
+  ),
   "cfg-table": (base, ctx) => (
     <CfgTableTab
       tabId={base.tabId}
@@ -3452,6 +3594,7 @@ const APP_BODY_VIEW_RENDERERS: Record<
 /** 页面标题（aria-label / 调试用）。 */
 const APP_BODY_VIEW_TITLES: Record<AppBodyViewId, (lang: ViewLang) => string> = {
   "file-missing": (lang) => (lang === "zh" ? "文件不存在" : "File not found"),
+  "md-view": (lang) => (lang === "zh" ? "Markdown 预览" : "Markdown preview"),
   "cfg-table": (lang) => (lang === "zh" ? "配置表视图" : "Table view"),
   "open-error": (lang) => (lang === "zh" ? "无法打开" : "Cannot open"),
   "text-log": (lang) => (lang === "zh" ? "文本视图" : "Text view"),
@@ -3588,6 +3731,9 @@ export default function App() {
           paths: tabs.map((t) => t.path),
           active: tabs.findIndex((t) => t.id === activeTabId),
           schemas: tabs.map((t) => t.slotsPath ?? null),
+          // 视图模式一起存：否则 Markdown 预览在重启后会掉回文本视图
+          // （表格视图本来也存不住，是因为它依赖 schema 记录，见 schemas）。
+          modes: tabs.map((t) => t.viewMode ?? null),
         })
       );
     } catch {
@@ -3734,6 +3880,95 @@ export default function App() {
     []
   );
 
+  // ---- Markdown 全文（.md tab 的读取结果，key 为 tabId） ----
+  //
+  // 与表格视图同构：读取结果按 tabId 存在 App 里，页面只拿数据、不碰后端。
+  // 文本视图走的是稀疏 tail 会话（分块取行），Markdown 预览要整篇解析，
+  // 所以单独走 `read_text_file`（见 src-tauri/src/document.rs）。
+  const [mdDocs, setMdDocs] = useState<Record<string, MdDoc>>({});
+
+  /**
+   * 「新建 tab 时要带的锚点」暂存（键为小写路径）。
+   *
+   * 只在「目标文档还没打开」时用得上：openPath 会新建 tab，而它不该长一个只有
+   * Markdown 才关心的参数，于是用这个一次性暂存把锚点带过去，建完即删。
+   * 已经打开的 tab 走 openDocAt 里的另一条路径（直接改写 tab.anchor）。
+   */
+  const newTabAnchorRef = useRef<Map<string, string>>(new Map());
+
+  /**
+   * 读取一个 Markdown 文件全文：成功存文本，失败把错误写到该 tab（驱动状态页）。
+   * 返回**内容是否与上次不同** —— 自动刷新据此决定要不要重排版（见 MarkdownView 的「跟随」）。
+   */
+  const loadMd = useCallback(
+    async (tabId: string, mdPath: string): Promise<boolean> => {
+      try {
+        const doc = await invoke<MdDoc>("read_text_file", {
+          path: mdPath,
+          maxBytes: MD_MAX_BYTES,
+        });
+        // 内容一模一样（只是 mtime 变了，例如编辑器「保存了但没改动」或自动保存）
+        // 就不换引用：否则自动刷新会把整篇文档重新解析+重排版一遍，白卡一下。
+        let changed = false;
+        setMdDocs((prev) => {
+          const old = prev[tabId];
+          if (old && old.text === doc.text && old.truncated === doc.truncated) {
+            return prev;
+          }
+          changed = true;
+          return { ...prev, [tabId]: doc };
+        });
+        setTabs((prev) =>
+          prev.map((t) => (t.id === tabId ? { ...t, openError: undefined } : t))
+        );
+        return changed;
+      } catch (e) {
+        // 失败时清掉旧内容：文件已被删/改成读不了，继续展示上一次的正文等于说假话。
+        setMdDocs((prev) => {
+          if (!(tabId in prev)) {
+            return prev;
+          }
+          const next = { ...prev };
+          delete next[tabId];
+          return next;
+        });
+        setTabs((prev) =>
+          prev.map((t) => (t.id === tabId ? { ...t, openError: String(e) } : t))
+        );
+        return false;
+      }
+    },
+    []
+  );
+
+  /** 「重新读取」按钮：失败时不动 tab 状态（错误已由 loadMd 写入或保留）。 */
+  const reloadMd = useCallback(
+    (tabId: string, mdPath: string) => {
+      void loadMd(tabId, mdPath);
+    },
+    [loadMd]
+  );
+
+  /**
+   * 自动刷新用：读到内容后由 `loadMd` 自己判断「是否真的变了」，返回变化与否。
+   *
+   * 为什么不让 MarkdownView 直接调 `reloadMd`：一次无条件重读会把「保存但没改内容」
+   * 也走成整篇重解析 + 重排版；判断放在这里（比较的是 App 手里的上一份正文），
+   * 页面只需要「闪一下提示」。
+   */
+  const reloadMdIfChanged = useCallback(
+    (tabId: string, mdPath: string): Promise<boolean> => loadMd(tabId, mdPath),
+    [loadMd]
+  );
+
+  /** 查询文件 mtime/大小：Markdown 页的「跟随」用它做轮询（见 MarkdownView）。 */
+  const statTextFile = useCallback(
+    (path: string): Promise<{ mtimeMs: number; size: number }> =>
+      invoke<{ mtimeMs: number; size: number }>("stat_text_file", { path }),
+    []
+  );
+
+
   /** 通过文件对话框添加一个 schema：备份进应用数据目录后注册，返回备份路径（取消 null）。 */
   const importSchemaViaDialog = useCallback(async (): Promise<string | null> => {
     try {
@@ -3801,7 +4036,7 @@ export default function App() {
     [parseCfg]
   );
 
-  // 恢复：挂载时读上次会话，重建标签页并重新打开文件（默认全部按文本打开）。
+  // 恢复：挂载时读上次会话，重建标签页并按各自的视图模式重新打开。
   useEffect(() => {
     const saved = readSavedTabs();
     restoredRef.current = true; // 先标记完成，避免后续保存被跳过
@@ -3819,19 +4054,22 @@ export default function App() {
       }
       seen.add(key);
       const id = nextTabId();
+      const savedMode = saved.modes?.[i];
       list.push({
         id,
         title: p.split(/[\\/]/).pop() || p,
         path: p,
+        // 老存档（或该 tab 没有记录模式）按扩展名推断：Markdown 文件恢复成预览。
+        viewMode: savedMode ?? defaultViewModeFor(p),
         slotsPath: saved.schemas?.[i] ?? null,
       });
     }
     setTabs(list);
     setActiveTabId(list[saved.active]?.id ?? list[list.length - 1]?.id ?? null);
     for (const t of list) {
-      // 逐个打开；文件已被删除/移动时失败信息记到 tab，正文区显示
+      // 逐个按各自模式打开；文件已被删除/移动时失败信息记到 tab，正文区显示
       // 「文件不存在」定制页（含重新检测 / 重新定位等修复入口）。
-      void openTabFile(t.id, t.path);
+      void reopenTab(t);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -4032,7 +4270,9 @@ export default function App() {
   const openTabFile = useCallback(async (tabId: string, path: string): Promise<boolean> => {
     try {
       await invoke("open_log_file", { tabId, path });
-      setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, openError: undefined } : t)));
+      setTabs((prev) =>
+        prev.map((t) => (t.id === tabId ? { ...t, openError: undefined, textOpened: true } : t))
+      );
       return true;
     } catch (e) {
       // 打开失败：错误记在 tab 上，正文区按分类显示对应状态页（见 bodyViews）。
@@ -4050,15 +4290,19 @@ export default function App() {
   /** 按 tab 当前的视图模式重新打开它（返回是否成功）。 */
   const reopenTab = useCallback(
     (tab: TabInfo): Promise<boolean> => {
-      const mode = tab.viewMode ?? "text";
+      const mode = tab.viewMode ?? defaultViewModeFor(tab.path);
+      if (mode === "md") {
+        return loadMd(tab.id, tab.path);
+      }
       return mode === "cfg" && tab.slotsPath
         ? parseCfg(tab.id, tab.path, tab.slotsPath)
         : openTabFile(tab.id, tab.path);
     },
-    [openTabFile, parseCfg]
+    [loadMd, openTabFile, parseCfg]
   );
 
-  // 打开新文件：新建一个 tab（默认文本视图；MemoryPack 表格视图由用户手动切换）。
+  // 打开新文件：新建一个 tab。视图模式按扩展名推断（.md/.markdown 直接进 Markdown
+  // 预览），其余按文本日志打开；表格视图涉及 schema 选择，始终由用户手动切换。
   // 同路径（Windows 大小写不敏感）已有 tab 时直接激活，不重复打开。
   const tabsRef = useRef<TabInfo[]>([]);
   tabsRef.current = tabs;
@@ -4079,32 +4323,73 @@ export default function App() {
       }
       const id = nextTabId();
       const name = selected.split(/[\\/]/).pop() || selected;
+      const viewMode = defaultViewModeFor(selected);
+      // 跨文档链接带来的锚点（openDocAt 暂存）：建 tab 时带上，页面渲染后跳转
+      const anchor = newTabAnchorRef.current.get(key);
+      newTabAnchorRef.current.delete(key);
       // 记录到最近打开历史（去重、上限 10 条；不做存在性检查，失效路径由
       // 正文区的「文件不存在」状态页负责说明）。
       setRecentPaths((prev) => pushRecentPath(prev, selected));
       // 先建 tab，再让后端打开文件；失败时正文区显示对应状态页。
-      setTabs((prev) => [...prev, { id, title: name, path: selected }]);
+      setTabs((prev) => [...prev, { id, title: name, path: selected, viewMode, anchor }]);
       setActiveTabId(id);
-      await openTabFile(id, selected);
+      if (viewMode === "md") {
+        await loadMd(id, selected);
+      } else {
+        await openTabFile(id, selected);
+      }
     },
-    [openTabFile, reopenTab]
+    [loadMd, openTabFile, reopenTab]
   );
 
-  /** 切换指定 tab 的视图模式；切到表格时按该 tab 选择的 schema 解析（必须手动指定）。 */
+  /** 打开另一个文档（可选锚点）：走 App 既有的 openPath，锚点写进目标 tab 的状态。 */
+  const openDocAt = useCallback(
+    (docPath: string, anchor?: string) => {
+      if (anchor) {
+        const key = docPath.toLowerCase();
+        // 已打开的 tab：直接改写它的 anchor（会触发一次重渲染，页面据此跳转）
+        const existing = tabsRef.current.find((t) => t.path.toLowerCase() === key);
+        if (existing) {
+          setTabs((prev) => prev.map((t) => (t.id === existing.id ? { ...t, anchor } : t)));
+        }
+        // 还没打开的 tab：由 openPath 新建时带上（见 NewTabAnchorRef）
+        newTabAnchorRef.current.set(key, anchor);
+      }
+      void openPath(docPath);
+    },
+    [openPath]
+  );
+
+  /**
+   * 切换指定 tab 的视图模式。
+   *
+   * 切到表格：按该 tab 选择的 schema 解析（必须手动指定）。
+   * 切到 Markdown：读取全文；从表格切走时清掉 openError（那条错误说的是 bin 解析失败，
+   * 与 Markdown 无关，留着会让新页面一进来就显示别人的错误）。
+   */
   const switchViewMode = useCallback(
-    (tabId: string, mode: "text" | "cfg", binPath: string, slotsPath: string) => {
+    (tabId: string, mode: ViewMode, binPath: string, slotsPath: string) => {
       setTabs((prev) =>
         prev.map((t) =>
           t.id === tabId
-            ? { ...t, viewMode: mode, openError: mode === "cfg" ? undefined : t.openError }
+            ? { ...t, viewMode: mode, openError: mode === "text" ? t.openError : undefined }
             : t
         )
       );
       if (mode === "cfg") {
         void parseCfg(tabId, binPath, slotsPath);
+      } else if (mode === "md") {
+        void loadMd(tabId, binPath);
+      } else {
+        // 切回文本视图：只有「从没开过文本会话」的 tab 才需要补 open_log_file
+        // （Markdown 预览直接打开的 tab 就是这种），否则会白清一次已加载内容。
+        const tab = tabsRef.current.find((t) => t.id === tabId);
+        if (tab && !tab.textOpened) {
+          void openTabFile(tabId, binPath);
+        }
       }
     },
-    [parseCfg]
+    [loadMd, openTabFile, parseCfg]
   );
 
   // 文件拖拽打开：监听 Tauri 原生拖放事件（Windows 上走 WebView2 原生 DnD，
@@ -4145,7 +4430,8 @@ export default function App() {
     try {
       const selected = await open({
         multiple: false,
-        filters: [{ name: appT.openDialogName, extensions: ["log", "txt", "bin", "*"] }],
+        // 扩展名只是给对话框的默认过滤器；`*` 一直保留（日志没有固定后缀）。
+        filters: [{ name: appT.openDialogName, extensions: ["log", "txt", "md", "markdown", "bin", "*"] }],
       });
       if (typeof selected === "string") {
         await openPath(selected);
@@ -4234,9 +4520,17 @@ export default function App() {
 
   const closeTab = useCallback(
     (id: string) => {
-      // 无论文本还是表格视图，后端会话都要清理。
+      // 无论文本、表格还是 Markdown 视图，后端会话与页面缓存都要清理。
       void invoke("close_tab", { tabId: id });
       setCfgTables((prev) => {
+        if (!(id in prev)) {
+          return prev;
+        }
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      setMdDocs((prev) => {
         if (!(id in prev)) {
           return prev;
         }
@@ -4848,6 +5142,18 @@ export default function App() {
                   error: classifyOpenError(t.openError),
                   cfg: cfgTables[t.id] ?? null,
                   pickSchema: (tabId, path) => void pickCfgSchema(tabId, path),
+                  md: mdDocs[t.id] ?? null,
+                  reloadMd,
+                  reloadMdIfChanged,
+                  openDoc: openDocAt,
+                  anchor: t.anchor ?? null,
+                  consumeAnchor: () => {
+                    // 写回 undefined：锚点是一次性指令，消费完就清，避免重渲染时反复跳
+                    setTabs((prev) =>
+                      prev.map((x) => (x.id === t.id && x.anchor ? { ...x, anchor: undefined } : x))
+                    );
+                  },
+                  statFile: statTextFile,
                 }}
                 base={{
                   tabId: t.id,
@@ -4911,6 +5217,7 @@ export default function App() {
             {(
               [
                 { id: "text", name: appT.viewModeTextName, desc: appT.viewModeTextDesc },
+                { id: "md", name: appT.viewModeMdName, desc: appT.viewModeMdDesc },
                 { id: "cfg", name: appT.viewModeCfgName, desc: appT.viewModeCfgDesc },
               ] as const
             ).map((m) => {

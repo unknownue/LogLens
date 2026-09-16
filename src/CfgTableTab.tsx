@@ -6,7 +6,7 @@ import { computeColumnWidths } from "./cfg-columns";
 import { fmtValue } from "./cfg-types";
 import type { ClientCfgTable, CfgColumn, CfgValue } from "./cfg-types";
 import { langOfPath } from "./cfg-types";
-import { useBodyViewEffects, type BodyViewProps, type ViewLang } from "./views";
+import { useBodyViewEffects, ViewToggleButton, type BodyViewProps, type ViewLang } from "./views";
 
 // 这些类型/纯函数已拆到 cfg-types.ts / cfg-columns.ts，此处原样再导出，
 // 保持既有 import 路径（App.tsx 等）不变。
@@ -16,27 +16,6 @@ export { fmtValue, computeColumnWidths };
 // ==================== 组件 ====================
 
 const BASE_ROW_HEIGHT = 26;
-
-/**
- * 工具栏最左侧的「切换视图」图标按钮。
- * 表格视图下它是切回文本视图的唯一入口，所以三条渲染分支（解析中/解析失败/正常）
- * 都必须带上它 —— 否则解析失败时用户会被困在表格视图里。
- * 图标表示「将要切到的视图」：当前表格 → 显示文本图标。
- */
-function ViewToggleButton({ title, onClick }: { title: string; onClick: () => void }) {
-  return (
-    <button
-      className="icon-btn toolbar-icon view-toggle on"
-      onClick={onClick}
-      aria-pressed={true}
-      title={title}
-    >
-      <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
-        <path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h6" stroke="currentColor" strokeWidth="1.55" />
-      </svg>
-    </button>
-  );
-}
 
 /** 表格视图的专属属性（`lang` 在本页叫 `uiLang`：与配置数据语言区分）。 */
 export interface CfgTableTabProps
