@@ -156,14 +156,32 @@ test("the app view table declares exactly one fallback and unique ids", () => {
   );
   assert.deepEqual(
     reg.definitions.map((d) => d.id),
-    ["file-missing", "cfg-table", "open-error", "text-log"]
+    ["file-missing", "md-view", "cfg-table", "open-error", "text-log"]
   );
+  // 内容视图（表格 / Markdown）必须排在通用错误页之前，否则它们自带的
+  // 「失败 + 重试 / 重选 schema」面板永远没机会出现。
+  const priorities = Object.fromEntries(APP_BODY_VIEWS.map((s) => [s.id, s.priority]));
+  assert.ok(priorities["md-view"] > priorities["open-error"]);
+  assert.ok(priorities["md-view"] > priorities["cfg-table"], "Markdown 页的失败面板要在最前");
+  assert.ok(priorities["file-missing"] > priorities["md-view"], "文件不存在时谁都不能抢");
 });
 
 test("a healthy tab resolves to the text view", () => {
   assert.equal(resolveAppBodyViewId(state(ok)), "text-log");
   assert.equal(resolveAppBodyViewId(state(ok, "text")), "text-log");
   assert.equal(resolveAppBodyViewId(state(ok, "cfg")), "cfg-table");
+  assert.equal(resolveAppBodyViewId(state(ok, "md")), "md-view");
+});
+
+test("a markdown tab keeps the markdown view for read errors (it has its own retry)", () => {
+  const readErr = classifyOpenError("读取失败: 拒绝访问。 (os error 5)");
+  assert.equal(
+    resolveAppBodyViewId(state(readErr, "md")),
+    "md-view",
+    "读取失败要留在 Markdown 页（那里有「重试」），而不是被换成一行通用报错"
+  );
+  // 同一个错误在文本视图下仍然是通用错误页
+  assert.equal(resolveAppBodyViewId(state(readErr, "text")), "open-error");
 });
 
 test("a missing file wins over every content view", () => {
@@ -171,6 +189,8 @@ test("a missing file wins over every content view", () => {
   assert.equal(resolveAppBodyViewId(state(missing, "text")), "file-missing");
   // 表格视图下 bin 丢了：同样是「文件不存在」页面（表格视图拿不到数据）
   assert.equal(resolveAppBodyViewId(state(missing, "cfg")), "file-missing");
+  // Markdown 文档被删除：也走「文件不存在」页（没有内容可渲染）
+  assert.equal(resolveAppBodyViewId(state(missing, "md")), "file-missing");
 });
 
 test("a missing schema keeps the table view (so the schema can be re-picked)", () => {
