@@ -11,6 +11,7 @@ Designed for large log files: follow them in real time and browse anywhere witho
 - **Find in content** — a VSCode-style floating widget (`Ctrl+F`); forward search, match-case and whole-word, Enter to step through hits. Its scope follows the filter.
 - **Sparse virtual scrolling** — the scrollbar maps the whole file; unloaded regions load on demand.
 - **Line index** — a sampled byte-offset index makes line lookups O(sample gap) instead of a full scan.
+- **Status bar & file encoding** — a 24px bar at the bottom shows the active file's live line count and the **text encoding it is decoded with**. Click the encoding to open a picker with a live preview (the file's first lines decoded with the highlighted encoding) and switch between UTF-8, UTF-16 LE/BE, GB18030 / GBK / Big5, Shift_JIS, EUC-JP, EUC-KR and the Windows-125x pages. Detection is automatic (BOM → valid UTF-8 → GB18030 fallback) and the status bar says *why* it picked that encoding. Everything is decoded through one layer, so filtering, find, jump-to-line, sparse scrolling and the Markdown view all honour it — GBK logs no longer turn into `����`, and UTF-16 files (PowerShell `Out-File`) split on their 2-byte line terminator instead of being torn in half. The choice is per tab and survives a restart. Guide: [docs/encoding.md](docs/encoding.md).
 - **Session restore** — reopens the previous tabs, and reuses the last window size.
 - **Extras** — multi-tab, jump-to-line, keyword highlighting, copy-view, recent files, bilingual UI (中文 / English), custom borderless title bar.
 - **Config-table viewer** — switch a tab to a GM10 `client_cfg` (MemoryPack) table view via the icon button at the left of its toolbar; columns size themselves to their content. Format spec: [docs/client_cfg_bin_format.md](docs/client_cfg_bin_format.md).
@@ -41,9 +42,11 @@ node --test tools/verify-markdown.test.mjs     # markdown pipeline rules (no bro
 node --test tools/verify-settings.test.mjs     # settings / font-stack rules + CSS consistency
 node --test tools/verify-md-sample.test.mjs    # markdown sample doc (repro/md-sample.md)
 node --test tools/verify-feature-test.test.mjs # feature-test docs (repro/md-feature-test*.md)
+node --test tools/verify-encoding.test.mjs     # encoding rules + front/back contract + decode guard
 node tools/e2e-file-missing.mjs --launch       # browser E2E (run `pnpm run dev` first)
 node tools/e2e-markdown.mjs --launch           # markdown-view E2E (sanitizing/math/find/links)
 node tools/e2e-settings.mjs --launch           # settings E2E (fonts applied to log/table/markdown)
+node tools/e2e-encoding.mjs --launch           # status bar + encoding picker E2E (line count / BOM label / preview)
 node tools/smoke-release.mjs --shot %TEMP%\loglens-smoke   # packaged-exe smoke: real WebView2 + real CSP
                                                # (run `make loglens-build` first; catches CSP/inline-style)
 ```
@@ -64,6 +67,7 @@ Installer output: `src-tauri/target/release/bundle/nsis/LogLens_<version>_x64-se
 | Layer | Source |
 |-------|--------|
 | Incremental reads | `src-tauri/src/tail.rs` |
+| Text encoding (detect / decode / line terminators) | `src-tauri/src/encoding.rs` — see [docs/encoding.md](docs/encoding.md) |
 | Line index | `src-tauri/src/index.rs` |
 | Filtering | `src-tauri/src/filter.rs` |
 | Find in content | `src-tauri/src/search.rs` |
@@ -74,6 +78,7 @@ Installer output: `src-tauri/target/release/bundle/nsis/LogLens_<version>_x64-se
 | Markdown pipeline (GFM + footnotes + math + highlight + sanitize) | `src/markdown/` — see [docs/markdown-view.md](docs/markdown-view.md) |
 | Body pages (text / table / markdown / file-missing / open-error) | `src/views/` — see [docs/body-views.md](docs/body-views.md) |
 | Settings & fonts (modal page, non-CJK/CJK font stack, CSS variables) | `src/settings/` — see [docs/settings.md](docs/settings.md) |
+| Status bar & encoding picker (line count + encoding modal with preview) | `src/statusbar/` — see [docs/encoding.md](docs/encoding.md) |
 | Rendering | `src/App.tsx` |
 
 Release profile (`src-tauri/Cargo.toml`): `opt-level = 3`, fat LTO, `codegen-units = 1`, `strip = true`, `panic = "abort"`.

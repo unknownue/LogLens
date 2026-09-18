@@ -4,9 +4,11 @@
 //! 因此这里的核心职责是「读取」+「限流」：默认封顶 [`DEFAULT_MAX_BYTES`]，
 //! 超大文件退化成截断预览，避免把内存打满 / 把 IPC 主线程卡死。
 //!
-//! 另外两件与预览配套的事：
+//! 另外三件与预览配套的事：
 //! - [`stat_text_file`]：只看 metadata（mtime + size），供前端轮询「文档是否被改动」；
-//! - [`read_text_file`] 读取成功后的 asset 协议动态授权：让正文里引用的本地图片可加载。
+//! - [`read_text_file`] 读取成功后的 asset 协议动态授权：让正文里引用的本地图片可加载；
+//! - 按 `encoding` 参数解码（含自动探测）：Markdown 与日志视图用同一套编码支持，
+//!   中文 GBK 写的说明文档一样能正常渲染。
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -23,10 +25,6 @@ use tracing::instrument;
 /// 内容不完整但界面可用，且 `truncated` 字段让前端能明确提示「仅预览前 N 字节」。
 pub const DEFAULT_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-/// UTF-8 BOM：带 BOM 的 Markdown 首行标题会被解析器当成普通文本，
-/// 因此解码前必须剥掉。
-const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
-
 /// 整读文本文件的结果（供 Markdown 预览）。
 #[derive(Debug, serde::Serialize)]
 pub struct TextFilePayload {
@@ -37,6 +35,8 @@ pub struct TextFilePayload {
     pub bytes: u64,
     /// 是否因超过上限被截断（`text` 只是前 `cap` 个字节）。
     pub truncated: bool,
+    /// 本篇文档实际按哪种编码解码（前端状态栏/编码弹窗显示）。
+    pub encoding: crate::encoding::EncodingInfo,
 }
 
 /// 文件「最后修改时间 + 字节数」快照：前端判断「文档是否被改动」的唯一依据。
@@ -95,34 +95,48 @@ pub fn stat_text_file(path: String) -> Result<TextFileStat, String> {
 /// `max_bytes` 为 `None` 时用 [`DEFAULT_MAX_BYTES`]。只读取前 `min(文件大小, 上限)`
 /// 个字节（`Read::take` 限流，不把整个文件读进内存后再截断）。
 ///
+/// `encoding` 是用户的编码选择：`None`/空/`"auto"` 走自动探测，否则是目录 id
+/// （见 [`crate::encoding`]）。返回值里带上实际生效的编码，前端据此同步状态栏。
+///
 /// 读取成功后额外把**文档所在目录**动态加入 asset 协议 scope（理由见
 /// [`authorize_document_dir`]），这样正文里引用的本地图片才能被 webview 加载。
-/// `app` 只用于该授权，对前端不可见：前端仍按 `{ path, maxBytes }` 调用。
+/// `app` 只用于该授权，对前端不可见：前端仍按 `{ path, maxBytes, encoding }` 调用。
 #[instrument(skip(app), fields(bytes = max_bytes.unwrap_or(DEFAULT_MAX_BYTES)))]
 #[tauri::command]
 pub fn read_text_file(
     app: tauri::AppHandle,
     path: String,
     max_bytes: Option<u64>,
+    encoding: Option<String>,
 ) -> Result<TextFilePayload, String> {
     let path = PathBuf::from(path);
     // 先取正文：只有读成功了才谈得上「这篇文档要显示图片」。
-    let payload = read_text_file_impl(&path, max_bytes)?;
+    let choice = encoding.unwrap_or_default();
+    let payload = read_text_file_impl(&path, max_bytes, &choice)?;
     authorize_document_dir(&app, &path);
     Ok(payload)
 }
 
-/// [`read_text_file`] 的实现体：只负责「读 + 限流」，不依赖 Tauri runtime。
+/// [`read_text_file`] 的实现体：只负责「读 + 限流 + 解码」，不依赖 Tauri runtime。
 ///
 /// 为什么把实现从命令里抽出来：命令签名带 `tauri::AppHandle`，单元测试里既没有
 /// 也无法构造 Tauri runtime，直接测命令就得先拉起整个应用；拆出 impl 后，测试打的
 /// 是同一份真实逻辑，命令退化成「调 impl + 授权 scope」的薄壳。
-fn read_text_file_impl(path: &Path, max_bytes: Option<u64>) -> Result<TextFilePayload, String> {
+fn read_text_file_impl(
+    path: &Path,
+    max_bytes: Option<u64>,
+    encoding_choice: &str,
+) -> Result<TextFilePayload, String> {
     require_file(path)?;
     let size = path
         .metadata()
         .map(|m| m.len())
         .map_err(|e| format!("读取失败: {}", e))?;
+
+    // 编码在读取前解析：`auto` 要探测文件头部，具体 id 则直接用。
+    let resolved = crate::encoding::resolve(path, encoding_choice);
+    let def = resolved.def;
+    let info = crate::encoding::info(encoding_choice, resolved);
 
     let cap = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
     // take 让 read_to_end 最多读 cap 字节：截断发生在 IO 层，超限部分根本不进内存。
@@ -134,13 +148,15 @@ fn read_text_file_impl(path: &Path, max_bytes: Option<u64>) -> Result<TextFilePa
         .read_to_end(&mut buf)
         .map_err(|e| format!("读取失败: {}", e))?;
 
-    // 截断点可能落在多字节字符中间：lossy 解码把不完整序列替换为 U+FFFD，绝不 panic。
-    let text = String::from_utf8_lossy(strip_bom(&buf)).into_owned();
+    // BOM 由编码层剥离（按所选编码的 BOM，不再只认 UTF-8）。
+    // 截断点可能落在多字节字符中间：按编码 lossy 解码把不完整序列替换为 U+FFFD，绝不 panic。
+    let text = crate::encoding::decode_all(crate::encoding::strip_bom(&buf, def), def).into_owned();
 
     Ok(TextFilePayload {
         text,
         bytes: size,
         truncated: size > cap,
+        encoding: info,
     })
 }
 
@@ -187,11 +203,8 @@ fn authorize_document_dir(app: &tauri::AppHandle, path: &Path) {
     }
 }
 
-/// 剥掉开头的 UTF-8 BOM（无 BOM 时原样返回）。
-fn strip_bom(buf: &[u8]) -> &[u8] {
-    buf.strip_prefix(UTF8_BOM).unwrap_or(buf)
-}
-
+/// 剥掉开头的 BOM 由 [`crate::encoding::strip_bom`] 负责（按所选编码的 BOM，
+/// 不再只认 UTF-8 —— GBK 文档里的 UTF-8 BOM 三个字节就是普通内容，不该被吃掉）。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,8 +228,25 @@ mod tests {
     /// 直呼 [`read_text_file_impl`]：命令签名的 `tauri::AppHandle` 在单测里构造不出来
     /// （那需要一整个 Tauri runtime），所以读取类测试一律打 impl。命令与 impl 之间只有
     /// 「授权 asset scope」这一行差别，读取逻辑是同一份。
+    ///
+    /// 默认走自动探测（空选择），与前端不传 `encoding` 时的行为一致。
     fn read(path: &str, max_bytes: Option<u64>) -> Result<TextFilePayload, String> {
-        read_text_file_impl(Path::new(path), max_bytes)
+        read_text_file_impl(Path::new(path), max_bytes, "")
+    }
+
+    /// 指定编码读取。
+    fn read_with(
+        path: &str,
+        max_bytes: Option<u64>,
+        encoding: &str,
+    ) -> Result<TextFilePayload, String> {
+        read_text_file_impl(Path::new(path), max_bytes, encoding)
+    }
+
+    /// 按目录里的编码把文本编成字节（造测试输入用）。
+    fn encode(text: &str, encoding_id: &str) -> Vec<u8> {
+        let def = crate::encoding::lookup(encoding_id).expect("目录里应有该编码");
+        def.enc.encode(text).0.into_owned()
     }
 
     /// 正常读取：中文按 UTF-8 解码，bytes 是真实字节数而非字符数。
@@ -234,7 +264,7 @@ mod tests {
     /// 带 BOM 的文件：BOM 必须剥掉，否则首行标题会被渲染成正文。
     #[test]
     fn strips_utf8_bom() {
-        let mut content = UTF8_BOM.to_vec();
+        let mut content = vec![0xEF, 0xBB, 0xBF];
         content.extend_from_slice("# 标题\n正文\n".as_bytes());
         let (path, _f) = temp_path(&content);
 
@@ -309,15 +339,91 @@ mod tests {
         }
     }
 
-    /// 非法 UTF-8 字节（非截断导致）：同样 lossy 替换，不 panic。
+    /// 非法 UTF-8 字节（非截断导致）：显式按 UTF-8 读时同样 lossy 替换，不 panic。
     #[test]
     fn invalid_utf8_bytes_are_replaced_lossily() {
         let (path, _f) = temp_path(&[b'a', 0xFF, 0xFE, b'b']);
 
-        let got = read(&path, None).unwrap();
+        let got = read_with(&path, None, "utf-8").unwrap();
         assert!(!got.truncated);
         assert!(got.text.starts_with('a') && got.text.ends_with('b'));
         assert!(got.text.contains('\u{FFFD}'), "非法字节应替换为 U+FFFD");
+    }
+
+    /// 同一份文件走自动探测时不再按 UTF-8 硬解 —— 这正是编码支持的意义：
+    /// 非法 UTF-8 的字节序列交给兜底编码（GB18030）去解，字节组合能配对就还原成
+    /// 一个汉字，而不是一律 U+FFFD。这条用例钉住「自动探测确实换了编码」，
+    /// 避免哪天又退回「一律 lossy UTF-8」。
+    #[test]
+    fn auto_detection_does_not_force_utf8_on_invalid_bytes() {
+        let raw = [b'a', 0xFF, 0xFE, b'b'];
+        let (path, _f) = temp_path(&raw);
+
+        let got = read(&path, None).unwrap();
+        assert_eq!(
+            got.encoding.id,
+            crate::encoding::FALLBACK_ID,
+            "非法 UTF-8 应落到兜底编码，实测 {:?}",
+            got.encoding.id
+        );
+        assert_eq!(got.encoding.source, "fallback");
+        assert!(got.text.starts_with('a'), "ASCII 前缀应保持不变");
+
+        // 与「一律按 UTF-8 lossy」的结果必须不同：否则说明编码参数根本没生效。
+        let utf8_lossy = read_with(&path, None, "utf-8").unwrap();
+        assert_ne!(
+            got.text, utf8_lossy.text,
+            "自动探测与显式 UTF-8 应给出不同的解码结果"
+        );
+        // 收尾的 'b'(0x62) 在 GB18030 里是前一个字节 0xFE 的尾字节，会被一并吃掉。
+        assert!(!got.text.ends_with('\u{FFFD}'), "GB18030 能配对完整字节");
+    }
+
+    /// GBK 写的 Markdown：按 GBK 读能还原中文（`encoding` 参数与自动探测两条路都要通）。
+    #[test]
+    fn decodes_gbk_markdown() {
+        let content = "# 标题\n\n正文：你好，世界。\n";
+        let bytes = encode(content, "gbk");
+        let (path, _f) = temp_path(&bytes);
+
+        // 显式指定。
+        let got = read_with(&path, None, "gbk").unwrap();
+        assert_eq!(got.text, content);
+        assert_eq!(got.encoding.id, "gbk");
+        assert_eq!(got.encoding.source, "manual");
+
+        // 自动探测：GBK 字节不是合法 UTF-8 → 落到兜底编码，中文同样正确。
+        let auto = read(&path, None).unwrap();
+        assert_eq!(auto.text, content);
+        assert_eq!(auto.encoding.source, "fallback");
+    }
+
+    /// 别名（`cp936` / `936`）也要能选上，否则前端存档里存过一次就再也开不回来。
+    #[test]
+    fn encoding_aliases_are_accepted() {
+        let bytes = encode("中文", "gbk");
+        let (path, _f) = temp_path(&bytes);
+        for alias in ["cp936", "936", "GBK", "gb2312"] {
+            let got = read_with(&path, None, alias).unwrap();
+            assert_eq!(got.text, "中文", "别名 {alias} 应解出正确文本");
+            assert_eq!(got.encoding.id, "gbk", "别名 {alias} 应归一化到目录 id");
+        }
+    }
+
+    /// UTF-16LE（PowerShell `Out-File` 的默认输出）带 BOM：整读要按 2 字节编码解码。
+    #[test]
+    fn decodes_utf16le_with_bom() {
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in "# 标题\n正文\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let (path, _f) = temp_path(&bytes);
+
+        let got = read(&path, None).unwrap();
+        assert_eq!(got.text, "# 标题\n正文\n");
+        assert_eq!(got.encoding.id, "utf-16le");
+        assert_eq!(got.encoding.source, "bom");
+        assert!(got.encoding.bom);
     }
 
     /// 不存在 → 错误文案带「文件不存在」前缀与路径（前端据此走 missing 页）。

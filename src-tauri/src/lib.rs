@@ -2,6 +2,7 @@
 
 mod client_cfg;
 mod document;
+mod encoding;
 mod filter;
 mod fonts;
 mod index;
@@ -36,6 +37,10 @@ fn init_tracy() {
 fn init_tracy() {}
 
 /// 打开日志文件并开始 tail-follow（针对指定 tab）。
+///
+/// `encoding` 是用户对该文件的编码**选择**：`None`/空/`"auto"` 表示自动探测
+/// （见 [`encoding::detect_file`]），否则是目录里的编码 id（接受 `cp936` 之类的
+/// 别名）。返回值是解析后的编码信息，前端状态栏据此显示「UTF-8」「GB18030」等。
 #[instrument(skip(app, state), fields(tab_id = %tab_id, path = %path))]
 #[tauri::command]
 fn open_log_file(
@@ -43,7 +48,8 @@ fn open_log_file(
     state: tauri::State<'_, Arc<AppState>>,
     tab_id: String,
     path: String,
-) -> Result<(), String> {
+    encoding: Option<String>,
+) -> Result<encoding::EncodingInfo, String> {
     let path = std::path::PathBuf::from(path);
     if !path.is_file() {
         return Err(format!("文件不存在: {}", path.display()));
@@ -52,8 +58,82 @@ fn open_log_file(
     perf::mark(&format!("open:start:{size}"));
 
     let session = state.get_or_create(&tab_id);
-    start_watching_for_session(app, tab_id, session, path);
-    Ok(())
+    Ok(start_watching_for_session(
+        app,
+        tab_id,
+        session,
+        path,
+        encoding.unwrap_or_default(),
+    ))
+}
+
+/// 切换指定 tab 的文本编码（状态栏 → 编码弹窗 → 应用）。
+///
+/// 实现是**整体重建会话**（见 [`AppState::replace_session`]）：编码决定换行符的
+/// 字节形态，行索引 / 已加载窗口 / 历史游标全部随之失效。旧会话的监控线程会被
+/// 停止信号收掉，新会话用新编码重新加载尾部，并通过 `log-lines`（`reset = true`）
+/// 让前端整体替换视图 —— 前端不需要为「换编码」写任何专门的刷新逻辑。
+///
+/// 过滤条件会被搬到新会话（用户不该因为换编码丢掉正在过滤的关键词）。
+#[instrument(skip(app, state), fields(tab_id = %tab_id, encoding = %encoding))]
+#[tauri::command]
+fn set_encoding(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+    tab_id: String,
+    encoding: String,
+) -> Result<encoding::EncodingInfo, String> {
+    let path = {
+        let session = state
+            .get(&tab_id)
+            .ok_or_else(|| format!("tab 不存在: {}", tab_id))?;
+        // 先落到局部变量：`session` 在块尾被 drop，而 `.lock()` 的守卫若作为块尾
+        // 表达式的临时值会活到整条 `let path = { .. };` 结束 —— 借用比 session 长。
+        let path = session.file_path.lock().clone();
+        path.ok_or_else(|| "tab 未打开文件".to_string())?
+    };
+    if !path.is_file() {
+        return Err(format!("文件不存在: {}", path.display()));
+    }
+    let fresh = state.replace_session(&tab_id);
+    Ok(start_watching_for_session(app, tab_id, fresh, path, encoding))
+}
+
+/// 读取指定 tab 当前生效的编码信息（状态栏刷新 / 切换视图后回填用）。
+#[tauri::command]
+fn get_encoding(
+    state: tauri::State<'_, Arc<AppState>>,
+    tab_id: String,
+) -> Result<Option<encoding::EncodingInfo>, String> {
+    Ok(state.get(&tab_id).and_then(|s| s.encoding_info()))
+}
+
+/// 解析一个文件的编码（不改动任何会话）：状态栏首屏显示、以及 Markdown / 表格这类
+/// 不走文本 tail 会话的视图用。
+///
+/// `encoding` 与 [`read_text_file`] 同义：`None`/空/`"auto"` 走自动探测，否则按用户
+/// 指定的编码解析。**不能在这里偷偷忽略用户的选择**：一个手动钉死 GBK 的 tab 若被
+/// 探测成 UTF-8，状态栏显示的编码就和正文实际用的那个不一致了。
+/// 无法判定时返回兜底编码而不是报错。
+#[tauri::command]
+fn detect_encoding(
+    path: String,
+    encoding: Option<String>,
+) -> Result<encoding::EncodingInfo, String> {
+    let path = std::path::PathBuf::from(&path);
+    if !path.is_file() {
+        return Err(format!("文件不存在: {}", path.display()));
+    }
+    let choice = encoding.unwrap_or_default();
+    let resolved = encoding::resolve(&path, &choice);
+    Ok(encoding::info(&choice, resolved))
+}
+
+/// 可选编码目录（编码弹窗的列表）：id / 展示名 / 别名 / 分组。
+/// 分组标题的中英文案在前端（`src/encoding/EncodingModal.tsx`），这里只给稳定分组键。
+#[tauri::command]
+fn list_encodings() -> Vec<encoding::EncodingOption> {
+    encoding::options()
 }
 
 /// 设置过滤条件：更新指定 tab 的过滤状态，并通过 log-lines 事件（reset）下发结果。
@@ -77,10 +157,26 @@ fn set_filter(
     let matched = session.apply_filter(spec);
     let total_lines = session.ensure_total_lines().unwrap_or(0);
     let avg_line_len = session.avg_line_len();
-    let _ = app.emit(
-        "log-lines",
-        LinesPayload { tab_id, lines: matched.clone(), reset: true, total_lines, avg_line_len },
-    );
+    // 持 emit_gate 发：取到锁时要么这个会话还没被换掉（这批数据仍然是它的），
+    // 要么已经被换掉（stop 置位）—— 后者不该再发，否则前端会把旧编码解出来的行
+    // 当成新会话的结果贴上去，而且不会自愈。见 TabSession::emit_gate。
+    {
+        let _gate = session.emit_gate.lock();
+        if !session.stop.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = app.emit(
+                "log-lines",
+                LinesPayload {
+                    tab_id,
+                    lines: matched.clone(),
+                    reset: true,
+                    // 过滤重扫：暂停跟随时不应用（恢复跟随时由前端统一补齐）。
+                    apply_when_paused: false,
+                    total_lines,
+                    avg_line_len,
+                },
+            );
+        }
+    }
     Ok(matched)
 }
 
@@ -281,6 +377,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             open_log_file,
+            set_encoding,
+            get_encoding,
+            detect_encoding,
+            list_encodings,
             set_filter,
             close_tab,
             get_lines,

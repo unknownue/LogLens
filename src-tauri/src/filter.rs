@@ -32,6 +32,9 @@ pub struct Filter {
     ac: Option<AhoCorasick>,
     /// 正则（带回溯保护，限制长度）。
     re: Option<Regex>,
+    /// 原始条件（编译后的匹配器只留得下「能不能匹配」，留不住用户填的是什么）。
+    /// 换编码重建会话时要把条件原样搬过去，所以这里存一份。
+    spec: FilterSpec,
 }
 
 impl Filter {
@@ -54,7 +57,12 @@ impl Filter {
             _ => None,
         };
 
-        Self { ac, re }
+        Self { ac, re, spec }
+    }
+
+    /// 原始过滤条件。
+    pub fn spec(&self) -> &FilterSpec {
+        &self.spec
     }
 
     /// 当前是否**真的**在过滤（关键词与正则两侧都为空 = 不过滤，视图即全量）。

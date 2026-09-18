@@ -14,6 +14,7 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
+use crate::encoding::LineTerm;
 use crate::tail::open_shared_file;
 
 /// 采样间隔：每 64 行记录一个行首字节偏移。
@@ -37,16 +38,30 @@ pub struct LineIndex {
     eof_no_newline: bool,
     /// 代际：reset() 时 +1；后台扫描任务持有起始代际，发现变化即退出。
     pub generation: u64,
+    /// 换行符的字节形态（见 [`crate::encoding`]）。
+    ///
+    /// 索引统计的「行」必须与读取路径切出来的「行」是同一个东西，因此两处要用
+    /// 同一份换行符定义：UTF-16 的换行是 2 字节（`0A 00` / `00 0A`），按裸
+    /// `0x0A` 计数会在偏移上错位一格，定位出来的行首全是半个字符。
+    /// 它是**只读**的：换编码时连 reader 带索引整体重建（见 `AppState::replace_session`），
+    /// 没有「就地改换行形态」这条路径。
+    term: LineTerm,
 }
 
 impl LineIndex {
     pub fn new() -> Self {
+        Self::with_term(LineTerm::Lf)
+    }
+
+    /// 按指定换行符形态建索引（UTF-8/GBK 等用 [`LineTerm::Lf`]）。
+    pub fn with_term(term: LineTerm) -> Self {
         Self {
             samples: vec![0],
             covered_bytes: 0,
             lines_upto: 0,
             eof_no_newline: false,
             generation: 0,
+            term,
         }
     }
 
@@ -68,20 +83,30 @@ impl LineIndex {
 
     /// 扫描一段新字节，把换行采样追加进索引。
     /// `start` 必须是 `covered_bytes`（连续推进）；`file_size` 用于判断是否到达 EOF。
+    ///
+    /// 只**提交**换行符宽度的整数倍：调用方已经把要读的长度对齐过了，但实际读到的
+    /// 字节数是另一回事 —— 短读（文件在 `metadata()` 与 `read()` 之间被截断/轮转、
+    /// 非本地盘……）完全可能返回奇数长度。一旦把奇数提交进 `covered_bytes`，之后
+    /// 每个块的起点奇偶就整体翻转，横跨边界的换行符两边都不认（见
+    /// [`LineTerm::align_chunk`]）。把不变量钉在**状态**上，而不是每个调用点上。
+    /// 未提交的尾巴下次会从同一个对齐偏移重读，既不丢也不重。
     fn scan_chunk(&mut self, buf: &[u8], start: u64, file_size: u64) {
         debug_assert_eq!(start, self.covered_bytes);
-        for (i, &b) in buf.iter().enumerate() {
-            if b == b'\n' {
-                self.lines_upto += 1;
-                if self.lines_upto % SAMPLE_EVERY == 0 {
-                    self.samples.push(start + i as u64 + 1);
-                }
+        let term = self.term;
+        let committed = term.align_chunk(buf.len());
+        let buf = &buf[..committed];
+        let mut from = 0usize;
+        while let Some(pos) = term.find(buf, start, from) {
+            self.lines_upto += 1;
+            if self.lines_upto % SAMPLE_EVERY == 0 {
+                self.samples.push(start + pos as u64 + term.len() as u64);
             }
+            from = pos + term.len();
         }
-        let end = start + buf.len() as u64;
+        let end = start + committed as u64;
         self.covered_bytes = end;
         if end >= file_size {
-            self.eof_no_newline = !buf.is_empty() && *buf.last().unwrap() != b'\n';
+            self.eof_no_newline = !buf.is_empty() && !term.ends_with(buf, start);
         }
     }
 
@@ -101,7 +126,22 @@ impl LineIndex {
         let mut scanned = 0u64;
         let mut buf = vec![0u8; 64 * 1024];
         while self.covered_bytes < target {
-            let want = ((target - self.covered_bytes).min(buf.len() as u64)) as usize;
+            // 块长对齐到换行符宽度：见 LineTerm::align_chunk（奇数块会让后续所有块的
+            // 起点奇偶翻转，横跨边界的换行符两边都不认；不足一个换行符宽度的尾巴
+            // 会被整成 0，此时就地停下，留给下一批字节）。
+            let want = self.term.align_chunk(
+                ((target - self.covered_bytes).min(buf.len() as u64)) as usize,
+            );
+            if want == 0 {
+                // 还差不足一个换行符宽度的尾巴。它只可能出现在文件末尾，且不可能
+                // 是完整换行符（换行符只从对齐偏移开始）—— 与读到 EOF 同义：末行
+                // 没有换行结尾。停在尾巴之前，等字节到齐再扫（这正是「写了一半的
+                // 日志」那种场景：UTF-16 文件当前大小是奇数时，最后一个字节就是
+                // 半个换行符；若此刻把它算进 covered_bytes，之后文件增长时那个
+                // 换行符就永远找不回来了）。
+                self.eof_no_newline = true;
+                break;
+            }
             file.seek(SeekFrom::Start(self.covered_bytes))?;
             let n = file.read(&mut buf[..want])?;
             if n == 0 {
@@ -124,7 +164,15 @@ impl LineIndex {
         if self.covered_bytes >= size {
             return Ok(true);
         }
-        let want = ((size - self.covered_bytes).min(budget_bytes)) as usize;
+        let want = self
+            .term
+            .align_chunk(((size - self.covered_bytes).min(budget_bytes)) as usize);
+        if want == 0 {
+            // 结果同上：只剩不足一个换行符宽度的尾巴，扫不动了。**必须在这里返回
+            // true**，否则预热任务会因为「covered 到不了 size」而永远转下去。
+            self.eof_no_newline = true;
+            return Ok(true);
+        }
         file.seek(SeekFrom::Start(self.covered_bytes))?;
         let mut buf = vec![0u8; want];
         let n = file.read(&mut buf)?;
@@ -167,12 +215,15 @@ impl LineIndex {
         let mut read_total = 0u64;
         let mut count = 0u64;
         while read_total < x - base {
-            let want = ((x - base - read_total).min(buf.len() as u64)) as usize;
+            let want = self
+                .term
+                .align_chunk(((x - base - read_total).min(buf.len() as u64)) as usize);
             let n = file.read(&mut buf[..want])?;
             if n == 0 {
                 break;
             }
-            count += buf[..n].iter().filter(|&&b| b == b'\n').count() as u64;
+            // 绝对偏移 = base + 已读字节数（UTF-16 的换行对齐判定要用到）。
+            count += self.term.count(&buf[..n], base + read_total);
             read_total += n as u64;
         }
         Ok(k as u64 * SAMPLE_EVERY + count)
@@ -201,6 +252,7 @@ impl LineIndex {
             return Ok(Some(base));
         }
         // 从 base 向后数 r 个换行；行首 = 第 r 个换行之后的字节。
+        let term = self.term;
         let mut file = open_shared_file(path)?;
         file.seek(SeekFrom::Start(base))?;
         let mut buf = vec![0u8; 64 * 1024];
@@ -211,13 +263,13 @@ impl LineIndex {
             if n == 0 {
                 break; // 理论不可达：line ≤ total 保证换行存在
             }
-            for (i, &b) in buf[..n].iter().enumerate() {
-                if b == b'\n' {
-                    seen += 1;
-                    if seen == r {
-                        return Ok(Some(pos + i as u64 + 1));
-                    }
+            let mut from = 0usize;
+            while let Some(p) = term.find(&buf[..n], pos, from) {
+                seen += 1;
+                if seen == r {
+                    return Ok(Some(pos + p as u64 + term.len() as u64));
                 }
+                from = p + term.len();
             }
             pos += n as u64;
         }
@@ -401,6 +453,227 @@ mod tests {
         assert_eq!(idx.locate_line(f.path(), 4).unwrap(), None);
     }
 
+    // ==================== UTF-16（2 字节换行） ====================
+    //
+    // 这一组的价值在于：索引里的换行计数、采样偏移、行首定位三处代码都要按
+    // **2 字节对齐**匹配 `0A 00`，任何一处退回「数裸 0x0A」都会让行首落在半个
+    // 字符上（读出乱码或 U+FFFD），而 offset 看上去还对得上 —— 属于最难自查的
+    // 那类 bug，必须有测试钉住。
+
+    /// 造一个 UTF-16LE 文件：每行 `行-{i:03}\r\n`（CRLF 也一起覆盖）。
+    fn utf16le_lines_file(count: usize, le: bool) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let mut bytes: Vec<u8> = Vec::new();
+        for i in 0..count {
+            for unit in format!("行-{i:05}\r\n").encode_utf16() {
+                let pair = if le {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                };
+                bytes.extend_from_slice(&pair);
+            }
+        }
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    /// 一行（`行-{i:05}\r\n`）在 UTF-16 下的字节数：码元数 × 2。
+    /// 由内容本身算出来，避免测试里写死一个会随格式漂移的魔数。
+    fn utf16_line_bytes() -> u64 {
+        utf16_line_units() * 2
+    }
+
+    fn utf16_line_units() -> u64 {
+        "行-00000\r\n".encode_utf16().count() as u64
+    }
+
+    #[test]
+    fn utf16_total_lines_and_locate_are_aligned() {
+        let line_bytes = utf16_line_bytes();
+        let f = utf16le_lines_file(200, true);
+        let path = f.path().to_path_buf();
+
+        let mut idx = LineIndex::with_term(LineTerm::Lf16Le);
+        assert_eq!(idx.total_lines(&path).unwrap(), 200);
+        // 跨越采样点（64 行）与端点都要覆盖：行首必须是 2 字节对齐的整行起点。
+        for line in [1u64, 2, 63, 64, 65, 128, 199, 200] {
+            let off = idx
+                .locate_line(&path, line)
+                .unwrap()
+                .unwrap_or_else(|| panic!("line {line} 应在范围内"));
+            assert_eq!(off, (line - 1) * line_bytes, "line {line}");
+            assert_eq!(off % 2, 0, "line {line} 的行首必须 2 字节对齐");
+        }
+        assert!(idx.locate_line(&path, 201).unwrap().is_none());
+
+        // 区间定位与逐行定位自洽（行区间读取走的是 locate_range）。
+        let (start, end) = idx.locate_range(&path, 9, 12).unwrap();
+        assert_eq!((start, end), (9 * line_bytes, 12 * line_bytes));
+    }
+
+    /// 同样的内容用大端序写：换行形态必须跟着换成 `00 0A`，行号才对得上。
+    #[test]
+    fn utf16be_total_lines_and_locate_are_aligned() {
+        let f = utf16le_lines_file(200, false);
+        let path = f.path().to_path_buf();
+
+        let mut idx = LineIndex::with_term(LineTerm::Lf16Be);
+        assert_eq!(idx.total_lines(&path).unwrap(), 200);
+        assert_eq!(
+            idx.locate_line(&path, 65).unwrap(),
+            Some(64 * utf16_line_bytes())
+        );
+    }
+
+    /// 用错换行形态（把 UTF-16LE 当 LF 扫）会数出错误的行数 —— 这条断言说明
+    /// 「索引的 term 必须与读取路径一致」不是可选项。
+    #[test]
+    fn utf16_file_under_lf_term_counts_wrong() {
+        let f = utf16le_lines_file(200, true);
+        let path = f.path().to_path_buf();
+
+        let mut lf_idx = LineIndex::new();
+        let wrong = lf_idx.total_lines(&path).unwrap();
+        assert_ne!(wrong, 200, "按裸 0x0A 扫 UTF-16 必然数错（实测 {wrong}）");
+    }
+
+    /// 末行无换行的 UTF-16 文件：末行计 1 行（`eof_no_newline` 也要按 2 字节判定）。
+    #[test]
+    fn utf16_trailing_line_without_terminator() {
+        let mut bytes: Vec<u8> = Vec::new();
+        for unit in "aa\nbb".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+
+        let mut idx = LineIndex::with_term(LineTerm::Lf16Le);
+        assert_eq!(idx.total_lines(f.path()).unwrap(), 2);
+        assert_eq!(idx.locate_line(f.path(), 2).unwrap(), Some(6)); // "aa\n" = 3 码元 = 6 字节
+    }
+
+    /// 只写完换行符的前一字节（写入进程正写到一半）：不能把它当成一个换行，
+    /// 否则会把半行拆出来、行号提前 +1。
+    #[test]
+    fn utf16_partial_terminator_at_eof_is_not_a_line_break() {
+        let mut bytes: Vec<u8> = Vec::new();
+        for unit in "aa".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.push(0x0A); // 换行符只写进来一半
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+
+        let mut idx = LineIndex::with_term(LineTerm::Lf16Le);
+        assert_eq!(idx.total_lines(f.path()).unwrap(), 1, "半截换行不算换行");
+    }
+
+    /// 块长必须对齐到换行符宽度（`LineTerm::align_chunk` 的存在理由）。
+    ///
+    /// 每行 `"a\n"` 在 UTF-16LE 下是 4 字节，换行符落在偏移 2、6、10…。
+    /// 用 3 字节的预算扫描时，第一块的边界正好是 `2 + 1` —— 横跨边界的那个换行符
+    /// 前一块凑不满 2 字节、后一块的绝对偏移是奇数，两边都不认：行数少 1，
+    /// 之后每个采样偏移都错一行。对齐之后（4 字节对齐成 2）就不会再出现。
+    #[test]
+    fn utf16_scan_step_with_an_odd_budget_still_counts_every_line() {
+        let mut bytes: Vec<u8> = Vec::new();
+        for _ in 0..200 {
+            for unit in "a\n".encode_utf16() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_path_buf();
+
+        let mut idx = LineIndex::with_term(LineTerm::Lf16Le);
+        let mut steps = 0;
+        while !idx.scan_step(&path, 3).unwrap() {
+            steps += 1;
+            assert!(steps < 10_000, "扫描没有推进（budget 被对齐成了 0？）");
+        }
+        assert_eq!(idx.total_lines(&path).unwrap(), 200);
+    }
+
+    /// 同一份文件改用一次性扫完（`total_lines` 走 `ensure_upto`）：结论必须一致。
+    #[test]
+    fn utf16_odd_budget_matches_single_pass_count() {
+        let mut bytes: Vec<u8> = Vec::new();
+        for _ in 0..200 {
+            for unit in "a\n".encode_utf16() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_path_buf();
+
+        let mut incremental = LineIndex::with_term(LineTerm::Lf16Le);
+        let mut steps = 0;
+        while !incremental.scan_step(&path, 7).unwrap() {
+            steps += 1;
+            assert!(steps < 10_000);
+        }
+        let mut single = LineIndex::with_term(LineTerm::Lf16Le);
+        assert_eq!(
+            incremental.total_lines(&path).unwrap(),
+            single.total_lines(&path).unwrap()
+        );
+        assert_eq!(incremental.locate_line(&path, 200).unwrap(), single.locate_line(&path, 200).unwrap());
+    }
+
+    /// **写了一半的 UTF-16 日志随后增长**：横跨「已扫描边界」的那个换行符不能丢。
+    ///
+    /// 场景来自真实用法：日志由别的进程边写边刷，索引的预热任务可能正好在文件大小
+    /// 是奇数（换行符只写进来一半）时扫完。若那时把 `covered_bytes` 推到那个奇数
+    /// 偏移上，等文件增长后，这个换行符前一块凑不满 2 字节、后一块的绝对偏移又是
+    /// 奇数 —— 两边都不认，那一行永久丢失，之后每个采样偏移都错一行。
+    /// 「停在不足一个换行符宽度的尾巴之前」正是为了它。
+    #[test]
+    fn utf16_odd_size_file_then_growth_keeps_every_line() {
+        // 先写 "aa" + 换行符的前一字节：文件大小 5（奇数）。
+        let mut bytes: Vec<u8> = Vec::new();
+        for unit in "aa".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.push(0x0A); // 换行符只写进来一半
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_path_buf();
+
+        let mut idx = LineIndex::with_term(LineTerm::Lf16Le);
+        // 预热扫到它以为的 EOF。
+        let mut steps = 0;
+        while !idx.scan_step(&path, 64).unwrap() {
+            steps += 1;
+            assert!(steps < 1000, "扫描没有推进");
+        }
+        assert_eq!(idx.total_lines(&path).unwrap(), 1, "半截换行时只有一条未完结的行");
+
+        // 写入进程补上换行符的后一字节，再写一行。
+        let mut more: Vec<u8> = vec![0x00];
+        for unit in "bb\n".encode_utf16() {
+            more.extend_from_slice(&unit.to_le_bytes());
+        }
+        f.write_all(&more).unwrap();
+        f.flush().unwrap();
+
+        assert_eq!(idx.total_lines(&path).unwrap(), 2, "增长后必须看到两行");
+        assert_eq!(
+            idx.locate_line(&path, 2).unwrap(),
+            Some(6),
+            "第 2 行应从字节 6 起（\"aa\" + 2 字节换行）"
+        );
+    }
+
     #[test]
     fn locate_range_matches_full_scan_semantics() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -490,7 +763,7 @@ mod tests {
         for i in 0..128usize {
             writeln!(f, "{:09}", i).unwrap(); // 9 + \n = 10 字节
         }
-        for i in 0..128usize {
+        for _ in 0..128usize {
             writeln!(f, "{}", "x".repeat(99)).unwrap(); // 99 + \n = 100 字节
         }
         f.flush().unwrap();

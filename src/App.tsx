@@ -31,6 +31,14 @@ import {
   type AppSettings,
 } from "./settings";
 import {
+  AUTO_ID,
+  EncodingModal,
+  StatusBar,
+  detectEncoding,
+  fetchTabEncoding,
+  type EncodingInfo,
+} from "./statusbar";
+import {
   APP_BODY_VIEWS,
   BodyViewHost,
   BodyViewRegistry,
@@ -96,6 +104,14 @@ interface LinesPayload {
   tab_id: string;
   lines: LogLine[];
   reset: boolean;
+  /**
+   * 暂停跟随时是否仍要应用这批（仅 `reset = true` 时有意义）。
+   *
+   * `true` = 用户动作引起的会话重建（打开文件 / 换编码）：必须生效，否则正文
+   * 永远停在旧编码上且不会自愈。`false` = 实时批次（追加 / 轮转 / 过滤重扫）：
+   * 暂停跟随时按设计丢弃。见 Rust `LinesPayload::apply_when_paused`。
+   */
+  apply_when_paused?: boolean;
   /** 文件当前总行数（实时，随追加增长）。 */
   total_lines: number;
   /** 平均行长（字节/行，来自后端行索引）：占位行高度与滚动条比例的估算依据。 */
@@ -148,6 +164,14 @@ interface TabInfo {
   openError?: string;
   /** 表格视图解析用的 schema 文件路径（手动指定）；null/undefined = 尚未选择。 */
   slotsPath?: string | null;
+  /**
+   * 本 tab 的文本编码**选择**（`auto` 或目录 id，见 `src/statusbar/encoding.ts`）。
+   *
+   * 存「选择」而不是「探测结果」：选了 `auto` 的 tab 重新打开时要重新探测
+   * （文件可能被别的工具改写成了另一种编码），只有用户手动指定的才固化下来。
+   * 表格视图（二进制）不适用，恒为 undefined。
+   */
+  encoding?: string;
 }
 
 /** 文件 tab 右键菜单的展开状态：目标 tab + 光标坐标（portal fixed 定位用）。 */
@@ -199,6 +223,11 @@ interface SavedTabs {
   schemas?: (string | null)[];
   /** 每个 tab 的视图模式（与 paths 下标对齐；null/缺失 = 按扩展名推断）。 */
   modes?: (ViewMode | null)[];
+  /**
+   * 每个 tab 的编码选择（与 paths 下标对齐；null/缺失 = 自动探测）。
+   * 只记用户手动指定的编码：`auto` 的 tab 存 null，下次打开重新探测。
+   */
+  encodings?: (string | null)[];
 }
 
 /** 读取上次会话的标签页（无数据/损坏时返回 null）。 */
@@ -227,11 +256,18 @@ function readSavedTabs(): SavedTabs | null {
           m === "text" || m === "cfg" || m === "md" ? m : null
         )
       : undefined;
+    // 编码同理：老存档没有 encodings 字段，null 即「自动探测」。
+    const encodings = Array.isArray(v.encodings)
+      ? v.encodings.slice(0, paths.length).map((e) =>
+          typeof e === "string" && e.length > 0 ? e : null
+        )
+      : undefined;
     return {
       paths,
       active: typeof v.active === "number" ? v.active : paths.length - 1,
       schemas,
       modes,
+      encodings,
     };
   } catch {
     return null;
@@ -704,6 +740,10 @@ interface Messages {
   winClose: string;
   menuTitle: string;
   menuExit: string;
+  /** 状态栏的编码按钮：打开编码弹窗的悬浮提示（按钮自身文案由 StatusBar 负责）。 */
+  encodingTitle: string;
+  /** 编码弹窗的应用失败（文件此时可能已被删除）。 */
+  encodingFailed: (e: string) => string;
 }
 
 const MESSAGES: Record<Lang, Messages> = {
@@ -836,6 +876,8 @@ const MESSAGES: Record<Lang, Messages> = {
     winClose: "关闭",
     menuTitle: "菜单",
     menuExit: "退出程序",
+    encodingTitle: "文件编码",
+    encodingFailed: (e) => `切换编码失败: ${e}`,
   },
   en: {
     notOpened: "No file opened",
@@ -965,6 +1007,8 @@ const MESSAGES: Record<Lang, Messages> = {
     winClose: "Close",
     menuTitle: "Menu",
     menuExit: "Exit",
+    encodingTitle: "File encoding",
+    encodingFailed: (e) => `Failed to change encoding: ${e}`,
   },
 };
 
@@ -1634,7 +1678,11 @@ function LogTab(props: LogTabProps) {
       if (tab_id !== tabId) {
         return;
       }
-      if (!autoRefreshRef.current) {
+      // 暂停跟随时丢弃实时批次 —— 但**只丢实时批次**。
+      // 「整体替换」里有一类是用户刚做的动作（打开文件、换编码），被暂停开关吞掉的话
+      // 正文会永远停在旧结果上且不会自愈（那个事件不会再发第二次）。
+      // 哪些批次属于这一类由后端在 `apply_when_paused` 里说清楚，见 LinesPayload。
+      if (!autoRefreshRef.current && !event.payload.apply_when_paused) {
         return;
       }
       // 实时总行数：每次事件都会携带（随追加增长；轮转后归零重计）。
@@ -3640,6 +3688,37 @@ export default function App() {
   // 文件拖拽进行中：显示全屏放置提示遮罩。
   const [dragActive, setDragActive] = useState(false);
 
+  // ---- 编码（底部状态栏 + 编码弹窗） ----
+  //
+  // 两份状态，职责不同：
+  // - `TabInfo.encoding` 是用户的**选择**（`auto` 或目录 id），随会话存档持久化，
+  //   重新打开文件时照它去解析（`auto` 要重新探测，见 TabInfo 的注释）；
+  // - `encodings` 是后端**解析出来的结果**（`UTF-8` / `GB18030 BOM`…），只用于显示。
+  //
+  /** 每个 tab 解析出的编码信息（键为 tabId；null = 尚未探测出/不适用）。 */
+  const [encodings, setEncodings] = useState<Record<string, EncodingInfo | null>>({});
+  /** 编码弹窗是否展开（目标是当前激活 tab）。 */
+  const [encodingOpen, setEncodingOpen] = useState(false);
+  /** 正在按新编码重载（状态栏显示提示并禁止重复点）。 */
+  const [encodingBusy, setEncodingBusy] = useState(false);
+  /** 切换失败的提示（显示在编码弹窗里；切换成功后清空）。 */
+  const [encodingError, setEncodingError] = useState<string | null>(null);
+
+  /**
+   * 各回调读取「最新 tabs」的稳定入口。
+   *
+   * 声明在 App 顶部：`loadMd`（Markdown 读取）与 `openTabFile` 都要按 tabId 现取
+   * tab 状态（编码选择、视图模式），而它们的引用必须稳定（是下游 effect 的依赖），
+   * 不能把 `tabs` 放进依赖数组。
+   */
+  const tabsRef = useRef<TabInfo[]>([]);
+  tabsRef.current = tabs;
+
+  /** 指定 tab 的编码选择（没有/未指定 = `auto`）。 */
+  const encodingChoiceOf = useCallback((tabId: string): string => {
+    return tabsRef.current.find((t) => t.id === tabId)?.encoding || AUTO_ID;
+  }, []);
+
   // ---- 最近打开记录（总菜单的「最近打开」二级菜单数据） ----
   const [recentPaths, setRecentPaths] = useState<string[]>(() => readRecentPaths());
   // ---- 首行最左侧的总菜单（历史记录二级菜单 / 语言 / 关于 / 退出） ----
@@ -3757,6 +3836,11 @@ export default function App() {
           // 视图模式一起存：否则 Markdown 预览在重启后会掉回文本视图
           // （表格视图本来也存不住，是因为它依赖 schema 记录，见 schemas）。
           modes: tabs.map((t) => t.viewMode ?? null),
+          // 只存手动指定的编码：`auto` 的 tab 存 null，下次打开重新探测
+          //（文件可能已被别的工具改写成了另一种编码）。
+          encodings: tabs.map((t) =>
+            t.encoding && t.encoding !== AUTO_ID ? t.encoding : null
+          ),
         })
       );
     } catch {
@@ -3922,14 +4006,24 @@ export default function App() {
   /**
    * 读取一个 Markdown 文件全文：成功存文本，失败把错误写到该 tab（驱动状态页）。
    * 返回**内容是否与上次不同** —— 自动刷新据此决定要不要重排版（见 MarkdownView 的「跟随」）。
+   *
+   * `encodingOverride` 给「刚改完编码」这类**调用方已经知道答案**的场景：`setTabs`
+   * 是异步的，紧接着调 `loadMd` 时 `tabsRef` 还是旧的那份，按 tab 现取会拿到旧编码。
+   * 其余调用方不传，按 tab 当前的选择走。
    */
   const loadMd = useCallback(
-    async (tabId: string, mdPath: string): Promise<boolean> => {
+    async (tabId: string, mdPath: string, encodingOverride?: string): Promise<boolean> => {
+      const encoding = encodingOverride ?? encodingChoiceOf(tabId);
       try {
         const doc = await invoke<MdDoc>("read_text_file", {
           path: mdPath,
           maxBytes: MD_MAX_BYTES,
+          encoding,
         });
+        // 后端把「实际按哪种编码解出来的」一并回传：状态栏据此显示（含自动探测的结果）。
+        if (doc.encoding) {
+          setEncodings((prev) => ({ ...prev, [tabId]: doc.encoding ?? null }));
+        }
         // 内容一模一样（只是 mtime 变了，例如编辑器「保存了但没改动」或自动保存）
         // 就不换引用：否则自动刷新会把整篇文档重新解析+重排版一遍，白卡一下。
         let changed = false;
@@ -4078,6 +4172,9 @@ export default function App() {
       seen.add(key);
       const id = nextTabId();
       const savedMode = saved.modes?.[i];
+      // 编码选择：存档里存的是**用户的选择**（手动指定才有值，`auto` 存 null）。
+      // 不设 `auto`，好让 `TabInfo.encoding` 的「undefined = 自动」这一条成立。
+      const savedEncoding = saved.encodings?.[i] ?? undefined;
       list.push({
         id,
         title: p.split(/[\\/]/).pop() || p,
@@ -4085,6 +4182,7 @@ export default function App() {
         // 老存档（或该 tab 没有记录模式）按扩展名推断：Markdown 文件恢复成预览。
         viewMode: savedMode ?? defaultViewModeFor(p),
         slotsPath: saved.schemas?.[i] ?? null,
+        encoding: savedEncoding,
       });
     }
     setTabs(list);
@@ -4297,21 +4395,105 @@ export default function App() {
    *
    * 只有成功才清错误标记：先清后读会让正文区在失败时闪一次
    * （状态页 → 日志页 → 状态页），空正文一闪而过，观感很差。
+   *
+   * 编码选择按 tab 现取（`auto` → 后端探测）；后端把解析结果回传，存进
+   * `encodings` 供状态栏显示。`encodingOverride` 的理由同 [`loadMd`]：`setTabs`
+   * 是异步的，刚改完编码的调用方必须把新选择直接传进来。
    */
-  const openTabFile = useCallback(async (tabId: string, path: string): Promise<boolean> => {
-    try {
-      await invoke("open_log_file", { tabId, path });
-      setTabs((prev) =>
-        prev.map((t) => (t.id === tabId ? { ...t, openError: undefined, textOpened: true } : t))
-      );
-      return true;
-    } catch (e) {
-      // 打开失败：错误记在 tab 上，正文区按分类显示对应状态页（见 bodyViews）。
-      setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, openError: String(e) } : t)));
-      return false;
-    }
-  }, []);
+  const openTabFile = useCallback(
+    async (tabId: string, path: string, encodingOverride?: string): Promise<boolean> => {
+      try {
+        const info = await invoke<EncodingInfo>("open_log_file", {
+          tabId,
+          path,
+          encoding: encodingOverride ?? encodingChoiceOf(tabId),
+        });
+        setEncodings((prev) => ({ ...prev, [tabId]: info ?? null }));
+        setTabs((prev) =>
+          prev.map((t) => (t.id === tabId ? { ...t, openError: undefined, textOpened: true } : t))
+        );
+        return true;
+      } catch (e) {
+        // 打开失败：错误记在 tab 上，正文区按分类显示对应状态页（见 bodyViews）。
+        setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, openError: String(e) } : t)));
+        return false;
+      }
+    },
+    [encodingChoiceOf]
+  );
 
+  /**
+   * 切换当前激活 tab 的文本编码（编码弹窗的「应用」）。
+   *
+   * 两条路径，取决于该 tab 此刻由谁在解码：
+   * - **文本视图**：走后端 `set_encoding` —— 它整体重建会话（换行符形态、行索引、
+   *   已加载窗口全部随之重建），并用 `log-lines`（`reset = true`）事件让正文整体
+   *   替换。失败（文件此时已被删除等）会把错误显示在弹窗里、**不关闭弹窗**，
+   *   让用户能改选另一个编码或取消。
+   * - **Markdown 视图**：那份正文是 `read_text_file` 整读来的，没有 tail 会话，
+   *   带新编码重读一遍即可。读取失败沿用既有约定：错误写到 tab 上、正文区显示
+   *   错误状态页（`loadMd` 负责），因此这里照常关弹窗。
+   */
+  const applyEncoding = useCallback(
+    async (choice: string) => {
+      const tab = tabsRef.current.find((t) => t.id === activeTabId);
+      if (!tab) {
+        return;
+      }
+      setEncodingError(null);
+      setEncodingBusy(true);
+      try {
+        if ((tab.viewMode ?? "text") === "md") {
+          // 显式把新选择传进去：`setTabs` 之下那次写入（见后）还没反映到 `tabsRef`。
+          await loadMd(tab.id, tab.path, choice);
+        } else {
+          const info = await invoke<EncodingInfo>("set_encoding", {
+            tabId: tab.id,
+            encoding: choice,
+          });
+          setEncodings((prev) => ({ ...prev, [tab.id]: info ?? null }));
+        }
+        // **成功之后**才把「选择」写回 tab（并随会话存档持久化）。
+        // 先写后调的话，一次失败的切换会留下「存档说 GBK、会话其实还是 UTF-8」的
+        // 不一致，而这个不一致在下次打开文件之前都不会被发现。
+        //
+        // Markdown 分支的「成功」含义稍弱：`loadMd` 自己吞掉读取错误（把错误写到 tab
+        // 上、正文区显示错误页），所以文件读不到时这里仍会写下选择。那没关系 ——
+        // 错误页说明的是「这个文件读不了」，与编码无关；下次打开成功时用用户的选择
+        // 正是他想要的。
+        setTabs((prev) =>
+          prev.map((t) =>
+            t.id === tab.id ? { ...t, encoding: choice === AUTO_ID ? undefined : choice } : t
+          )
+        );
+        setEncodingOpen(false);
+      } catch (e) {
+        setEncodingError(appT.encodingFailed(String(e)));
+      } finally {
+        setEncodingBusy(false);
+      }
+    },
+    [activeTabId, appT, loadMd]
+  );
+
+  /**
+   * 切换编码后重新拉一次状态栏的编码信息。
+   *
+   * 文本视图的重载是**异步**的（后端重建会话、发 reset 事件），`applyEncoding` 里
+   * 拿到的只是「已按新编码重开」的即时结果；等正文真正回来后再对一次账，避免
+   * 状态栏显示与正文实际用的编码不一致（例如后端回退到了兜底编码）。
+   */
+  useEffect(() => {
+    if (!encodingOpen || !activeTabId) {
+      return;
+    }
+    const tabId = activeTabId;
+    void fetchTabEncoding(tabId).then((info) => {
+      if (info) {
+        setEncodings((prev) => ({ ...prev, [tabId]: info }));
+      }
+    });
+  }, [encodingOpen, activeTabId, encodingBusy]);
   // ---- 失败 tab 的重新检测 ----
   //
   // 状态页本身只有一行说明、没有按钮，所以这里只保留一条**隐式**的恢复路径：
@@ -4322,12 +4504,14 @@ export default function App() {
   const reopenTab = useCallback(
     (tab: TabInfo): Promise<boolean> => {
       const mode = tab.viewMode ?? defaultViewModeFor(tab.path);
+      // 编码显式传 tab 自己的那份：这里手里就有整个 tab 对象，比按 id 去 ref 里
+      // 现取更准 —— 恢复会话时 `setTabs(list)` 还没生效，ref 里查不到这些新 tab。
       if (mode === "md") {
-        return loadMd(tab.id, tab.path);
+        return loadMd(tab.id, tab.path, tab.encoding);
       }
       return mode === "cfg" && tab.slotsPath
         ? parseCfg(tab.id, tab.path, tab.slotsPath)
-        : openTabFile(tab.id, tab.path);
+        : openTabFile(tab.id, tab.path, tab.encoding);
     },
     [loadMd, openTabFile, parseCfg]
   );
@@ -4335,9 +4519,6 @@ export default function App() {
   // 打开新文件：新建一个 tab。视图模式按扩展名推断（.md/.markdown 直接进 Markdown
   // 预览），其余按文本日志打开；表格视图涉及 schema 选择，始终由用户手动切换。
   // 同路径（Windows 大小写不敏感）已有 tab 时直接激活，不重复打开。
-  const tabsRef = useRef<TabInfo[]>([]);
-  tabsRef.current = tabs;
-
   /** 打开指定路径（对话框选中后 / 自动化钩子 / 会话恢复共用）。 */
   const openPath = useCallback(
     async (selected: string) => {
@@ -4562,6 +4743,14 @@ export default function App() {
         return next;
       });
       setMdDocs((prev) => {
+        if (!(id in prev)) {
+          return prev;
+        }
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      setEncodings((prev) => {
         if (!(id in prev)) {
           return prev;
         }
@@ -4797,6 +4986,54 @@ export default function App() {
   /** 右键菜单指向的 tab（已关闭时找不到，菜单随之消失）。 */
   const menuTab = tabMenu ? tabs.find((t) => t.id === tabMenu.tabId) : undefined;
 
+  /**
+   * 文本编码是否适用于当前 tab。
+   *
+   * 表格视图（`client_cfg` 二进制）不按文本解码，编码对它没有意义 —— 状态栏此时
+   * 把编码显示成不可点的灰色，而不是藏起来（否则状态栏会在视图间跳动）。
+   * 没有激活 tab 时也不适用。
+   */
+  const canPickEncoding = activeTab != null && (activeTab.viewMode ?? "text") !== "cfg";
+
+  /**
+   * 激活 tab 换了、而状态栏还没有它的编码信息时补一次。
+   *
+   * 编码信息由各视图在自己打开/整读文件时上报（`open_log_file` / `read_text_file`
+   * 的返回值），但有几条路径不会上报：会话恢复时文件已不存在、tab 关闭后又被
+   * 重新打开、以及将来新增的视图。少一次补拉，状态栏就会一直显示「—」，
+   * 而它旁边的行数却是有值的 —— 看起来像功能坏了。
+   *
+   * 两条查法：先问后端会话（`get_encoding`，文本视图有会话才有答案），
+   * 拿不到再直接探测文件（`detect_encoding`，Markdown 视图没有 tail 会话，走这条）。
+   * 只在「确实没有」时才问（`encodings[activeTabId]` 有值就跳过）：这是补位，
+   * 不是每次切 tab 都打两次 IPC。
+   */
+  useEffect(() => {
+    if (!canPickEncoding || !activeTabId) {
+      return;
+    }
+    const tab = tabs.find((t) => t.id === activeTabId);
+    // 文件本身打不开（不存在 / 无权限）时不要再问：探测只会一直失败，而这个 effect
+    // 的依赖里带着 `tabs`，每次开关 tab 都会白打两轮 IPC。
+    if (!tab || tab.openError || encodings[activeTabId]) {
+      return;
+    }
+    let alive = true;
+    const choice = tab.encoding || AUTO_ID;
+    void fetchTabEncoding(activeTabId)
+      // 会话没有答案（Markdown 视图没有 tail 会话）→ 按**这个 tab 自己的选择**解析，
+      // 不能无条件重跑自动探测：手动钉死编码的 tab 会被显示成探测结果，与正文对不上。
+      .then((info) => info ?? detectEncoding(tab.path, choice))
+      .then((info) => {
+        if (alive && info) {
+          setEncodings((prev) => ({ ...prev, [activeTabId]: info }));
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, [canPickEncoding, activeTabId, encodings, tabs]);
+
   return (
     <div
       className="loglens"
@@ -4872,9 +5109,6 @@ export default function App() {
         {/* tab 列表与右侧工具栏之间的空白：窗口拖动主区域（tab 少时占满整行）。 */}
         <div className="titlebar-drag" data-tauri-drag-region />
         <div className="tabbar-right">
-          <span className="total-lines" title={appT.totalLinesTitle}>
-            {activeTotal != null ? appT.countLines(activeTotal) : ""}
-          </span>
           <button
             className="icon-btn"
             onClick={() => changeFontSize(-1)}
@@ -5383,6 +5617,38 @@ export default function App() {
         <div className="drop-overlay">
           <div className="drop-overlay-box">{appT.dropToOpen}</div>
         </div>
+      ) : null}
+
+      {/* 底部状态栏：行数（从工具栏右上角搬来）+ 文件编码（可点开弹窗切换）。
+          放在正文之后、模态框之前：模态框都是 fixed 定位，层级由 z-index 决定，
+          与这里的顺序无关。 */}
+      <StatusBar
+        lang={lang}
+        total={activeTotal}
+        totalTitle={appT.totalLinesTitle}
+        encoding={canPickEncoding ? (encodings[activeTabId ?? ""] ?? null) : null}
+        hasTab={activeTab != null}
+        canPickEncoding={canPickEncoding}
+        busy={encodingBusy}
+        onPickEncoding={() => {
+          setEncodingError(null);
+          setEncodingOpen(true);
+        }}
+      />
+
+      {encodingOpen && activeTab && canPickEncoding ? (
+        <EncodingModal
+          lang={lang}
+          path={activeTab.path}
+          current={encodings[activeTab.id] ?? null}
+          error={encodingError}
+          busy={encodingBusy}
+          onApply={(id) => void applyEncoding(id)}
+          onClose={() => {
+            setEncodingOpen(false);
+            setEncodingError(null);
+          }}
+        />
       ) : null}
     </div>
   );

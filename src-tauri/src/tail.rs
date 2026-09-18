@@ -1,4 +1,8 @@
 //! 增量 tail-follow：按字节偏移增量读取日志文件尾部，处理换行边界与文件轮转。
+//!
+//! 行切分与解码不在这里实现：换行符的字节形态随编码而变（UTF-16 是 2 字节），
+//! 统一由 [`crate::encoding`] 负责。本模块只关心「在哪个字节偏移上读多少字节」，
+//! 以及把跨批次的残片（`pending`）拼回去。
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
@@ -6,6 +10,7 @@ use std::path::PathBuf;
 
 use tracing::instrument;
 
+use crate::encoding::{self, EncodingDef};
 use crate::index::SharedIndex;
 use crate::perf;
 
@@ -37,10 +42,33 @@ pub struct TailReader {
     /// 外部完全重写文件且新尺寸 ≥ 旧偏移时，仅靠 size 检测不到
     /// （等长重写甚至完全无事件），用内容签名识别。
     head_sig: Vec<u8>,
+    /// 当前生效的文本编码：决定换行符形态与「字节 → 文本」的解码。
+    ///
+    /// 打开文件时由调用方探测/指定一次，之后整个 reader 生命周期内不变——
+    /// 换编码等于换一整套行边界，必须重建 reader（见 `set_encoding` 命令）。
+    def: &'static EncodingDef,
 }
 
 /// 头部签名长度：外部重写后前 1KB 与旧内容完全一致的概率可忽略。
 const HEAD_SIG_LEN: usize = 1024;
+
+/// 判断绝对偏移 `at` 是否恰好是一个换行符之后（即 `at` 处是行首）。
+///
+/// 用「回看换行符」而不是「记住上次位置」：init_tail / load_history 都是从一个
+/// 任意偏移往前读，只能靠前一个字节判断首行是不是残片。对 UTF-16 要回看 2 字节。
+fn starts_line_at(file: &mut File, at: u64, def: &EncodingDef) -> std::io::Result<bool> {
+    let width = def.term.len() as u64;
+    if at == 0 {
+        return Ok(true); // 文件开头必然是行首
+    }
+    if at < width {
+        return Ok(false); // 连一个换行符都放不下：不可能是行首
+    }
+    let mut prev = vec![0u8; width as usize];
+    file.seek(SeekFrom::Start(at - width))?;
+    file.read_exact(&mut prev)?;
+    Ok(def.term.ends_with(&prev, at - width))
+}
 
 #[derive(Debug, Clone)]
 pub enum TailEvent {
@@ -51,7 +79,8 @@ pub enum TailEvent {
 }
 
 impl TailReader {
-    pub fn new(path: PathBuf) -> Self {
+    /// 建 reader：`def` 为本次会话生效的编码（决定换行形态与解码方式）。
+    pub fn new(path: PathBuf, def: &'static EncodingDef) -> Self {
         Self {
             path,
             file: None,
@@ -62,8 +91,11 @@ impl TailReader {
             first_open: true,
             line_no: 1,
             history_line_no: None,
-            index: std::sync::Arc::new(parking_lot::Mutex::new(crate::index::LineIndex::new())),
+            index: std::sync::Arc::new(parking_lot::Mutex::new(crate::index::LineIndex::with_term(
+                def.term,
+            ))),
             head_sig: Vec::new(),
+            def,
         }
     }
 
@@ -142,14 +174,7 @@ impl TailReader {
 
             // start 是否恰在行首：是则缓冲首行是完整行、直接保留；
             // 否则首行是从行中间截断的残片，需丢弃（该行由 load_history 补全）。
-            let starts_at_line_start = if start == 0 {
-                true
-            } else {
-                let mut prev = [0u8; 1];
-                file.seek(SeekFrom::Start(start - 1))?;
-                file.read_exact(&mut prev)?;
-                prev[0] == b'\n'
-            };
+            let starts_at_line_start = starts_line_at(&mut file, start, self.def)?;
 
             file.seek(SeekFrom::Start(start))?;
             let mut buf = Vec::with_capacity(approx as usize);
@@ -162,7 +187,7 @@ impl TailReader {
             self.file = Some(file);
 
             // 统计尾部缓冲里的完整行数（含首行丢弃前的总数）。
-            let n_in_buf = buf.iter().filter(|&&b| b == b'\n').count() as u64;
+            let n_in_buf = self.def.term.count(&buf, start);
             // start 之前的完整行数（一次前缀扫描，仅首屏一次）。
             let prefix_complete = if start > 0 {
                 perf::mark("init_tail:scan-start");
@@ -185,7 +210,7 @@ impl TailReader {
             self.line_no = prefix_complete + n_in_buf + 1;
             self.history_line_no = Some(first);
 
-            let (mut lines, leftover) = split_with_pending(&buf);
+            let (mut lines, leftover) = encoding::split_complete(&buf, start, self.def);
             // 首行残片（start 落在行中间时）丢弃。
             if !starts_at_line_start && !lines.is_empty() {
                 lines.remove(0);
@@ -246,23 +271,17 @@ impl TailReader {
         let read_len = self.history_start - read_start;
 
         // read_start 是否恰在行首：决定缓冲首行是完整行还是残片。
-        let starts_at_line_start = if read_start == 0 {
-            true
-        } else {
-            let mut prev = [0u8; 1];
-            file.seek(SeekFrom::Start(read_start - 1))?;
-            file.read_exact(&mut prev)?;
-            prev[0] == b'\n'
-        };
+        let starts_at_line_start = starts_line_at(file, read_start, self.def)?;
 
         file.seek(SeekFrom::Start(read_start))?;
         let mut buf = vec![0u8; read_len as usize];
         file.read_exact(&mut buf)?;
 
-        // 补全末尾边界行：history_start 落在行中间时（缓冲不以 \n 结尾），
+        // 补全末尾边界行：history_start 落在行中间时（缓冲不以换行符结尾），
         // 从 history_start 继续向前读到下一个换行，把该行补全并入缓冲。
         // 超长行（>1MB）或文件未写完（EOF 仍无换行）时放弃补全，该行按缺失处理。
-        let mut boundary_included = buf.ends_with(b"\n");
+        let term = self.def.term;
+        let mut boundary_included = term.ends_with(&buf, read_start);
         if !boundary_included {
             const MAX_SUFFIX: usize = 1 << 20;
             let mut suffix: Vec<u8> = Vec::new();
@@ -272,8 +291,10 @@ impl TailReader {
                 if n == 0 {
                     break false; // EOF 仍无换行：末行尚未写完，无法补全
                 }
-                if let Some(pos) = chunk[..n].iter().position(|&b| b == b'\n') {
-                    suffix.extend_from_slice(&chunk[..=pos]);
+                // 缓冲区起点 = history_start（read_start + read_len），再跳过已读的 suffix。
+                let suffix_base = read_start + read_len + suffix.len() as u64;
+                if let Some(pos) = term.find(&chunk[..n], suffix_base, 0) {
+                    suffix.extend_from_slice(&chunk[..=pos + term.len() - 1]);
                     break true;
                 }
                 suffix.extend_from_slice(&chunk[..n]);
@@ -287,7 +308,7 @@ impl TailReader {
             }
         }
 
-        let mut lines = split_lines(&buf);
+        let mut lines = encoding::split_complete(&buf, read_start, self.def).0;
         // 首行残片（read_start 落在行中间时）丢弃；该行由下一次翻页补全。
         if !starts_at_line_start && !lines.is_empty() {
             lines.remove(0);
@@ -354,17 +375,26 @@ impl TailReader {
         }
 
         let file = self.file.as_mut().unwrap();
-        file.seek(SeekFrom::Start(self.offset))?;
-        let mut buf = vec![0u8; (size - self.offset) as usize];
+        // 本批新字节的起始偏移（改 self.offset 之前先记住）。
+        let read_start = self.offset;
+        file.seek(SeekFrom::Start(read_start))?;
+        let mut buf = vec![0u8; (size - read_start) as usize];
         file.read_exact(&mut buf)?;
         self.offset = size;
         self.last_size = size;
 
         // 拼接残留 + 新数据，再按行切分。
+        // 残片的绝对起点 = read_start - 残片长度（残片本来就是紧邻新数据之前的那一段）。
+        // 用 saturating_sub 而不是裸减法：所有给 `pending` 赋值的地方都同时把 `offset`
+        // 设成「同一段缓冲的终点」，所以 pending_len ≤ offset 恒成立；但把它写成
+        // 不会 panic 的形式 + 断言，比依赖「所有调用点都记得」更稳。
+        let pending_len = self.pending.len() as u64;
+        debug_assert!(pending_len <= read_start, "pending 比已读偏移还长，offset 维护有误");
+        let combined_base = read_start.saturating_sub(pending_len);
         let mut combined = std::mem::take(&mut self.pending);
         combined.extend_from_slice(&buf);
 
-        let (complete, leftover) = split_with_pending(&combined);
+        let (complete, leftover) = encoding::split_complete(&combined, combined_base, self.def);
         self.pending = leftover;
 
         if complete.is_empty() {
@@ -400,40 +430,6 @@ impl TailReader {
     }
 }
 
-/// 把 buffer 切成完整行（Vec<String>），返回剩余的「未以换行结尾」的残片。
-fn split_with_pending(buf: &[u8]) -> (Vec<String>, Vec<u8>) {
-    let mut lines = Vec::new();
-    let mut start = 0usize;
-    for (i, &b) in buf.iter().enumerate() {
-        if b == b'\n' {
-            let mut line = &buf[start..i];
-            // 去掉 \r
-            if line.last() == Some(&b'\r') {
-                line = &line[..line.len() - 1];
-            }
-            lines.push(String::from_utf8_lossy(line).into_owned());
-            start = i + 1;
-        }
-    }
-    let leftover = buf[start..].to_vec();
-    (lines, leftover)
-}
-
-fn split_lines(buf: &[u8]) -> Vec<String> {
-    split_with_pending(buf).0
-}
-
-/// 把 buffer 切成完整行；与 split_with_pending 的区别：
-/// 结尾未换行的残片也作为一行返回（用于「跳转到行」的窗口读取，
-/// 窗口终点是文件 EOF 且末行无换行时不能丢）。
-pub(crate) fn split_lines_inclusive(buf: &[u8]) -> Vec<String> {
-    let (mut lines, leftover) = split_with_pending(buf);
-    if !leftover.is_empty() {
-        lines.push(String::from_utf8_lossy(&leftover).into_owned());
-    }
-    lines
-}
-
 /// 以共享模式打开文件（独立句柄，用于行号定位/窗口读取，不影响 TailReader 游标）。
 pub fn open_shared_file(path: &std::path::Path) -> std::io::Result<File> {
     let mut opts = OpenOptions::new();
@@ -445,6 +441,9 @@ pub fn open_shared_file(path: &std::path::Path) -> std::io::Result<File> {
 
 /// 统计文件总行数：换行符数，末尾无换行且非空时 +1。
 /// 已被行索引（`LineIndex::total_lines`）取代；保留作为测试对照的全扫参考实现。
+///
+/// 注意：这是 LF 时代的对照实现，**只认裸 `0x0A`**，不支持 UTF-16 的 2 字节换行。
+/// 新增用例请走 [`crate::encoding::LineTerm`] / `LineIndex`。
 #[allow(dead_code)]
 pub fn count_lines(path: &std::path::Path) -> std::io::Result<u64> {
     let mut file = open_shared_file(path)?;
@@ -472,6 +471,8 @@ pub fn count_lines(path: &std::path::Path) -> std::io::Result<u64> {
 /// 末尾无换行的最后一行按一行计；end_line == 总行数时 end 偏移为文件大小。
 /// 扫描在找到两个偏移后提前终止（end_line 通常离 start_line 只有几千行）。
 /// 已被行索引（`LineIndex::locate_range`）取代；保留作为测试对照的全扫参考实现。
+///
+/// 注意：与 [`count_lines`] 同样**只认裸 `0x0A`**，不支持 UTF-16 的 2 字节换行。
 #[allow(dead_code)]
 pub fn line_range_offsets(
     path: &std::path::Path,
@@ -555,19 +556,21 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// 写一个临时文件并返回 TailReader。
+    /// 写一个临时文件并返回 TailReader（测试内容一律 UTF-8 / LF）。
     fn make_reader(content: &str) -> (TailReader, tempfile::NamedTempFile) {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f.flush().unwrap();
         let path = f.path().to_path_buf();
-        let reader = TailReader::new(path);
+        let reader = TailReader::new(path, encoding::utf8());
         (reader, f)
     }
 
+    /// 行切分（含 CRLF 与末尾残片）现在由 [`crate::encoding`] 负责，
+    /// 这里只钉住 tail 依赖的那部分行为契约。
     #[test]
     fn splitting_handles_crlf_and_partial_lines() {
-        let (complete, leftover) = split_with_pending(b"line1\r\nline2\npartial");
+        let (complete, leftover) = encoding::split_complete(b"line1\r\nline2\npartial", 0, encoding::utf8());
         assert_eq!(complete, vec!["line1".to_string(), "line2".to_string()]);
         assert_eq!(leftover, b"partial");
     }
@@ -653,7 +656,7 @@ mod tests {
         f.flush().unwrap();
         let path = f.path().to_path_buf();
 
-        let mut reader = TailReader::new(path.clone());
+        let mut reader = TailReader::new(path.clone(), encoding::utf8());
         let (initial, first) = reader.init_tail(1000).unwrap();
         assert_eq!(initial, vec!["old-a".to_string(), "old-b".to_string(), "old-c".to_string()]);
         assert_eq!(first, 1);
@@ -744,7 +747,7 @@ mod tests {
         f.flush().unwrap();
         let path = f.path().to_path_buf();
 
-        let mut reader = TailReader::new(path.clone());
+        let mut reader = TailReader::new(path.clone(), encoding::utf8());
         let _ = reader.init_tail(1000).unwrap();
 
         {
@@ -773,7 +776,7 @@ mod tests {
         f.flush().unwrap();
         let path = f.path().to_path_buf();
 
-        let mut reader = TailReader::new(path.clone());
+        let mut reader = TailReader::new(path.clone(), encoding::utf8());
         let _ = reader.init_tail(1000).unwrap();
         assert_eq!(reader.total_lines(), 10);
 
@@ -856,7 +859,7 @@ mod tests {
         let path = f.path().to_path_buf();
 
         // TailReader 独立打开 + init_tail（模拟应用启动）。
-        let mut reader = TailReader::new(path.clone());
+        let mut reader = TailReader::new(path.clone(), encoding::utf8());
         let (initial, first_no) = reader.init_tail(1000).unwrap();
         assert_eq!(initial, vec!["line1".to_string(), "line2".to_string(), "line3".to_string()]);
         assert_eq!(first_no, 1, "文件头开始，首行编号应为 1");
@@ -898,7 +901,7 @@ mod tests {
         f.flush().unwrap();
         let path = f.path().to_path_buf();
 
-        let mut reader = TailReader::new(path.clone());
+        let mut reader = TailReader::new(path.clone(), encoding::utf8());
         // init_tail 只读尾部一段（约 8KB+）。
         let (initial, _first) = reader.init_tail(10).unwrap();
         assert!(initial.len() < 2000, "只应加载尾部一部分，实际 {}", initial.len());
@@ -945,7 +948,7 @@ mod tests {
         f.flush().unwrap();
         let path = f.path().to_path_buf();
 
-        let mut reader = TailReader::new(path.clone());
+        let mut reader = TailReader::new(path.clone(), encoding::utf8());
         let (initial, first_initial) = reader.init_tail(1000).unwrap();
         assert!(!initial.is_empty());
 
@@ -986,7 +989,7 @@ mod tests {
         };
         let path = PathBuf::from(&path);
 
-        let mut reader = TailReader::new(path.clone());
+        let mut reader = TailReader::new(path.clone(), encoding::utf8());
         let (initial, first_initial) = reader.init_tail(1000).unwrap();
 
         let newline_count =
@@ -1036,7 +1039,7 @@ mod tests {
         }
         let path = f.path().to_path_buf();
 
-        let mut reader = TailReader::new(path.clone());
+        let mut reader = TailReader::new(path.clone(), encoding::utf8());
         let (initial, _first) = reader.init_tail(1000).unwrap();
         eprintln!("[perf] init_tail 200k file: {} lines loaded", initial.len());
 
@@ -1060,5 +1063,168 @@ mod tests {
             t.elapsed() / batches as u32
         );
         assert!(total >= 190_000, "total={}", total);
+    }
+
+    // ==================== 非 UTF-8 编码 ====================
+
+    /// 造一个 UTF-16 文件（`le` 决定端序；含 BOM 时模拟 PowerShell `Out-File`）。
+    fn utf16_file(lines: &[&str], le: bool, bom: bool) -> tempfile::NamedTempFile {
+        let mut bytes: Vec<u8> = Vec::new();
+        if bom {
+            bytes.extend_from_slice(if le { b"\xFF\xFE" } else { b"\xFE\xFF" });
+        }
+        for l in lines {
+            for unit in format!("{l}\n").encode_utf16() {
+                let pair = if le {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                };
+                bytes.extend_from_slice(&pair);
+            }
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    /// UTF-16LE（带 BOM）：tail 初始化要按 2 字节换行切行、剥 BOM、行号从 1 起。
+    ///
+    /// 1200 行 × 16 字节 ≈ 19 KB，远小于 `init_tail(1000)` 的读取窗口
+    /// （1000 × 256 = 256 KB），所以整篇都会被加载 —— 于是「第 1 行」也在结果里，
+    /// 正好用来验证首行 BOM 被剥掉。
+    #[test]
+    fn init_tail_decodes_utf16le_with_bom() {
+        let lines: Vec<String> = (1..=1200).map(|i| format!("行-{i:04}")).collect();
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let f = utf16_file(&refs, true, true);
+        let def = encoding::lookup("utf-16le").unwrap();
+
+        let mut reader = TailReader::new(f.path().to_path_buf(), def);
+        let (loaded, first) = reader.init_tail(1000).unwrap();
+        assert_eq!(reader.total_lines(), 1200);
+        assert_eq!(first, 1, "文件小于读取窗口 → 整篇都加载，首行即第 1 行");
+        assert_eq!(loaded.len(), 1200);
+        assert_eq!(loaded[0], "行-0001", "首行不该带 BOM");
+        assert_eq!(loaded[1199], "行-1200");
+    }
+
+    /// UTF-16BE：换行是 `00 0A`，同样要切对。
+    #[test]
+    fn init_tail_decodes_utf16be() {
+        let lines: Vec<String> = (1..=300).map(|i| format!("row-{i:04}")).collect();
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let f = utf16_file(&refs, false, true);
+        let def = encoding::lookup("utf-16be").unwrap();
+
+        let mut reader = TailReader::new(f.path().to_path_buf(), def);
+        let (loaded, first) = reader.init_tail(1000).unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(loaded.len(), 300);
+        assert_eq!(loaded[0], "row-0001");
+        assert_eq!(loaded[299], "row-0300");
+    }
+
+    /// GBK 增量追加：新追加的中文要按 GBK 解出来（不是一片 U+FFFD）。
+    #[test]
+    fn poll_decodes_gbk_appends() {
+        let def = encoding::lookup("gbk").unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let encode = |s: &str| def.enc.encode(s).0.into_owned();
+        f.write_all(&encode("第一行\n")).unwrap();
+        f.flush().unwrap();
+
+        let mut reader = TailReader::new(f.path().to_path_buf(), def);
+        let (initial, _) = reader.init_tail(1000).unwrap();
+        assert_eq!(initial, vec!["第一行".to_string()]);
+
+        f.write_all(&encode("第二行\n第三行\n")).unwrap();
+        f.flush().unwrap();
+
+        let events = reader.poll().unwrap();
+        let got: Vec<String> = events
+            .into_iter()
+            .flat_map(|e| match e {
+                TailEvent::Lines { lines, .. } => lines,
+                TailEvent::Reset => Vec::new(),
+            })
+            .collect();
+        assert_eq!(got, vec!["第二行".to_string(), "第三行".to_string()]);
+        assert_eq!(reader.total_lines(), 3);
+    }
+
+    /// GBK 文件里一个汉字被读到一半（跨批次残片）：拼接后仍解出完整汉字，
+    /// 不出现 U+FFFD。这条钉住「残片按字节留在 pending、不提前解码」的契约。
+    #[test]
+    fn gbk_multibyte_split_across_polls_is_reassembled() {
+        let def = encoding::lookup("gbk").unwrap();
+        let encoded = def.enc.encode("中文\n").0.into_owned();
+        assert_eq!(encoded.len(), 5, "两个汉字 4 字节 + 换行");
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        // 先只写第一个汉字的两个字节（模拟写入进程写了一半）。
+        f.write_all(&encoded[..2]).unwrap();
+        f.flush().unwrap();
+
+        let mut reader = TailReader::new(f.path().to_path_buf(), def);
+        let (initial, _) = reader.init_tail(1000).unwrap();
+        assert!(initial.is_empty(), "半个汉字不该产出完整行");
+
+        // 剩下的字节到齐后，整行正确解码。
+        f.write_all(&encoded[2..]).unwrap();
+        f.flush().unwrap();
+        let got: Vec<String> = reader
+            .poll()
+            .unwrap()
+            .into_iter()
+            .flat_map(|e| match e {
+                TailEvent::Lines { lines, .. } => lines,
+                TailEvent::Reset => Vec::new(),
+            })
+            .collect();
+        assert_eq!(got, vec!["中文".to_string()]);
+        assert!(!got[0].contains('\u{FFFD}'));
+    }
+
+    /// 历史加载也要按 2 字节换行补齐边界行（UTF-16 下最容易错的一处）。
+    ///
+    /// 用 2 万行（约 280 KB）造出「初始只加载了尾部一段」的局面，然后一路向前翻页
+    /// 到文件头：行号必须逐批无缝衔接、内容不许丢、最后落到第 1 行。
+    #[test]
+    fn load_history_is_correct_for_utf16() {
+        const TOTAL: u64 = 20_000;
+        let lines: Vec<String> = (1..=TOTAL).map(|i| format!("L{i:05}")).collect();
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let f = utf16_file(&refs, true, false);
+        let def = encoding::lookup("utf-16le").unwrap();
+
+        let mut reader = TailReader::new(f.path().to_path_buf(), def);
+        let (initial, first_initial) = reader.init_tail(500).unwrap();
+        assert!(
+            !initial.is_empty() && (initial.len() as u64) < TOTAL,
+            "应只加载尾部一段，实测 {} 行",
+            initial.len()
+        );
+        assert_eq!(initial.last().unwrap(), &format!("L{TOTAL:05}"));
+
+        let mut expected_next = first_initial;
+        let mut total = initial.len() as u64;
+        let mut more = true;
+        while more {
+            let (history, has_more, first) = reader.load_history(5000).unwrap();
+            if !history.is_empty() {
+                assert_eq!(
+                    first + history.len() as u64,
+                    expected_next,
+                    "批间行号必须无缝衔接"
+                );
+                expected_next = first;
+                total += history.len() as u64;
+            }
+            more = has_more;
+        }
+        assert_eq!(expected_next, 1, "翻到顶后首行必须是第 1 行");
+        assert_eq!(total, TOTAL, "不允许丢行");
     }
 }

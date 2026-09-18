@@ -185,8 +185,20 @@ process.on("exit", cleanup);
  * 实测（Windows 11 + WebView2 152）：用户数据目录被占用时，第二个实例会**静默卡住**
  * —— 没有窗口、没有 msedgewebview2 子进程、CDP 端口永远不出现。与其等 30 秒超时，
  * 不如立刻说清楚原因。
+ *
+ * 例外：设了 `WEBVIEW2_USER_DATA_FOLDER` 时，两个实例用的**不是**同一个目录，
+ * 上面那条冲突就不存在了（Tauri 默认把数据目录固定到
+ * `%LOCALAPPDATA%\<identifier>\EBWebView`，而这个环境变量会让 WebView2 换一个）。
+ * 于是可以一边开着日常用的 LogLens、一边冒烟测新构建 —— 这正是开发时最常见的状态。
  */
 function assertNoRunningInstance() {
+  if (process.env.WEBVIEW2_USER_DATA_FOLDER) {
+    console.log(
+      `（已设 WEBVIEW2_USER_DATA_FOLDER=${process.env.WEBVIEW2_USER_DATA_FOLDER}，` +
+        "与其它实例互不干扰，跳过「已有 LogLens 在运行」检查）"
+    );
+    return;
+  }
   let out = "";
   try {
     out = execFileSync("tasklist", ["/FI", "IMAGENAME eq LogLens.exe", "/FO", "CSV", "/NH"], {
@@ -200,7 +212,9 @@ function assertNoRunningInstance() {
     throw new SmokeError(
       `已有 LogLens 在运行（PID ${pids.join(", ")}）。\n` +
         "  WebView2 的用户数据目录是同一个（%LOCALAPPDATA%\\com.loglens.LogLens\\EBWebView），\n" +
-        "  第二个实例会卡在 WebView2 初始化上：没有窗口、没有 CDP 端口。请先关掉它再跑本脚本。"
+        "  第二个实例会卡在 WebView2 初始化上：没有窗口、没有 CDP 端口。请先关掉它再跑本脚本，\n" +
+        "  或给本脚本设一个独立的数据目录（两个实例就互不干扰了）：\n" +
+        '    $env:WEBVIEW2_USER_DATA_FOLDER = "$env:TEMP\\loglens-smoke"; node tools/smoke-release.mjs'
     );
   }
 }

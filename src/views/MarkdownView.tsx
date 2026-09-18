@@ -27,12 +27,28 @@ import { ViewToggleButton } from "./ViewToggleButton.tsx";
 
 /** 后端 `read_text_file` 的返回负载（与 `src-tauri/src/document.rs` 对齐）。 */
 export interface MdDoc {
-  /** 全文（UTF-8 BOM 已剥、非法字节按 lossy 替换）。 */
+  /** 全文（BOM 已按所选编码剥掉、非法字节按该编码 lossy 替换）。 */
   text: string;
   /** 文件真实字节数。 */
   bytes: number;
   /** 是否因为超过上限被截断。 */
   truncated: boolean;
+  /**
+   * 实际按哪种编码解出来的（自动探测的结果也在里面）。
+   *
+   * 这里用结构化类型而不是 import `src/statusbar` 的 `EncodingInfo`：`views`
+   * 是被 `App` 静态 import 的基础层，反向依赖 `statusbar` 会把状态栏模块拖进
+   * Markdown 页的依赖图（那一页是 lazy chunk，越少依赖越好）。字段名与它一致。
+   */
+  encoding?: {
+    choice: string;
+    id: string;
+    name: string;
+    note: string;
+    group: string;
+    source: string;
+    bom: boolean;
+  };
 }
 
 /** 页内查找状态。 */

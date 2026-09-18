@@ -14,6 +14,7 @@ use parking_lot::Mutex;
 use tauri::{AppHandle, Emitter};
 use tracing::{info_span, instrument};
 
+use crate::encoding::{self, EncodingDef, EncodingInfo, Resolved};
 use crate::filter::{Filter, FilterSpec};
 use crate::index::{LineIndex, SharedIndex, SCAN_CHUNK_BYTES};
 use crate::perf;
@@ -26,6 +27,18 @@ pub struct LinesPayload {
     pub tab_id: String,
     pub lines: Vec<LogLine>,
     pub reset: bool,
+    /// **暂停跟随时是否仍要应用这批整体替换**（只有 `reset = true` 时有意义）。
+    ///
+    /// 为什么需要这个字段：前端的「自动刷新」开关会丢弃实时批次（那正是暂停的意思
+    /// —— 别动我的视图）。但「整体替换」有三个来源，它们的性质并不相同：
+    ///
+    /// - **会话重建**（打开文件、`set_encoding` 换编码）：用户刚做的一个动作，
+    ///   必须生效。被暂停开关吞掉的话，正文会**永远**停在旧编码解出来的内容上，
+    ///   而且不会自愈 —— 这个事件不会再发第二次。→ `true`
+    /// - **轮转 / 截断**：实时跟踪的自然结果，暂停时不该打断用户正在看的内容。→ `false`
+    /// - **过滤条件重扫**：暂停期间不应用，恢复跟随时由 `toggleAutoRefresh` 统一补齐
+    ///   （那是前端既有的设计，这里保持不动）。→ `false`
+    pub apply_when_paused: bool,
     /// 文件当前总行数（实时，随追加增长；轮转后从 0 重新计）。
     pub total_lines: u64,
     /// 平均行长（字节/行，来自行索引覆盖区）：前端占位行高度/滚动条比例的估算依据。
@@ -48,10 +61,27 @@ pub struct TabSession {
     pub reader: Mutex<Option<TailReader>>,
     /// 行索引（与 reader 共享同一实例）：行号 ↔ 字节偏移 O(采样间隔) 定位。
     pub index: Mutex<SharedIndex>,
-    /// 停止信号：置 true 后监控线程退出（关闭 tab 时）。
+    /// 停止信号：置 true 后监控线程退出（关闭 tab 时 / 会话被换掉时）。
     pub stop: Arc<AtomicBool>,
+    /// 「发事件」与「被新会话取代」之间的互斥闸门。
+    ///
+    /// 为什么需要它：`set_encoding` 会整体换掉会话（见 [`AppState::replace_session`]），
+    /// 而旧会话的监控线程可能正处在「已经取好一批行、还没 emit」的中间态。若它抢在
+    /// 新会话的 `reset` 事件**之后**送达，前端会把旧编码解出来的行**追加**到新视图上
+    /// （旧事件 `reset = false`，语义正是「追加」）—— 表现为正文里混着一段乱码。
+    ///
+    /// 闸门把这两件事串起来：监控线程持锁发事件，取代方持锁置 `stop`。于是旧会话的
+    /// 最后一个事件一定落在新会话的 reset **之前**，前端状态天然自洽；代价是
+    /// `replace_session` 可能等一次 emit（毫秒级）。
+    pub emit_gate: Mutex<()>,
     /// 文件总行数缓存（懒计算；文件轮转/截断时失效）。用于「跳转到行」的范围校验。
     pub total_lines: Mutex<Option<u64>>,
+    /// 本 tab 的文本编码：用户的**选择**（`auto` 或目录 id）+ 解析出的编码定义。
+    ///
+    /// 选择与解析结果都要存：状态栏要显示「自动 → GB18030」这类信息，而重新打开
+    /// 文件时要沿用用户的原始选择（`auto` 得继续自动探测，不能固化成上次的结果）。
+    /// 解析结果在 `start_watching_for_session` 里按文件内容定下，之后只读。
+    pub encoding: Mutex<Option<(String, Resolved)>>,
 }
 
 /// 每 tab 行数上限：防长时间运行 + 高频日志导致内存无限增长。
@@ -94,8 +124,35 @@ impl TabSession {
             reader: Mutex::new(None),
             index: Mutex::new(std::sync::Arc::new(parking_lot::Mutex::new(LineIndex::new()))),
             stop: Arc::new(AtomicBool::new(false)),
+            emit_gate: Mutex::new(()),
             total_lines: Mutex::new(None),
+            encoding: Mutex::new(None),
         }
+    }
+
+    /// 当前生效的编码定义：决定换行符形态与解码方式。
+    ///
+    /// 未打开文件（或解析结果缺失）时按 UTF-8 兜底 —— 此时没有任何字节可读，
+    /// 返回什么都不影响结果，但让调用点不必处理 Option。
+    pub fn encoding_def(&self) -> &'static EncodingDef {
+        self.encoding
+            .lock()
+            .as_ref()
+            .map(|(_, r)| r.def)
+            .unwrap_or_else(encoding::utf8)
+    }
+
+    /// 当前编码信息的 IPC 载荷（未打开文件 → None）。
+    pub fn encoding_info(&self) -> Option<EncodingInfo> {
+        self.encoding
+            .lock()
+            .as_ref()
+            .map(|(choice, r)| encoding::info(choice, *r))
+    }
+
+    /// 记下「用户选择 + 解析结果」。
+    pub fn set_encoding_resolved(&self, choice: String, resolved: Resolved) {
+        *self.encoding.lock() = Some((choice, resolved));
     }
 
     /// 取出行索引的共享句柄（克隆 Arc，不长期占外层锁；再 `.lock()` 即得独占访问）。
@@ -133,6 +190,11 @@ impl TabSession {
         };
         *filter = new_filter;
         result
+    }
+
+    /// 当前过滤条件（原始 spec）：换编码重建会话时原样搬到新会话。
+    pub fn filter_spec(&self) -> FilterSpec {
+        self.filter.lock().spec().clone()
     }
 
     /// 返回当前过滤后的视图（用于前端挂载时拉取，弥补挂载前错过的事件）。
@@ -272,7 +334,8 @@ impl TabSession {
         let mut buf = vec![0u8; (end_off - start_off) as usize];
         file.read_exact(&mut buf)
             .map_err(|e| format!("读取行区间失败: {e}"))?;
-        let texts = crate::tail::split_lines_inclusive(&buf);
+        // 起点偏移参与切分：UTF-16 的换行对齐判定与「首行剥 BOM」都依赖它。
+        let texts = encoding::split_inclusive(&buf, start_off, self.encoding_def());
 
         let mut items: Vec<LogLine> = Vec::with_capacity(texts.len());
         for (i, text) in texts.into_iter().enumerate() {
@@ -357,7 +420,8 @@ impl TabSession {
             return Ok(SearchPage::empty(total)); // 起点已超出文件末尾
         };
         let ac = search::build_matcher(query, case_sensitive)?;
-        let (hits, complete) = search::scan_file_from(&path, start_off, from, &ac, kind)?;
+        let (hits, complete) =
+            search::scan_file_from(&path, start_off, from, &ac, kind, self.encoding_def())?;
         Ok(SearchPage {
             hits,
             complete,
@@ -414,7 +478,7 @@ impl TabSession {
         let mut buf = vec![0u8; (end_off - start_off) as usize];
         file.read_exact(&mut buf)
             .map_err(|e| format!("读取窗口失败: {e}"))?;
-        let window_texts = crate::tail::split_lines_inclusive(&buf);
+        let window_texts = encoding::split_inclusive(&buf, start_off, self.encoding_def());
 
         // 生成行对象（alloc 新 id，保证与既有行/历史行标识不冲突），
         // 并记录目标行在窗口内的位置。
@@ -495,20 +559,70 @@ impl AppState {
     pub fn close(&self, tab_id: &str) {
         let session = self.sessions.lock().remove(tab_id);
         if let Some(s) = session {
+            // 与监控线程的 emit 互斥：确保「关掉之后」不再有事件发出。
+            let _gate = s.emit_gate.lock();
             s.stop.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// 换掉指定 tab 的会话（换编码时用），返回新会话。
+    ///
+    /// 为什么整体换会话而不是就地改字段：编码决定**换行符的字节形态**
+    /// （UTF-8 是 1 字节、UTF-16 是 2 字节），一旦变，行索引的采样偏移、pending
+    /// 残片、已加载窗口全部失效。就地重置要在五六个字段上各写一遍，漏一处就是
+    /// 「行号对但内容错位」这种极难查的 bug；新建一个 TabSession 天然干净。
+    ///
+    /// 唯一需要搬过去的是**过滤条件**：用户不该因为换个编码就丢掉正在过滤的关键词。
+    /// 旧会话的监控线程与索引预热任务随后由 `stop` 信号退出（新会话是新的 stop）。
+    ///
+    /// **顺序很重要**：先建好新会话（此时还没人知道它），再拿旧会话的 `emit_gate`
+    /// 置 `stop`，最后替换 map 里的条目。持闸门置位保证旧会话的最后一个事件一定
+    /// 先于新会话的首次 reset 送达前端；而替换放在置位之后，则保证任何在
+    /// `get()` 里读到旧会话的命令（如并发的 `set_filter`）不会对着一个「已经不在
+    /// map 里」的会话操作。
+    pub fn replace_session(&self, tab_id: &str) -> Arc<TabSession> {
+        let mut sessions = self.sessions.lock();
+        let filter_spec = sessions.get(tab_id).map(|s| s.filter_spec());
+        let fresh = Arc::new(TabSession::new());
+        if let Some(spec) = filter_spec {
+            fresh.apply_filter(spec);
+        }
+        if let Some(old) = sessions.get(tab_id) {
+            let _gate = old.emit_gate.lock();
+            old.stop.store(true, Ordering::SeqCst);
+        }
+        sessions.insert(tab_id.to_string(), fresh.clone());
+        fresh
     }
 }
 
 /// 为指定 tab 的会话启动文件监控（命令层先 get_or_create 会话）。
-pub fn start_watching_for_session(app: AppHandle, tab_id: String, session: Arc<TabSession>, path: PathBuf) {
+///
+/// `encoding_choice` 是用户的**选择**（`auto` 或目录 id，见 [`crate::encoding`]）：
+/// 这里把它解析成具体编码（`auto` 会读文件头部探测），解析结果写回会话并用于
+/// 建 reader（换行形态 + 解码）。返回解析出的编码信息，供前端状态栏显示。
+pub fn start_watching_for_session(
+    app: AppHandle,
+    tab_id: String,
+    session: Arc<TabSession>,
+    path: PathBuf,
+    encoding_choice: String,
+) -> EncodingInfo {
     // 打开新文件：清空该 tab 旧文件的残留状态。
     session.clear();
     session.invalidate_total_lines();
 
+    // 编码解析要在建 reader 之前：换行符形态由它决定。
+    let resolved = encoding::resolve(&path, &encoding_choice);
+    session.set_encoding_resolved(encoding_choice, resolved);
+    let info = session
+        .encoding_info()
+        .expect("刚刚写入过编码信息，必然存在");
+    let def = resolved.def;
+
     // 先加载初始尾部。
     perf::mark("open:tail-start");
-    let mut reader = TailReader::new(path.clone());
+    let mut reader = TailReader::new(path.clone(), def);
     let (initial, first_line_no) = match reader.init_tail(1000) {
         Ok(v) => v,
         Err(e) => {
@@ -521,10 +635,25 @@ pub fn start_watching_for_session(app: AppHandle, tab_id: String, session: Arc<T
     let total_lines = reader.total_lines();
     let avg_line_len = reader.index.lock().avg_line_len();
     // reset=true：告知前端这是全新加载，替换现有视图而非追加。
-    let _ = app.emit(
-        "log-lines",
-        LinesPayload { tab_id: tab_id.clone(), lines: matched, reset: true, total_lines, avg_line_len },
-    );
+    // apply_when_paused=true：打开文件 / 换编码都是用户动作，暂停跟随也得生效
+    //（否则换个编码正文却不动 —— 见 LinesPayload::apply_when_paused）。
+    //
+    // 持 emit_gate 发：与 replace_session / close 的置 stop 互斥，保证同一个 tab 的
+    // 两次「会话重建」事件不会被别的发射点插队颠倒顺序。
+    {
+        let _gate = session.emit_gate.lock();
+        let _ = app.emit(
+            "log-lines",
+            LinesPayload {
+                tab_id: tab_id.clone(),
+                lines: matched,
+                reset: true,
+                apply_when_paused: true,
+                total_lines,
+                avg_line_len,
+            },
+        );
+    }
     perf::mark("open:emit-done");
 
     *session.file_path.lock() = Some(path.clone());
@@ -676,16 +805,27 @@ pub fn start_watching_for_session(app: AppHandle, tab_id: String, session: Arc<T
                     tab_id: tab_id.clone(),
                     lines: std::mem::take(&mut pending_lines),
                     reset: pending_reset,
+                    // 监控线程只会产出「实时数据」的整体替换（轮转 / 截断 / 重写），
+                    // 暂停跟随时前端应当丢弃，别打断用户正在看的内容。
+                    apply_when_paused: false,
                     total_lines,
                     avg_line_len,
                 };
                 pending_reset = false;
                 last_flush = std::time::Instant::now();
-                let _span = info_span!("emit_log_lines", count = payload.lines.len()).entered();
-                let _ = app.emit("log-lines", payload);
+                // 过「取代闸门」再发：换编码会换掉整个会话，本线程可能已经是被取代
+                // 的那个。持锁 emit 保证本批一定落在这个 tab 下一次 reset 之前，
+                // 否则前端会把旧编码解出来的行追加到新视图上（见 TabSession::emit_gate）。
+                let _gate = session.emit_gate.lock();
+                if !stop.load(Ordering::SeqCst) {
+                    let _span = info_span!("emit_log_lines", count = payload.lines.len()).entered();
+                    let _ = app.emit("log-lines", payload);
+                }
             }
         }
     });
+
+    info
 }
 
 /// 后台行索引预热：分块把索引扫到 EOF（每块 [`SCAN_CHUNK_BYTES`]，块间释放锁，
@@ -854,9 +994,77 @@ mod tests {
         assert_eq!(m2[0].text, "bbb two");
     }
 
+    // ==================== 换编码：会话替换 ====================
+
+    /// 换会话（`set_encoding` 的底层）：必须换成一个**新**会话、旧会话收到停止信号、
+    /// 过滤条件搬过去。
+    ///
+    /// 三条都不能少：不换新会话 → 行索引/残片带着旧换行形态；不停旧会话 → 旧监控
+    /// 线程继续往同一个 tab 发事件（正文混入旧编码的行）；不搬过滤条件 → 用户换个
+    /// 编码就把正在过滤的关键词丢了。
     #[test]
-    fn current_view_returns_filtered_lines() {
-        let s = session_with(vec!["ERROR e1", "INFO i1", "ERROR e2"]);
+    fn replace_session_stops_the_old_one_and_keeps_the_filter() {
+        let state = AppState::new();
+        let old = state.get_or_create("t1");
+        old.apply_filter(FilterSpec {
+            keywords: vec!["ERROR".to_string()],
+            regex: None,
+            case_sensitive: false,
+        });
+        assert!(old.filter.lock().is_active(), "前置条件：旧会话在过滤");
+
+        let fresh = state.replace_session("t1");
+
+        assert!(!std::sync::Arc::ptr_eq(&old, &fresh), "必须换成一个新会话");
+        assert!(old.stop.load(Ordering::SeqCst), "旧会话必须收到停止信号");
+        assert!(!fresh.stop.load(Ordering::SeqCst), "新会话不该带着停止信号");
+        assert_eq!(
+            fresh.filter_spec().keywords,
+            vec!["ERROR".to_string()],
+            "过滤条件必须搬到新会话"
+        );
+        assert!(fresh.filter.lock().is_active());
+        let registered = state.get("t1").expect("会话应仍在 map 里");
+        assert!(
+            std::sync::Arc::ptr_eq(&registered, &fresh),
+            "map 里的会话必须已经是新的那个"
+        );
+    }
+
+    /// 会话不存在时 `replace_session` 也要能建出一个（等价于新建），不 panic。
+    #[test]
+    fn replace_session_on_a_missing_tab_creates_one() {
+        let state = AppState::new();
+        let fresh = state.replace_session("nope");
+        assert!(!fresh.stop.load(Ordering::SeqCst));
+        assert!(state.get("nope").is_some());
+    }
+
+    /// `LinesPayload` 的序列化契约：前端按这些键名读。
+    ///
+    /// 尤其是 `apply_when_paused` —— 它决定「暂停跟随时换编码要不要生效」。键名改动
+    /// 不会编译报错，只会静默退化成「前端读到 undefined → 一律丢弃」，也就是这个
+    /// 功能在暂停跟随时失效。
+    #[test]
+    fn lines_payload_serializes_with_the_documented_keys() {
+        let json = serde_json::to_string(&LinesPayload {
+            tab_id: "tab-1".to_string(),
+            lines: vec![LogLine::new(1, 1, "hi".to_string())],
+            reset: true,
+            apply_when_paused: true,
+            total_lines: 42,
+            avg_line_len: Some(12.5),
+        })
+        .unwrap();
+        assert!(json.contains(r#""tab_id":"tab-1""#), "{json}");
+        assert!(json.contains(r#""reset":true"#), "{json}");
+        assert!(json.contains(r#""apply_when_paused":true"#), "{json}");
+        assert!(json.contains(r#""total_lines":42"#), "{json}");
+        assert!(json.contains(r#""avg_line_len":12.5"#), "{json}");
+    }
+
+    #[test]
+    fn current_view_returns_filtered_lines() {        let s = session_with(vec!["ERROR e1", "INFO i1", "ERROR e2"]);
         // 未过滤：全量。
         assert_eq!(s.current_view().len(), 3);
         // 过滤 error 后：只剩 2 行。
@@ -915,7 +1123,7 @@ mod tests {
 
         let s = TabSession::new();
         *s.file_path.lock() = Some(path.clone());
-        let mut reader = TailReader::new(path.clone());
+        let mut reader = TailReader::new(path.clone(), encoding::utf8());
         let _ = reader.init_tail(10).unwrap();
         *s.index.lock() = reader.index.clone();
         *s.reader.lock() = Some(reader);
@@ -1010,7 +1218,7 @@ mod tests {
 
         let s = TabSession::new();
         *s.file_path.lock() = Some(path.clone());
-        let mut reader = TailReader::new(path.clone());
+        let mut reader = TailReader::new(path.clone(), encoding::utf8());
         let _ = reader.init_tail(100).unwrap();
         *s.index.lock() = reader.index.clone();
         *s.reader.lock() = Some(reader);
@@ -1142,7 +1350,7 @@ mod tests {
             .unwrap_or(19_000);
         let s = TabSession::new();
         *s.file_path.lock() = Some(PathBuf::from(&path));
-        let mut reader = TailReader::new(PathBuf::from(&path));
+        let mut reader = TailReader::new(PathBuf::from(&path), encoding::utf8());
         let _ = reader.init_tail(10).unwrap();
         *s.index.lock() = reader.index.clone();
         *s.reader.lock() = Some(reader);

@@ -1,6 +1,6 @@
 [package]
 name = "loglens"
-version = "0.4.0"
+version = "0.5.0"
 description = "LogLens — 大日志实时查看器（tail-follow + 过滤 + 稀疏虚拟滚动）"
 authors = ["you"]
 edition = "2021"
@@ -37,6 +37,11 @@ regex = "1"
 aho-corasick = "1"
 parking_lot = "0.12"
 tracing = "0.1"
+# 文本编码（GBK/GB18030、Big5、Shift_JIS、UTF-16 等中文日志常见编码）：
+# 选 encoding_rs 而不是 iconv / 系统 API——它是 WHATWG Encoding 标准的完整实现
+# （Firefox 用的就是这一份），纯 Rust 无 C 依赖，自带 BOM 嗅探与「按编码 lossy
+# 解码」（非法字节替换为 U+FFFD，与既有 String::from_utf8_lossy 同语义、不 panic）。
+encoding_rs = "0.8"
 # 设置页要枚举「本机所有可用字体」：走 DirectWrite 的系统字体集（与 WebView2 取字体
 # 用的是同一份集合）。版本与 tauri 传递依赖的版本一致，不会多编译一份。
 windows = { version = "0.61", features = ["Win32_Graphics_DirectWrite"] }

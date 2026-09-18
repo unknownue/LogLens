@@ -1,0 +1,324 @@
+/* ===== 底部状态栏 =====
+ *
+ * 24px 固定高度的一条：左侧行数、右侧编码。背景用 --bg-bar（与 tab 栏、工具栏
+ * 同一层色），上边一条 --border 收边，视觉上「窗口到此为止」。
+ *
+ * 颜色全部走主题变量：浅色主题下自动跟着换，不需要 :root[data-theme="light"] 覆盖。
+ */
+
+.statusbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  height: 24px;
+  flex-shrink: 0;
+  padding: 0 4px;
+  background-color: var(--bg-bar);
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-dim);
+  user-select: none;
+  /* 状态栏是「信息条」不是内容区：里面的文字不该被拖选（与 tab 栏一致）。 */
+  white-space: nowrap;
+}
+
+.statusbar-side {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.statusbar-right {
+  justify-content: flex-end;
+}
+
+.statusbar-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 3px;
+  color: var(--text-muted);
+  font: inherit;
+  /* 按钮形态的状态项：去掉原生外观，靠 hover 背景表达可点。 */
+  background: none;
+  border: none;
+  cursor: default;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.statusbar-lines {
+  /* 行数是被动信息，不做 hover 反馈（避免看起来可点）。 */
+  color: var(--text-dim);
+}
+
+button.statusbar-encoding {
+  cursor: pointer;
+}
+
+button.statusbar-encoding:hover:not(:disabled) {
+  background-color: var(--bg-hover);
+  color: var(--text-bright);
+}
+
+/* 不可切换（二进制表格视图）：保持可见但明显是禁用态 ——
+   直接隐藏会让状态栏在不同视图间跳动。 */
+button.statusbar-encoding:disabled {
+  cursor: default;
+  opacity: 0.55;
+  color: var(--text-dim);
+}
+
+.statusbar-busy {
+  color: var(--accent-soft);
+}
+
+/* 编码名可能很长（`Windows-1252 · ANSI 1252 / Latin-1`）：截断而不撑破布局。 */
+.statusbar-encoding-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ===== 编码选择弹窗 ===== */
+
+.encoding-modal {
+  display: flex;
+  flex-direction: column;
+  width: min(760px, 92vw);
+  height: min(520px, 82vh);
+  background-color: var(--bg-bar);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+}
+
+.encoding-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.encoding-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-bright);
+}
+
+/* 只看文件名：全路径太长，标题栏放不下；完整路径在 title 里。 */
+.encoding-file {
+  font-size: 12px;
+  color: var(--path);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 45%;
+}
+
+.encoding-spacer {
+  flex: 1;
+}
+
+.encoding-close {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+.encoding-close:hover {
+  background-color: var(--bg-hover);
+  color: var(--text-bright);
+}
+
+.encoding-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.encoding-list {
+  width: 240px;
+  flex-shrink: 0;
+  overflow-y: auto;
+  padding: 6px;
+  border-right: 1px solid var(--border);
+}
+
+.encoding-group {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 8px 6px 4px;
+}
+
+.encoding-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  width: 100%;
+  padding: 4px 8px;
+  border: none;
+  border-radius: 3px;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.encoding-item:hover {
+  background-color: var(--bg-hover);
+}
+
+.encoding-item.selected {
+  background-color: var(--accent);
+  color: #ffffff;
+}
+
+.encoding-item-name {
+  flex-shrink: 0;
+}
+
+/* 别名（`ANSI 936`）跟在名字后面，弱化显示。 */
+.encoding-item-note {
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.encoding-item.selected .encoding-item-note {
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.encoding-note {
+  padding: 8px;
+  font-size: 11px;
+  color: var(--warn);
+}
+
+.encoding-preview {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+}
+
+.encoding-preview-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding-bottom: 6px;
+}
+
+/* 「这个编码解出来乱码很多」的提醒：用 --warn，浅色主题下自动换成深琥珀。 */
+.encoding-preview-warn {
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--warn);
+}
+
+.encoding-preview-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  margin: 0;
+  padding: 8px;
+  background-color: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--font-stack);
+  font-size: var(--log-font-size);
+  line-height: 1.5;
+  color: var(--text);
+  /* 保留换行（预览要看行结构），长行折行而不是横向滚动。 */
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.encoding-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.encoding-current {
+  color: var(--text-muted);
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.encoding-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  max-width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 应用失败（后端拒绝 / 文件已被删除）：就地显示，弹窗保持打开。
+   与「提示」同一位置，两者互斥（有错误时不显示提示）。 */
+.encoding-error {
+  font-size: 11px;
+  color: var(--error);
+  max-width: 52%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.encoding-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--border-light);
+  border-radius: 3px;
+  background-color: var(--bg);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.encoding-btn:hover:not(:disabled) {
+  background-color: var(--bg-hover);
+}
+
+.encoding-btn.primary {
+  background-color: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+}
+
+.encoding-btn.primary:hover:not(:disabled) {
+  background-color: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.encoding-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}

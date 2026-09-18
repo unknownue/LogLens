@@ -245,7 +245,7 @@ const PHASE1 = `
     push("buttons in panel", visiblePanel().querySelectorAll("button").length);
     push("tab warns", warnCount());
     push("tab title", document.querySelector(".tabbar .tab-title")?.textContent);
-    push("total lines label", document.querySelector(".total-lines")?.textContent);
+    push("total lines label", document.querySelector(".statusbar-lines")?.textContent);
     push("copy-view disabled", document.querySelector("button.copy-view")?.disabled);
     push("log rows in panel", visiblePanel().querySelectorAll(".row").length);
 
@@ -261,7 +261,10 @@ const PHASE1 = `
     check(warnCount() === 1, "tab 栏应有一个警告标记，实际 " + warnCount());
     check(visiblePanel().querySelectorAll(".row").length === 0, "状态页不该渲染日志行");
     check(document.querySelector("button.copy-view")?.disabled === true, "状态页应禁用「复制当前视图」");
-    check((document.querySelector(".total-lines")?.textContent ?? "") === "", "状态页不该显示总行数");
+    check(
+      !/\d/.test(document.querySelector(".statusbar-lines")?.textContent ?? ""),
+      "状态页不该显示总行数（状态栏左侧应是无数字的占位）"
+    );
 
     // ---------- 2. 同一路径再次打开：不新增 tab，仍是那一行提示 ----------
     const before = tabCount();

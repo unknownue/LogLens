@@ -828,7 +828,7 @@ const PHASE3 = `
     await sleep(600);
     push("first tab view", view());
     check(view() === "md-view", "回到第一个 tab 应仍是 Markdown 预览");
-    push("total lines label", document.querySelector(".total-lines")?.textContent);
+    push("total lines label", document.querySelector(".statusbar-lines")?.textContent);
   } catch (e) {
     fails.push("phase3 threw: " + (e && e.message ? e.message : String(e)));
   }

@@ -24,6 +24,8 @@ use std::path::Path;
 
 use aho_corasick::AhoCorasick;
 
+use crate::encoding::EncodingDef;
+
 /// 单次前向搜索的命中数上限。
 ///
 /// 命中窗口整体经 IPC 传给前端（`search_lines` 的返回值），
@@ -126,28 +128,25 @@ pub(crate) fn collect_line_hits(
     false
 }
 
-/// 把一行原始字节交给匹配器（去掉行尾 \r；非法 UTF-8 按 lossy 解码，与前端经
-/// `get_lines`/`get_range` 收到的行文本口径一致）。返回 true = 命中数已达上限。
-fn emit_line(
+/// 把一行**已解码**的文本交给匹配器。返回 true = 命中数已达上限。
+///
+/// 解码（含按编码替换非法字节、剥行尾 `\r`）由 [`crate::encoding::split_complete`]
+/// 统一完成，与前端经 `get_lines`/`get_range` 收到的行文本口径完全一致。
+fn emit_text(
     ac: &AhoCorasick,
     kind: MatchKind,
-    raw: &[u8],
+    text: &str,
     file_line: u64,
     hits: &mut Vec<SearchHit>,
 ) -> bool {
-    let raw = if raw.last() == Some(&b'\r') {
-        &raw[..raw.len() - 1]
-    } else {
-        raw
-    };
-    let text = String::from_utf8_lossy(raw);
-    collect_line_hits(ac, kind, &text, file_line, hits)
+    collect_line_hits(ac, kind, text, file_line, hits)
 }
 
 /// 整文件路径：从字节偏移 `start_off` 起流式向后扫描到文件末尾。
 ///
 /// - `first_line_no` 是 `start_off` 处那一行的文件行号（1-based，由行索引 `locate_line`
 ///   定位得到，因此必然落在行首、行号精确）。
+/// - `def` 是当前生效的编码：决定换行符形态与解码方式（UTF-16 的换行是 2 字节）。
 /// - 每块读取前重取文件大小：文件在扫描期间被追加时能看到新字节；变小（截断/轮转）
 ///   或句柄失效时按「已扫到的内容」提前收工，返回 `complete = true` 而不是报错。
 /// - 跨块行用 `pending` 残片缓冲拼接；其内存上界 = 最长的一条未换行行
@@ -160,6 +159,7 @@ pub(crate) fn scan_file_from(
     first_line_no: u64,
     ac: &AhoCorasick,
     kind: MatchKind,
+    def: &'static EncodingDef,
 ) -> Result<(Vec<SearchHit>, bool), String> {
     let mut file = crate::tail::open_shared_file(path).map_err(|e| format!("打开文件失败: {e}"))?;
     file.seek(SeekFrom::Start(start_off))
@@ -194,34 +194,25 @@ pub(crate) fn scan_file_from(
             break; // 期望还有字节却读到 EOF：截断/轮转
         }
 
-        let mut line_start = 0usize;
-        let mut stop = false;
-        for i in 0..n {
-            if buf[i] != b'\n' {
-                continue;
-            }
-            let done = if pending.is_empty() {
-                emit_line(ac, kind, &buf[line_start..i], line_no, &mut hits)
-            } else {
-                // 上一块末尾的残片 + 本块首个换行之前的部分 = 完整的一行。
-                pending.extend_from_slice(&buf[line_start..i]);
-                let done = emit_line(ac, kind, &pending, line_no, &mut hits);
-                pending.clear();
-                done
-            };
+        // 残片 + 本块拼成一段连续字节再切行：换行符可能横跨块边界（UTF-16 是
+        // 2 字节），交给 Splitter 统一处理比在块内手写状态机可靠。
+        let pending_len = pending.len() as u64;
+        let mut combined = std::mem::take(&mut pending);
+        combined.extend_from_slice(&buf[..n]);
+        let base = pos - pending_len;
+        let (lines, rest) = crate::encoding::split_complete(&combined, base, def);
+        pending = rest;
+
+        for text in &lines {
+            let done = emit_text(ac, kind, text, line_no, &mut hits);
             line_no += 1;
-            line_start = i + 1;
             if done {
                 capped = true;
-                stop = true;
                 break;
             }
         }
-        if stop {
+        if capped {
             break;
-        }
-        if line_start < n {
-            pending.extend_from_slice(&buf[line_start..n]);
         }
         pos += n as u64;
     }
@@ -229,7 +220,17 @@ pub(crate) fn scan_file_from(
     // 读到文件末尾时，末尾未换行的残片就是最后一行（与总行数/按行读取口径一致）。
     // 命中封顶而提前收工时不再处理残片（续扫会从该行重新开始）。
     if at_eof && !capped && !pending.is_empty() {
-        emit_line(ac, kind, &pending, line_no, &mut hits);
+        // 残片的绝对起点 = 已扫到的位置 - 残片长度。只有它正好是文件第 0 字节时才剥
+        // BOM —— 否则正文里一个真实的 U+FEFF 会被吃掉，而命中偏移是按文本算的，
+        // 与显示路径（`split_inclusive`）的口径就对不上了。
+        let line_start = pos.saturating_sub(pending.len() as u64);
+        let raw = if line_start == 0 {
+            crate::encoding::strip_bom(&pending, def)
+        } else {
+            &pending[..]
+        };
+        let text = crate::encoding::decode_line(raw, def);
+        emit_text(ac, kind, &text, line_no, &mut hits);
     }
 
     Ok((hits, !capped))
@@ -241,6 +242,7 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
 
+    use crate::encoding;
     use crate::filter::FilterSpec;
     use crate::state::TabSession;
     use crate::tail::TailReader;
@@ -250,7 +252,7 @@ mod tests {
     fn session_for_file(path: &Path) -> Arc<TabSession> {
         let s = TabSession::new();
         *s.file_path.lock() = Some(path.to_path_buf());
-        let mut reader = TailReader::new(path.to_path_buf());
+        let mut reader = TailReader::new(path.to_path_buf(), encoding::utf8());
         // 只加载尾部极少行：整文件路径不依赖已加载窗口。
         let _ = reader.init_tail(2).unwrap();
         *s.index.lock() = reader.index.clone();
