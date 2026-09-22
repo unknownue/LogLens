@@ -10,9 +10,9 @@ import type { CfgColumn, CfgValue } from "./cfg-types.ts";
 import { fmtValue } from "./cfg-types.ts";
 
 /** 单元格左右内边距之和（与 .cfg-cell 的 padding: 3px 8px 对齐）。 */
-const CELL_PADDING_X = 16;
+export const CELL_PADDING_X = 16;
 /** 行高亮/边框等留一点余量，避免文字刚好顶到边界。 */
-const CELL_FUDGE = 2;
+export const CELL_FUDGE = 2;
 /** 列宽下限：比表头文字还窄会很难看。 */
 export const MIN_COL_W = 72;
 /** 列宽上限：单个超长值（数组/字典串）不应把整列撑开、把其它列挤出屏幕。 */

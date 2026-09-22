@@ -1732,7 +1732,10 @@ body,
   color: var(--text-bright);
 }
 
-/* ==================== client_cfg 表格视图 ==================== */
+/* ==================== 表格视图（配置表 / CSV 共用） ====================
+   两种表格后端（.bin 配置表、CSV 文本）长得一样，共用这一组 .cfg-* 类
+   （前缀是历史命名：这里最早只服务 client_cfg 配置表）。网格本身见
+   src/views/TableGrid.tsx。 */
 
 .cfg-tab {
   flex: 1;
@@ -1799,6 +1802,93 @@ body,
   justify-content: center;
   color: var(--text-dim);
   padding: 20px;
+}
+
+/* 错误面板的标题行与建议行（CSV 页用：标题给「这是什么错误」，
+   建议行说明下一步能做什么 —— 后端原文单独一行，是给排查用的）。 */
+.cfg-error-title {
+  color: var(--text);
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.cfg-error-hint {
+  margin-top: 10px;
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+/* CSV 表格被行数 / 字节上限截断时的横幅（表头之上、工具栏之下） */
+.cfg-banner {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  background: var(--bg-hover);
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+/* 分隔符下拉（CSV 表格工具栏） */
+.cfg-delim {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.cfg-delim-select {
+  background: var(--bg-hover);
+  color: var(--text);
+  border: 1px solid var(--border-light);
+  border-radius: 3px;
+  padding: 1px 4px;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+/* 「首行为表头」开关（CSV 表格工具栏） */
+.cfg-check {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.cfg-check input {
+  cursor: pointer;
+  margin: 0;
+}
+
+/* 表格的定位容器：让页内查找框（.find-widget，绝对定位）悬浮在表格右上角。
+   与 .list-wrap 同构 —— 文本视图的搜索框就挂在那样一个相对定位的容器里，
+   两个视图的查找框因此落在同一位置、同一层级。 */
+.table-holder {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+
+/* 表格里的查找命中：与文本视图**同一套配色**（靛蓝实心块 / 当前命中品红 + 亮环），
+   见下方 .row .text .find-mark 的注释（配色与对比度是整套算过的）。 */
+.cfg-cell .find-mark {
+  background: #4b3fd6;
+  color: #ffffff;
+  border-radius: 2px;
+  padding: 0 1px;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.22);
+}
+
+.cfg-cell .find-mark.current {
+  background: #c2185b;
+  color: #ffffff;
+  box-shadow: 0 0 0 1px #ffffff, 0 0 6px 1px rgba(255, 255, 255, 0.75);
 }
 
 .cfg-scroll {

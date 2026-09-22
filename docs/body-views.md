@@ -23,11 +23,15 @@
 |------|------|
 | `src/views/body-view.ts` | 框架核心（纯逻辑）：公共 props、错误分类 `classifyOpenError`、`BodyViewRegistry` |
 | `src/views/app-body-views.ts` | **本应用的页面清单**：`id` / 优先级 / 命中规则 + `resolveAppBodyViewId`（纯数据，可单测） |
+| `src/views/table-kind.ts` | 表格视图的两种后端按扩展名分工的规则（`.bin` → 配置表 / 其余 → CSV），纯函数 |
 | `src/views/BodyViewHost.tsx` | 宿主：解析页面、写 `data-view`、页面级错误边界（页面崩了不白屏） |
 | `src/views/use-body-view.ts` | 公共生命周期 hook：激活时注册「复制当前视图」/ 上报行数，失活时注销 |
 | `src/views/NoticeLine.tsx` | 状态页外壳：正文区正中一行说明文字（含悬停提示） |
 | `src/views/FileMissingView.tsx` | 「文件不存在」状态页 |
 | `src/views/OpenErrorView.tsx` | 通用「打开失败」状态页（权限 / IO / 格式…） |
+| `src/views/TableGrid.tsx` | 共用表格网格（粘性表头 + 虚拟行 + 列宽），配置表页与 CSV 页共用 |
+| `src/views/CsvTableTab.tsx` | CSV / TSV 表格页（表格视图的文本后端）—— 见 [csv-view.md](csv-view.md) |
+| `src/CfgTableTab.tsx` | 配置表页（表格视图的二进制后端） |
 | `App.tsx` 的 `APP_BODY_VIEW_RENDERERS` | 「页面 id → 怎么渲染」：页面专属属性在这里组装，App 侧回调在这里注入 |
 
 ## 选择规则（优先级从高到低）
@@ -36,7 +40,8 @@
 |-------|---------|---------|------|
 | 100 | `file-missing` | 错误分类 = `missing` 且缺的是**文件本体** | 内容根本加载不出来，直接说明是哪件事、哪个路径 |
 | 40 | `md-view` | `viewMode === "md"` | Markdown 预览（自带「读取失败 + 重试」面板） |
-| 30 | `cfg-table` | `viewMode === "cfg"` | 表格视图自带错误面板（可重选 schema），故排在通用错误页之前 |
+| 32 | `csv-table` | `viewMode === "table"` 且扩展名不是 `.bin` | CSV / TSV 表格（自带「换分隔符 / 重新解析」面板） |
+| 30 | `cfg-table` | `viewMode === "table"` 且扩展名是 `.bin` | 配置表（自带「选择 schema」面板） |
 | 20 | `open-error` | 错误分类 = `denied` / `other` | 通用状态页，兜住未预料的失败 |
 | 0 | `text-log` | 永远命中（`fallback`） | 文本日志视图 |
 
@@ -46,9 +51,10 @@
   不放按钮。理由：这类页面只有一句话的信息量，堆操作反而把「看一眼就知道怎么回事」
   变成了「先读一排按钮」；要重新定位文件直接再打开一次即可。
 - **`file-missing` 优先于一切内容视图**：文件不在，表格 / 文本都没有数据可显示。
-- **内容视图（`md-view` / `cfg-table`）优先于 `open-error`**：它们各自带错误面板
-  （Markdown 页能原地重读，表格页能重选 schema），不能被通用错误页顶掉。
-  两者的 `match` 由 `viewMode` 决定、互斥，优先级只影响「谁先被检查」。
+- **内容视图（`md-view` / `csv-table` / `cfg-table`）优先于 `open-error`**：它们各自带
+  错误面板（Markdown 页能原地重读、CSV 页能换分隔符重解析、配置表页能重选 schema），
+  不能被通用错误页顶掉。三者的 `match` 由 `viewMode`（表格再加扩展名）决定、互斥，
+  优先级只影响「谁先被检查」。
 - **「缺 schema」不是「缺文件」**：`classifyOpenError` 把
   `schema 文件不存在: …` 归到 `subject: "schema"`，此时仍留在表格视图里重选 schema ——
   否则页面会把**存在**的 bin 路径当成缺失文件展示。
@@ -127,10 +133,12 @@ App 的静态 import 就会把它拖回主 chunk，每次启动都要解析这�
 ```powershell
 pnpm run build                                  # tsc + vite（类型与打包）
 node --test tools/verify-body-views.test.mjs    # 规则单测：错误分类 / 页面优先级（无需浏览器）
+node --test tools/verify-csv.test.mjs           # CSV 页的纯规则（表种 / 表头切分 / 列宽，无需浏览器）
 node --test tools/verify-markdown.test.mjs      # Markdown 页的管线规则（无需浏览器）
 
 pnpm run dev                                    # 另开一个终端：Vite dev server (127.0.0.1:5173)
 node tools/e2e-file-missing.mjs --launch        # 浏览器端到端：CDP + mock 后端驱动真实交互
+node tools/e2e-csv.mjs --launch                 # CSV 表格页的端到端（默认模式/分隔符/表头/复制/截断）
 node tools/e2e-markdown.mjs --launch            # Markdown 预览页的端到端（清洗/公式/查找/链接）
 node tools/e2e-file-missing.mjs --launch --theme light --shot %TEMP%\loglens-e2e
                                                 # 浅色主题 + 导出成品截图
@@ -139,5 +147,6 @@ node tools/e2e-file-missing.mjs --launch --theme light --shot %TEMP%\loglens-e2e
 端到端脚本覆盖的场景：会话恢复到一个已删除的文件 → 正文是一行「文件不存在：<路径>」
 （无按钮）→ 同一路径再次打开不新增 tab → 文件恢复后再次打开自动切回文本视图 →
 拒绝访问走通用错误页 → 表格视图选 schema / 渲染 / 复制 / 切回文本。
-Markdown 页另有一份端到端脚本（`tools/e2e-markdown.mjs`），覆盖内容见
-[markdown-view.md](markdown-view.md) 的「验证」一节。
+CSV 表格页另有自己的端到端脚本（`tools/e2e-csv.mjs`），覆盖内容见
+[csv-view.md](csv-view.md) 的「验证」一节。
+Markdown 页的端到端脚本覆盖内容见 [markdown-view.md](markdown-view.md) 的「验证」一节。

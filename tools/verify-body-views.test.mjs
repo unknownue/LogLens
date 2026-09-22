@@ -8,8 +8,8 @@
 //
 // 覆盖两件事：
 //   1. 后端错误文本 → 分类（真实消息样本，含容易误判的样本）；
-//   2. 应用真实页面表的优先级 —— 「文件不存在 / 表格 / 通用错误 / 文本」的先后顺序，
-//      这是最容易加页面时插错位置的地方。
+//   2. 应用真实页面表的优先级 —— 「文件不存在 / 表格（两种后端）/ 通用错误 / 文本」
+//      的先后顺序，这是最容易加页面时插错位置的地方。
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -21,8 +21,12 @@ import { APP_BODY_VIEWS, resolveAppBodyViewId } from "../src/views/app-body-view
 
 /** 造一个「无错误」状态。 */
 const ok = { kind: "none" };
-/** 造一个「分类结果」状态。 */
-const state = (error, viewMode) => ({ error, viewMode });
+/** 造一个「分类结果」状态（path 决定表格视图用哪个后端，默认按普通日志）。 */
+const state = (error, viewMode, path = "D:\\logs\\a.log") => ({ error, viewMode, path });
+/** 一个 CSV 路径（表格视图的文本后端）。 */
+const CSV = "D:\\logs\\export\\items.csv";
+/** 一个配置表 bin 路径（表格视图的二进制后端）。 */
+const BIN = "D:\\Logs\\cfg\\client_cfg\\default\\pic_guide_data.bin";
 
 test("no error text is classified as none", () => {
   assert.equal(classifyOpenError(undefined).kind, "none");
@@ -156,21 +160,28 @@ test("the app view table declares exactly one fallback and unique ids", () => {
   );
   assert.deepEqual(
     reg.definitions.map((d) => d.id),
-    ["file-missing", "md-view", "cfg-table", "open-error", "text-log"]
+    ["file-missing", "md-view", "csv-table", "cfg-table", "open-error", "text-log"]
   );
-  // 内容视图（表格 / Markdown）必须排在通用错误页之前，否则它们自带的
+  // 内容视图（表格两种后端 / Markdown）必须排在通用错误页之前，否则它们自带的
   // 「失败 + 重试 / 重选 schema」面板永远没机会出现。
   const priorities = Object.fromEntries(APP_BODY_VIEWS.map((s) => [s.id, s.priority]));
   assert.ok(priorities["md-view"] > priorities["open-error"]);
+  assert.ok(priorities["csv-table"] > priorities["open-error"]);
+  assert.ok(priorities["cfg-table"] > priorities["open-error"]);
   assert.ok(priorities["md-view"] > priorities["cfg-table"], "Markdown 页的失败面板要在最前");
   assert.ok(priorities["file-missing"] > priorities["md-view"], "文件不存在时谁都不能抢");
 });
 
-test("a healthy tab resolves to the text view", () => {
+test("a healthy tab resolves to the text view (or the view its mode asks for)", () => {
   assert.equal(resolveAppBodyViewId(state(ok)), "text-log");
   assert.equal(resolveAppBodyViewId(state(ok, "text")), "text-log");
-  assert.equal(resolveAppBodyViewId(state(ok, "cfg")), "cfg-table");
   assert.equal(resolveAppBodyViewId(state(ok, "md")), "md-view");
+  assert.equal(resolveAppBodyViewId(state(ok, "table", BIN)), "cfg-table");
+  assert.equal(resolveAppBodyViewId(state(ok, "table", CSV)), "csv-table");
+  // .tsv 与手切进表格视图的 .txt / .log 都走 CSV 后端：表格视图只有这两种后端，
+  // 二进制那个只认 .bin。
+  assert.equal(resolveAppBodyViewId(state(ok, "table", "D:\\logs\\a.tsv")), "csv-table");
+  assert.equal(resolveAppBodyViewId(state(ok, "table", "D:\\logs\\a.log")), "csv-table");
 });
 
 test("a markdown tab keeps the markdown view for read errors (it has its own retry)", () => {
@@ -184,11 +195,26 @@ test("a markdown tab keeps the markdown view for read errors (it has its own ret
   assert.equal(resolveAppBodyViewId(state(readErr, "text")), "open-error");
 });
 
+test("a table tab keeps its own page for read errors (each has its own panel)", () => {
+  const readErr = classifyOpenError("读取失败: 拒绝访问。 (os error 5)");
+  assert.equal(
+    resolveAppBodyViewId(state(readErr, "table", CSV)),
+    "csv-table",
+    "CSV 页有「换分隔符 / 重新解析」面板，不能被通用错误页顶掉"
+  );
+  assert.equal(
+    resolveAppBodyViewId(state(readErr, "table", BIN)),
+    "cfg-table",
+    "配置表页有「选择 schema…」面板，同理"
+  );
+});
+
 test("a missing file wins over every content view", () => {
   const missing = classifyOpenError("文件不存在: D:\\logs\\a.log");
   assert.equal(resolveAppBodyViewId(state(missing, "text")), "file-missing");
-  // 表格视图下 bin 丢了：同样是「文件不存在」页面（表格视图拿不到数据）
-  assert.equal(resolveAppBodyViewId(state(missing, "cfg")), "file-missing");
+  // 表格视图下文件丢了：同样是「文件不存在」页面（表格视图拿不到数据）
+  assert.equal(resolveAppBodyViewId(state(missing, "table", BIN)), "file-missing");
+  assert.equal(resolveAppBodyViewId(state(missing, "table", CSV)), "file-missing");
   // Markdown 文档被删除：也走「文件不存在」页（没有内容可渲染）
   assert.equal(resolveAppBodyViewId(state(missing, "md")), "file-missing");
 });
@@ -196,15 +222,16 @@ test("a missing file wins over every content view", () => {
 test("a missing schema keeps the table view (so the schema can be re-picked)", () => {
   const missingSchema = classifyOpenError("schema 文件不存在: C:\\app\\slots.json");
   assert.equal(
-    resolveAppBodyViewId(state(missingSchema, "cfg")),
+    resolveAppBodyViewId(state(missingSchema, "table", BIN)),
     "cfg-table",
     "缺 schema 应由表格视图的错误面板处理（那里有「选择 schema…」）"
   );
 });
 
-test("parse failures keep the table view, other open failures get the generic page", () => {
+test("parse failures keep their table page, other open failures get the generic page", () => {
   const parseErr = classifyOpenError("解析 pic_guide_data 失败: 数据类型不匹配");
-  assert.equal(resolveAppBodyViewId(state(parseErr, "cfg")), "cfg-table");
+  assert.equal(resolveAppBodyViewId(state(parseErr, "table", BIN)), "cfg-table");
+  assert.equal(resolveAppBodyViewId(state(parseErr, "table", CSV)), "csv-table");
   assert.equal(resolveAppBodyViewId(state(parseErr, "text")), "open-error");
 
   const denied = classifyOpenError("读取失败: 拒绝访问。 (os error 5)");

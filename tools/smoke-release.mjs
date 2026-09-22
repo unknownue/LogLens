@@ -130,11 +130,44 @@ const PIC_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFUlEQVR4nGP8z8DAwMDAxMDAwMAAAA0EAQBSV0G5AAAAAElFTkSuQmCC";
 const PIC = join(TMP_DIR, "smoke-pic.png");
 
+// ==================== 临时 CSV 样例 ====================
+//
+// CSV 表格（表格视图的文本后端）同样有「只有打包版才测得到」的部分：解析在 Rust 后端，
+// 走的是真实 Tauri IPC（命令名、参数名、Option 参数的省略、编码层的自动探测），
+// dev 端的 mock 后端把这些全部替换掉了 —— 参数名写错在 E2E 里是看不出来的。
+//
+// 两份样例各守一件事：
+//   1. UTF-8 **带 BOM** + 引号字段（字段内逗号、字段内换行、`""` 转义、空字段）：
+//      BOM 没剥掉的话第一列表头会变成 "\uFEFFname"，界面看不出、却对不上；
+//   2. GBK 编码（国内 Excel 导出的常见形态）：自动探测应落到 GB18030 兜底编码，
+//      中文要原样解出来（这是编码层与 CSV 后端接对了的证据）。
+
+/** UTF-8 + BOM 的 CSV 样例（行数组换行拼起来：第三行开始是多行字段）。 */
+const CSV_FIXTURE = join(TMP_DIR, "smoke.csv");
+const CSV_LINES = [
+  "name,qty,note",
+  'apple,3,"fresh, sweet"',
+  'pear,,"line1',
+  'line2"',
+  'banana,5,"he said ""hi"""',
+  "",
+];
+
+/** GBK 样例的字节（"名称,数量\n苹果,3\n梨,5\n" 按 GBK 编码后的 base64）。 */
+const CSV_GBK_FIXTURE = join(TMP_DIR, "smoke-gbk.csv");
+const CSV_GBK_BASE64 = "w/uzxizK/cG/Csa7ufssMwrA5iw1Cg==";
+
 function writeFixture() {
   mkdirSync(TMP_DIR, { recursive: true });
   writeFileSync(FIXTURE, FIXTURE_LINES.join("\n"), "utf8");
   // 与 fixture 同目录：asset 协议只授权「打开过的文档所在目录」
   writeFileSync(PIC, Buffer.from(PIC_BASE64, "base64"));
+  // CSV 样例：UTF-8 要带 BOM（验 BOM 剥离），GBK 直接用原始字节。
+  writeFileSync(
+    CSV_FIXTURE,
+    Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(CSV_LINES.join("\n"), "utf8")])
+  );
+  writeFileSync(CSV_GBK_FIXTURE, Buffer.from(CSV_GBK_BASE64, "base64"));
 }
 
 // ==================== 进程与清理 ====================
@@ -676,8 +709,169 @@ async function assertAnnotationAndLocalImage() {
   };
 }
 
-// ==================== 截图 ====================
+// ==================== 断言 H：CSV 表格（打包版专属） ====================
 
+/** 页面内定位「当前可见的 CSV 表格页」并读出表头 / 数据行 / 行数文案。 */
+const CSV_PRELUDE = `
+const panel = () => [...document.querySelectorAll(".tab-panel")]
+  .find((p) => p.getBoundingClientRect().height > 0
+    && p.querySelector(".body-view[data-view='csv-table']"));
+const cells = (sel) => [...panel().querySelectorAll(sel)];
+const csvHeads = () => cells(".cfg-head-cell").map((c) => c.textContent.trim());
+const csvRows = () => cells(".cfg-row").map((r) =>
+  [...r.querySelectorAll(".cfg-cell")].map((c) => c.textContent));
+`;
+
+/**
+ * CSV 表格：默认模式 + 真实后端解析 + 编码层。
+ *
+ * 断言的是「接线」而不是解析规则本身（解析规则的细节在 `cargo test --lib csv_table`）：
+ * `.csv` 打开后正文直接是 csv-table 页、表头取首行（BOM 已剥）、引号字段里的逗号与
+ * 换行没有被切开、GBK 文件的中文能解出来。
+ */
+async function assertCsvTable() {
+  const failures = [];
+
+  // ---- 1. UTF-8 + BOM，带引号 / 多行 / 空字段 ----
+  await evaluate(`window.__lvOpenPath(${JSON.stringify(CSV_FIXTURE)})`);
+  await waitFor(
+    async () => await evaluate(`(() => { ${CSV_PRELUDE} return !!panel(); })()`),
+    WAIT_FIXTURE_MS,
+    "CSV 默认进表格视图（.body-view[data-view=csv-table]）"
+  );
+  await sleep(300);
+  const utf8 = JSON.parse(
+    await evaluate(`(() => {
+      ${CSV_PRELUDE}
+      const p = panel();
+      return JSON.stringify({
+        heads: csvHeads(),
+        rows: csvRows(),
+        count: p.querySelector(".cfg-count")?.textContent ?? null,
+        banner: p.querySelector(".cfg-banner")?.textContent ?? null,
+        delimiter: p.querySelector(".cfg-delim-select")?.value ?? null,
+        headersChecked: p.querySelector(".cfg-check input")?.checked ?? null,
+      });
+    })()`)
+  );
+
+  const wantHeads = ["name", "qty", "note"];
+  const wantRows = [
+    ["apple", "3", "fresh, sweet"],
+    ["pear", "", "line1\u240aline2"],
+    ["banana", "5", 'he said "hi"'],
+  ];
+  if (JSON.stringify(utf8.heads) !== JSON.stringify(wantHeads)) {
+    failures.push(
+      `表头不对：${JSON.stringify(utf8.heads)}（BOM 没剥掉时首列会是 "\\uFEFFname"）`
+    );
+  }
+  if (JSON.stringify(utf8.rows) !== JSON.stringify(wantRows)) {
+    failures.push(`数据行不对：${JSON.stringify(utf8.rows)}`);
+  }
+  if (!(utf8.count ?? "").includes("3 行")) {
+    failures.push(`行数/列数文案不对：${JSON.stringify(utf8.count)}`);
+  }
+  if (utf8.banner) {
+    failures.push(`小文件不该出现截断横幅：${JSON.stringify(utf8.banner)}`);
+  }
+  if (utf8.delimiter !== "," || utf8.headersChecked !== true) {
+    failures.push(
+      `工具栏默认值不对：分隔符=${JSON.stringify(utf8.delimiter)}、首行为表头=${utf8.headersChecked}`
+    );
+  }
+
+  // `shoot` 只在传了 --shot 时才有目录可用（其余断言也不截图）。
+  if (SHOT_DIR) {
+    await shoot("03-csv-table.png", { captureBeyondViewport: true });
+  }
+
+  // ---- 2. GBK（Excel 导出的常见形态）：自动探测应解出中文 ----
+  await evaluate(`window.__lvOpenPath(${JSON.stringify(CSV_GBK_FIXTURE)})`);
+  const gbk = await waitFor(
+    async () => {
+      const raw = await evaluate(`(() => {
+        ${CSV_PRELUDE}
+        const p = panel();
+        if (!p) return null;
+        const heads = csvHeads();
+        // 等到「当前可见的表格页」换成了 GBK 那份（表头是中文）
+        if (heads[0] !== "名称") return null;
+        return JSON.stringify({ heads, rows: csvRows() });
+      })()`);
+      return raw ? JSON.parse(raw) : null;
+    },
+    WAIT_FIXTURE_MS,
+    "GBK 样例解析出中文表头"
+  ).catch(() => null);
+
+  if (!gbk) {
+    const raw = await evaluate(`(() => {
+      ${CSV_PRELUDE}
+      return JSON.stringify({ heads: panel() ? csvHeads() : null, rows: panel() ? csvRows() : null });
+    })()`);
+    failures.push(`GBK 样例没解出中文：${raw}（自动探测应落到 GB18030 兜底编码）`);
+  } else if (JSON.stringify(gbk.rows) !== JSON.stringify([["苹果", "3"], ["梨", "5"]])) {
+    failures.push(`GBK 样例数据行不对：${JSON.stringify(gbk.rows)}`);
+  }
+
+  // ---- 3. 页内查找在打包版里也能用（真实的 CSP 下没有内联样式可用） ----
+  await evaluate(`window.__lvOpenPath(${JSON.stringify(CSV_FIXTURE)})`);
+  await waitFor(
+    async () => await evaluate(`(() => { ${CSV_PRELUDE} return !!panel(); })()`),
+    WAIT_FIXTURE_MS,
+    "回到 UTF-8 样例的表格页"
+  );
+  await sleep(300);
+  await evaluate(`document.activeElement?.blur();
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "f", ctrlKey: true, bubbles: true, cancelable: true }));
+    true`);
+  await sleep(300);
+  const findOpen = await evaluate(`(() => { ${CSV_PRELUDE} return !!panel().querySelector(".find-widget"); })()`);
+  if (!findOpen) {
+    failures.push("Ctrl+F 没打开查找框");
+  } else {
+    await evaluate(`(() => {
+      ${CSV_PRELUDE}
+      const input = panel().querySelector(".find-input");
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(input, "fresh");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      return true;
+    })()`);
+    await sleep(600);
+    const find = JSON.parse(
+      await evaluate(`(() => {
+        ${CSV_PRELUDE}
+        const p = panel();
+        return JSON.stringify({
+          count: p.querySelector(".find-count")?.textContent ?? null,
+          mark: p.querySelector(".cfg-cell .find-mark.current")?.textContent ?? null,
+          focus: document.activeElement === p.querySelector(".find-input"),
+        });
+      })()`)
+    );
+    if (find.count !== "1/1" || find.mark !== "fresh") {
+      failures.push(`查找计数/命中不对：count=${JSON.stringify(find.count)}、mark=${JSON.stringify(find.mark)}`);
+    }
+    if (!find.focus) {
+      failures.push("查找框打开后没有聚焦到输入框");
+    }
+    await evaluate(`document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); true`);
+  }
+
+  return {
+    ok: failures.length === 0,
+    detail: [
+      ...failures,
+      `UTF-8+BOM 样例：表头 ${JSON.stringify(utf8.heads)}、${utf8.rows.length} 行数据、分隔符 ${JSON.stringify(utf8.delimiter)}`,
+      `引号字段（含逗号 / 换行 / ""）与空字段都按原文还原；${utf8.banner ? "有截断横幅" : "无截断横幅"}`,
+      `GBK 样例：${gbk ? JSON.stringify(gbk.rows) : "未解出中文"}`,
+      `查找：Ctrl+F 开框 + 聚焦 + 命中计数（"fresh" → 1/1）`,
+    ],
+  };
+}
+
+// ==================== 截图 ====================
 async function shoot(file, params) {
   const r = await cdp.send("Page.captureScreenshot", { format: "png", ...params });
   mkdirSync(SHOT_DIR, { recursive: true });
@@ -852,6 +1046,9 @@ async function main() {
 await check("G", "公式注解可复制 + 本地图片真的加载（打包版专属）", assertAnnotationAndLocalImage);
 
   await captureShots();
+
+  // CSV 表格放在截图之后：它会把 CSV 标签页切到最前，而上面的成品截图要的是 Markdown 页。
+  await check("H", "CSV 默认表格视图 + 真实后端解析（打包版专属）", assertCsvTable);
 
   // ---------- 汇总 ----------
   const failed = results.filter((r) => !r.ok);

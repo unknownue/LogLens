@@ -11,12 +11,19 @@
  * 新增页面的步骤见 docs/body-views.md。
  */
 
-// 显式带 .ts 后缀：本模块（连同 body-view.ts）要能被 Node 的单测直接 import，
-// 见 tools/verify-body-views.test.mjs 与 tsconfig 的 allowImportingTsExtensions。
+// 显式带 .ts 后缀：本模块（连同 body-view.ts / table-kind.ts）要能被 Node 的单测
+// 直接 import，见 tools/verify-body-views.test.mjs 与 tsconfig 的 allowImportingTsExtensions。
 import { BodyViewRegistry, type OpenErrorInfo } from "./body-view.ts";
+import { tableKindOf } from "./table-kind.ts";
 
-/** tab 的视图模式（`undefined` 视为 `text`）。 */
-export type ViewMode = "text" | "cfg" | "md";
+/**
+ * tab 的视图模式（`undefined` 视为 `text`）。
+ *
+ * `table` 是**一个入口、两种后端**：`.bin` 走配置表（配置表页），其余文本走 CSV 解析
+ * （CSV 页）。曾经的取值 `"cfg"` 就是现在的 `"table"`（会话存档读入时迁移，
+ * 见 App.tsx 的 `readSavedTabs`）—— 那时表格视图只服务配置表，现在它服务所有表格。
+ */
+export type ViewMode = "text" | "table" | "md";
 
 /** 解析「该显示哪个页面」所需的 tab 状态子集（与 App 的 TabInfo 结构兼容）。 */
 export interface BodyViewState {
@@ -24,10 +31,18 @@ export interface BodyViewState {
   viewMode?: ViewMode;
   /** 打开/解析失败信息的分类结果（`kind === "none"` = 正常）。 */
   error: OpenErrorInfo;
+  /** tab 绑定的文件路径：表格视图据此判断用哪个后端（见 `table-kind.ts`）。 */
+  path: string;
 }
 
 /** 应用内置的正文页面 id（与 App.tsx 的渲染实现表一一对应）。 */
-export type AppBodyViewId = "file-missing" | "md-view" | "cfg-table" | "open-error" | "text-log";
+export type AppBodyViewId =
+  | "file-missing"
+  | "md-view"
+  | "csv-table"
+  | "cfg-table"
+  | "open-error"
+  | "text-log";
 
 /** 一条页面规则。 */
 export interface AppBodyViewSpec {
@@ -41,6 +56,16 @@ export interface AppBodyViewSpec {
   match: (state: BodyViewState) => boolean;
 }
 
+/** 该 tab 是否处于表格视图的 CSV 后端。 */
+function isCsvTable(state: BodyViewState): boolean {
+  return (state.viewMode ?? "text") === "table" && tableKindOf(state.path) === "csv";
+}
+
+/** 该 tab 是否处于表格视图的配置表后端。 */
+function isCfgTable(state: BodyViewState): boolean {
+  return (state.viewMode ?? "text") === "table" && tableKindOf(state.path) === "cfg";
+}
+
 /**
  * 正文页面清单（优先级从高到低）：
  *
@@ -48,14 +73,16 @@ export interface AppBodyViewSpec {
  *    先给出解释与修复入口；表格视图下 bin 丢了也走这里。
  * 2. `md-view` —— Markdown 预览。排在通用错误页之前：它自带「读取失败 + 重试」面板
  *    （文件被外部改动、编解码失败都要能在原地重读，而不是被换成一行通用报错）。
- * 3. `cfg-table` —— 表格视图。它自带错误面板（解析失败 / 缺 schema 时能重选
- *    schema），同样排在通用错误页之前；「文件本体不存在」已被 1 号页面接走。
+ * 3. `csv-table` / `cfg-table` —— 表格视图的两种后端（同一视图模式、两种解析器，
+ *    见 `table-kind.ts`）。各自带错误面板（CSV 能改分隔符重解析、配置表能重选 schema），
+ *    所以都排在通用错误页之前；「文件本体不存在」已被 1 号页面接走。
  * 4. `open-error` —— 其它打开失败（权限、IO、格式…）的通用状态页。没它的话任何
  *    未预料的失败都会退化成「空白正文 + 一句错误文本」。
  * 5. `text-log` —— 文本日志视图（fallback：没被上面命中的 tab 都按日志文本显示）。
  *
- * `md-view` 与 `cfg-table` 由 viewMode 决定、互斥，优先级只影响「谁先被检查」；
- * 两者都必须高于 `open-error`，否则它们各自的错误面板永远没机会出现。
+ * `md-view` / `csv-table` / `cfg-table` 由 viewMode（+ 扩展名）决定、互斥，
+ * 优先级只影响「谁先被检查」；它们都必须高于 `open-error`，否则各自的错误面板
+ * 永远没机会出现。
  */
 export const APP_BODY_VIEWS: readonly AppBodyViewSpec[] = [
   {
@@ -72,9 +99,14 @@ export const APP_BODY_VIEWS: readonly AppBodyViewSpec[] = [
     match: (state) => (state.viewMode ?? "text") === "md",
   },
   {
+    id: "csv-table",
+    priority: 32,
+    match: isCsvTable,
+  },
+  {
     id: "cfg-table",
     priority: 30,
-    match: (state) => (state.viewMode ?? "text") === "cfg",
+    match: isCfgTable,
   },
   {
     id: "open-error",

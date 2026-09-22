@@ -20,6 +20,8 @@ import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { CfgTableTab, type ClientCfgTable } from "./CfgTableTab";
 import { copyTextToClipboard } from "./clipboard";
 import { isMarkdownPath } from "./markdown/paths.ts";
+// 搜索匹配语义（子串 / 大小写 / 全字）与表格视图共用一份实现，见 src/search/matcher.ts
+import { findSpans, type SearchMatcher } from "./search/matcher.ts";
 import {
   SettingsModal,
   FONT_SIZE_MAX,
@@ -42,12 +44,18 @@ import {
   APP_BODY_VIEWS,
   BodyViewHost,
   BodyViewRegistry,
+  CsvTableTab,
   FileMissingView,
   OpenErrorView,
   classifyOpenError,
+  isStaleDefaultMode,
+  isTablePath,
+  normalizeDelimiter,
+  tableKindOf,
   useBodyViewEffects,
   type AppBodyViewId,
   type BodyViewProps,
+  type CsvTable,
   type OpenErrorInfo,
   type ViewLang,
   type ViewMode,
@@ -140,7 +148,7 @@ interface TabInfo {
   title: string;
   path: string;
   /** 当前视图模式：默认文本（日志）；.md/.markdown 打开时自动进 Markdown 预览，
-   *  用户也可手动切换文本 / 表格 / Markdown（见 views/app-body-views.ts）。 */
+   *  .csv/.tsv 自动进表格视图；用户也可手动切换（见 views/app-body-views.ts）。 */
   viewMode?: ViewMode;
   /**
    * 打开本 tab 时要跳转到的锚点（`other.md#sec` 这类跨文档链接带入）。
@@ -164,6 +172,15 @@ interface TabInfo {
   openError?: string;
   /** 表格视图解析用的 schema 文件路径（手动指定）；null/undefined = 尚未选择。 */
   slotsPath?: string | null;
+  /**
+   * 表格视图（CSV 后端）的分隔符。
+   *
+   * undefined = 按扩展名默认（`.tsv` 制表符、其余逗号，见 `views/table-kind.ts`）。
+   * 只在用户手动改过时才存具体值 —— 与编码一样，存的是「用户的选择」而不是推断结果。
+   */
+  delimiter?: string;
+  /** 表格视图（CSV 后端）是否把首行当表头；undefined = 是（默认）。 */
+  headers?: boolean;
   /**
    * 本 tab 的文本编码**选择**（`auto` 或目录 id，见 `src/statusbar/encoding.ts`）。
    *
@@ -214,8 +231,25 @@ interface TabDragState {
 
 // ==================== 文件记忆（重启恢复上次打开的文件） ====================
 
+/**
+ * 会话存档的版本号（写进 `lv-tabs` 的 `version` 字段）。
+ *
+ * 为什么需要它：存档里的「视图模式」是**记录**，不是**用户意图** —— 每个 tab 存的是
+ * 它当时恰好处于哪个模式。一旦某个模式的默认值变了，老存档里那些「当年的默认值」
+ * 就会把 tab 钉死在旧行为上，而用户什么都没做过。有了版本号就能区分
+ * 「用户当年真选过」与「当年就是这么默认的」。
+ *
+ * 版本历史：
+ * - （无 `version` 字段）= 0.5.0 及更早：表格视图只服务 `.bin` 配置表，`.csv` 的默认
+ *   是文本视图（那时还没有 CSV 表格）。所以老存档里 CSV 的 `"text"` 不是选择。
+ * - `2` = 0.6.0 起：表格视图扩容到 CSV/TSV，`.csv` / `.tsv` 默认进表格视图。
+ */
+const ARCHIVE_VERSION = 2;
+
 /** localStorage 中保存的标签页列表。 */
 interface SavedTabs {
+  /** 存档版本（老存档没有这个字段，见 {@link ARCHIVE_VERSION}）。 */
+  version?: number;
   paths: string[];
   /** 上次激活的 tab 下标。 */
   active: number;
@@ -228,6 +262,24 @@ interface SavedTabs {
    * 只记用户手动指定的编码：`auto` 的 tab 存 null，下次打开重新探测。
    */
   encodings?: (string | null)[];
+  /** 每个 tab 的 CSV 分隔符（与 paths 下标对齐；null/缺失 = 按扩展名默认）。 */
+  delims?: (string | null)[];
+  /** 每个 tab 的「首行为表头」开关（与 paths 下标对齐；null/缺失 = 是）。 */
+  heads?: (boolean | null)[];
+}
+
+/**
+ * 视图模式的存档归一化。
+ *
+ * 老存档里表格视图写作 `"cfg"`（那时它只服务 client_cfg 配置表），现在这个入口
+ * 同时服务 CSV，取值改成 `"table"`—— 老存档必须继续认得，否则用户重启后
+ * 表格 tab 会静默退回文本视图。
+ */
+function normalizeSavedMode(m: unknown): ViewMode | null {
+  if (m === "text" || m === "md" || m === "table") {
+    return m;
+  }
+  return m === "cfg" ? "table" : null;
 }
 
 /** 读取上次会话的标签页（无数据/损坏时返回 null）。 */
@@ -250,11 +302,9 @@ function readSavedTabs(): SavedTabs | null {
           typeof s === "string" && s.length > 0 ? s : null
         )
       : undefined;
-    // 老存档没有 modes 字段：留给下方按扩展名推断（Markdown 文件仍会自动进预览）。
+    // 老存档没有 modes 字段：留给下方按扩展名推断（Markdown / CSV 文件仍会自动进各自视图）。
     const modes = Array.isArray(v.modes)
-      ? v.modes.slice(0, paths.length).map((m) =>
-          m === "text" || m === "cfg" || m === "md" ? m : null
-        )
+      ? v.modes.slice(0, paths.length).map((m) => normalizeSavedMode(m))
       : undefined;
     // 编码同理：老存档没有 encodings 字段，null 即「自动探测」。
     const encodings = Array.isArray(v.encodings)
@@ -262,21 +312,53 @@ function readSavedTabs(): SavedTabs | null {
           typeof e === "string" && e.length > 0 ? e : null
         )
       : undefined;
+    // CSV 分隔符 / 表头开关：老存档没有，null 即「按扩展名默认 / 首行是表头」。
+    const delims = Array.isArray(v.delims)
+      ? v.delims.slice(0, paths.length).map((d) =>
+          typeof d === "string" && d.length > 0 ? d : null
+        )
+      : undefined;
+    const heads = Array.isArray(v.heads)
+      ? v.heads.slice(0, paths.length).map((h) => (typeof h === "boolean" ? h : null))
+      : undefined;
     return {
+      version: typeof v.version === "number" ? v.version : undefined,
       paths,
       active: typeof v.active === "number" ? v.active : paths.length - 1,
       schemas,
       modes,
       encodings,
+      delims,
+      heads,
     };
   } catch {
     return null;
   }
 }
 
-/** 按扩展名推断默认视图模式：Markdown 文件直接进预览，其余按文本日志打开。 */
+/**
+ * 按扩展名推断默认视图模式：Markdown 文件直接进预览、CSV / TSV 直接进表格视图，
+ * 其余按文本日志打开。
+ *
+ * 为什么 CSV 默认进表格：CSV 本身就是「行列数据」，用文本视图打开看到的一屏逗号
+ * 分隔的长行几乎总是要再切一次表格 —— 默认值选用户大概率要去的地方。文本视图
+ * 一直是表格页工具栏上的一个按钮，想要「看原文」点一下就回去了。
+ */
 function defaultViewModeFor(path: string): ViewMode {
-  return isMarkdownPath(path) ? "md" : "text";
+  if (isMarkdownPath(path)) {
+    return "md";
+  }
+  return isTablePath(path) ? "table" : "text";
+}
+
+/**
+ * 该文件看表格是否必须先选 schema —— 只有配置表后端（`.bin`）需要。
+ *
+ * CSV / TSV 以及手切进表格视图的 `.txt` 都不需要；视图模式弹窗据此决定要不要显示
+ * schema 记录那一块（以及切表格时要不要拦一下）。
+ */
+function needsSchema(tab: TabInfo): boolean {
+  return tableKindOf(tab.path) === "cfg";
 }
 
 /** 读取 Markdown 文件的大小上限（字节）。
@@ -850,7 +932,7 @@ const MESSAGES: Record<Lang, Messages> = {
     viewModeTextDesc: "以日志文本方式查看：tail-follow 实时跟随、关键词/正则过滤、高亮与稀疏虚拟滚动。",
     viewModeCfgName: "表格视图",
     viewModeCfgDesc:
-      "以 client_cfg 配置表格式解析当前文件。数据为 MemoryPack 二进制序列化格式，解析依赖表结构描述文件 cfg_table_slots.json。",
+      "把当前文件按表格查看：.csv / .tsv 按分隔符解析（分隔符与「首行为表头」可在表格页工具栏上调整）；.bin 按 client_cfg 配置表（MemoryPack 二进制）解析，需要 cfg_table_slots.json 结构描述文件。",
     viewModeMdName: "Markdown 预览",
     viewModeMdDesc:
       "按文档排版渲染当前文件：支持表格、任务列表、代码高亮与 LaTeX 公式（$…$ / $$…$$），并带大纲与页内查找。图片以占位符显示（本地图片可在资源管理器中定位）。",
@@ -981,7 +1063,8 @@ const MESSAGES: Record<Lang, Messages> = {
     viewModeTextName: "Text view",
     viewModeTextDesc: "View the file as log text: tail-follow live updates, keyword/regex filtering, highlighting and sparse virtual scrolling.",
     viewModeCfgName: "Table view",
-    viewModeCfgDesc: "Parse the current file as a client_cfg config table. The data uses the MemoryPack binary serialization format; parsing requires the cfg_table_slots.json schema description.",
+    viewModeCfgDesc:
+      "View the current file as a table: .csv / .tsv are parsed by delimiter (the delimiter and the “first row is the header” toggle live in the table toolbar); .bin is parsed as a client_cfg config table (MemoryPack binary) and needs the cfg_table_slots.json schema description.",
     viewModeMdName: "Markdown preview",
     viewModeMdDesc:
       "Render the file as a document: tables, task lists, syntax-highlighted code and LaTeX math ($…$ / $$…$$), plus an outline and in-page find. Images show as placeholders (local ones can be revealed in File Explorer).",
@@ -1043,50 +1126,6 @@ function buildHighlightMatcher(keywords: string[]): HighlightMatcher | null {
     re: new RegExp(`(${escaped.join("|")})`, "gi"),
     lowerKeywords: keywords.map((k) => k.toLowerCase()),
   };
-}
-
-/** 搜索匹配器：字符串匹配（非正则），支持大小写敏感与全字匹配。 */
-interface SearchMatcher {
-  term: string;
-  caseSensitive: boolean;
-  wholeWord: boolean;
-}
-
-/**
- * 全字匹配的边界判断：命中片段两侧不能紧邻「词字符」。
- * 用 Unicode 属性（\p{L}\p{N}_）而不是 ASCII 判断，中文/日文等非 ASCII 文本
- * 才能得到正确边界（否则「错误err」也会被判成独立单词）。
- */
-const WORD_CHAR_RE = /[\p{L}\p{N}_]/u;
-
-function isWordChar(ch: string): boolean {
-  return ch.length > 0 && WORD_CHAR_RE.test(ch);
-}
-
-/**
- * 在一行文本里找出搜索词的所有命中位置（返回 [start, end) 的 UTF-16 下标）。
- * 与后端保持一致：大小写不敏感时按 ASCII 折叠比较，不做 Unicode 大小写折叠。
- */
-function findSpans(text: string, m: SearchMatcher): [number, number][] {
-  if (!m.term) {
-    return [];
-  }
-  const needle = m.caseSensitive ? m.term : m.term.toLowerCase();
-  const hay = m.caseSensitive ? text : text.toLowerCase();
-  const spans: [number, number][] = [];
-  let i = 0;
-  while (i <= hay.length - needle.length) {
-    const at = hay.indexOf(needle, i);
-    if (at < 0) {
-      break;
-    }
-    const end = at + needle.length;
-    if (!m.wholeWord || (!isWordChar(text.charAt(at - 1)) && !isWordChar(text.charAt(end)))) {
-      spans.push([at, end]);
-    }
-    i = at + 1; // 允许重叠命中（aaaa 里搜 aa）
-  }
-  return spans;
 }
 
 /**
@@ -2807,8 +2846,18 @@ function LogTab(props: LogTabProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchEpoch]);
 
-  /** Ctrl+F 打开搜索框（Ctrl+F 未被其他快捷键占用）。 */
+  /**
+   * Ctrl+F 打开搜索框（Ctrl+F 未被其他快捷键占用）。
+   *
+   * **只在自己是激活 tab 时装监听**：非激活的 tab 面板并没有卸载（只是 display:none），
+   * 不加这道判断的话，一次 Ctrl+F 会让**每一个**处于文本视图的 tab 都打开搜索框
+   * —— 用户只看得见当前那个，切回去才发现别的 tab 也被打开了。表格视图的查找
+   * （CsvTableTab）与 Markdown 的查找（MarkdownView）同样是按 active 装的。
+   */
   useEffect(() => {
+    if (!active) {
+      return;
+    }
     const onKey = (e: KeyboardEvent) => {
       if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === "f" || e.key === "F")) {
         e.preventDefault();
@@ -2817,7 +2866,7 @@ function LogTab(props: LogTabProps) {
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [openSearch]);
+  }, [active, openSearch]);
 
   /**
    * 过滤状态变化后按新范围重搜：过滤生效时范围变成「过滤后的行」，
@@ -3551,6 +3600,18 @@ interface AppBodyViewCtx {
   error: OpenErrorInfo;
   /** 表格视图数据（表格页用；null = 尚未解析成功）。 */
   cfg: ClientCfgTable | null;
+  /** CSV 表格数据（CSV 页用；null = 尚未解析成功）。 */
+  csv: CsvTable | null;
+  /** 该 tab 当前生效的分隔符（单字符）。 */
+  delimiter: string;
+  /** 该 tab 是否把首行当表头。 */
+  headers: boolean;
+  /** 换分隔符（写回 tab 并重新解析）。 */
+  setDelimiter: (tabId: string, path: string, delimiter: string) => void;
+  /** 切「首行为表头」（纯前端状态，不重读文件）。 */
+  setHeaders: (tabId: string, headers: boolean) => void;
+  /** 重新解析 CSV（解析失败重试 / 外部改过文件）。 */
+  reloadCsv: (tabId: string, path: string) => void;
   /** 表格视图重新选择 schema 文件。 */
   pickSchema: (tabId: string, path: string) => void;
   /** Markdown 全文（Markdown 页用；null = 尚未读到）。 */
@@ -3634,6 +3695,25 @@ const APP_BODY_VIEW_RENDERERS: Record<
       />
     </Suspense>
   ),
+  "csv-table": (base, ctx) => (
+    <CsvTableTab
+      tabId={base.tabId}
+      path={base.path}
+      active={base.active}
+      fontSize={base.fontSize}
+      lang={base.lang}
+      data={ctx.csv}
+      error={ctx.tab.openError}
+      delimiter={ctx.delimiter}
+      headers={ctx.headers}
+      onDelimiterChange={(d) => ctx.setDelimiter(ctx.tab.id, ctx.tab.path, d)}
+      onHeadersChange={(h) => ctx.setHeaders(ctx.tab.id, h)}
+      onReload={() => ctx.reloadCsv(ctx.tab.id, ctx.tab.path)}
+      onSwitchViewMode={base.onSwitchViewMode}
+      registerCopy={base.registerCopy}
+      reportTotal={base.reportTotal}
+    />
+  ),
   "cfg-table": (base, ctx) => (
     <CfgTableTab
       tabId={base.tabId}
@@ -3661,7 +3741,8 @@ const APP_BODY_VIEW_RENDERERS: Record<
 const APP_BODY_VIEW_TITLES: Record<AppBodyViewId, (lang: ViewLang) => string> = {
   "file-missing": (lang) => (lang === "zh" ? "文件不存在" : "File not found"),
   "md-view": (lang) => (lang === "zh" ? "Markdown 预览" : "Markdown preview"),
-  "cfg-table": (lang) => (lang === "zh" ? "配置表视图" : "Table view"),
+  "csv-table": (lang) => (lang === "zh" ? "表格视图（CSV）" : "Table view (CSV)"),
+  "cfg-table": (lang) => (lang === "zh" ? "表格视图（配置表）" : "Table view (config)"),
   "open-error": (lang) => (lang === "zh" ? "无法打开" : "Cannot open"),
   "text-log": (lang) => (lang === "zh" ? "文本视图" : "Text view"),
 };
@@ -3676,7 +3757,9 @@ const bodyViews = new BodyViewRegistry<AppBodyViewCtx>(
     priority: spec.priority,
     fallback: spec.fallback,
     title: APP_BODY_VIEW_TITLES[spec.id],
-    match: (ctx) => spec.match({ viewMode: ctx.tab.viewMode, error: ctx.error }),
+    // 页面规则只依赖「视图模式 + 错误分类 + 路径」（后者决定表格视图用哪个后端）。
+    match: (ctx) =>
+      spec.match({ viewMode: ctx.tab.viewMode, error: ctx.error, path: ctx.tab.path }),
     render: (base, ctx) => APP_BODY_VIEW_RENDERERS[spec.id](base, ctx),
   }))
 );
@@ -3830,17 +3913,22 @@ export default function App() {
       localStorage.setItem(
         "lv-tabs",
         JSON.stringify({
+          version: ARCHIVE_VERSION,
           paths: tabs.map((t) => t.path),
           active: tabs.findIndex((t) => t.id === activeTabId),
           schemas: tabs.map((t) => t.slotsPath ?? null),
-          // 视图模式一起存：否则 Markdown 预览在重启后会掉回文本视图
-          // （表格视图本来也存不住，是因为它依赖 schema 记录，见 schemas）。
+          // 视图模式一起存：否则 Markdown 预览 / CSV 表格在重启后会掉回文本视图
+          // （配置表的 schema 记录另存 schemas）。
           modes: tabs.map((t) => t.viewMode ?? null),
           // 只存手动指定的编码：`auto` 的 tab 存 null，下次打开重新探测
           //（文件可能已被别的工具改写成了另一种编码）。
           encodings: tabs.map((t) =>
             t.encoding && t.encoding !== AUTO_ID ? t.encoding : null
           ),
+          // CSV 表格的两个开关：手动改过的分隔符与「非默认」的表头开关才存
+          //（没改过的存 null，下次打开仍按扩展名 / 默认值推断）。
+          delims: tabs.map((t) => t.delimiter ?? null),
+          heads: tabs.map((t) => t.headers ?? null),
         })
       );
     } catch {
@@ -3985,6 +4073,95 @@ export default function App() {
       }
     },
     []
+  );
+
+  // ---- CSV 表格数据（文本表格 tab 的解析结果，key 为 tabId） ----
+  //
+  // 与配置表同构：解析结果按 tabId 存在 App 里，页面只拿数据、不碰后端。
+  // 解析在后端（`parse_csv_table`）：CSV 常是 Excel 导出的 GBK/GB18030 文本，
+  // 解码要复用编码层；超大文件也要在读取时就按上限截断（见 src-tauri/src/csv_table.rs）。
+  const [csvTables, setCsvTables] = useState<Record<string, CsvTable>>({});
+
+  /** 指定 tab 的 CSV 分隔符（未设置 → 按扩展名默认）。 */
+  const delimiterOf = useCallback((tabId: string, path: string): string => {
+    const tab = tabsRef.current.find((t) => t.id === tabId);
+    return normalizeDelimiter(tab?.delimiter, path);
+  }, []);
+
+  /** 指定 tab 的「首行为表头」（未设置 → 是）。 */
+  const headersOf = useCallback((tabId: string): boolean => {
+    const tab = tabsRef.current.find((t) => t.id === tabId);
+    return tab?.headers ?? true;
+  }, []);
+
+  /**
+   * 解析一个 CSV / TSV 文件：成功存表数据，失败把错误写到该 tab（驱动表格页的错误面板）。
+   *
+   * `opts` 里的两项都是给「调用方**已经知道答案**」的场景（刚换完分隔符 / 刚改完编码）：
+   * `setTabs` 是异步的，紧接着按 tab 现取会拿到旧值。其余调用方不传，按 tab 当前状态走。
+   */
+  const parseCsv = useCallback(
+    async (
+      tabId: string,
+      path: string,
+      opts: { delimiter?: string; encoding?: string } = {}
+    ): Promise<boolean> => {
+      const delimiter = opts.delimiter ?? delimiterOf(tabId, path);
+      const encoding = opts.encoding ?? encodingChoiceOf(tabId);
+      try {
+        const table = await invoke<CsvTable>("parse_csv_table", {
+          path,
+          delimiter,
+          encoding,
+        });
+        // 后端把「实际按哪种编码解出来的」一并回传：状态栏据此显示。
+        if (table.encoding) {
+          setEncodings((prev) => ({ ...prev, [tabId]: table.encoding ?? null }));
+        }
+        setCsvTables((prev) => ({ ...prev, [tabId]: table }));
+        setTabs((prev) =>
+          prev.map((t) => (t.id === tabId ? { ...t, openError: undefined } : t))
+        );
+        return true;
+      } catch (e) {
+        // 失败时清掉旧数据：文件已被删/改成读不了，继续展示上一次的表格等于说假话。
+        setCsvTables((prev) => {
+          if (!(tabId in prev)) {
+            return prev;
+          }
+          const next = { ...prev };
+          delete next[tabId];
+          return next;
+        });
+        setTabs((prev) =>
+          prev.map((t) => (t.id === tabId ? { ...t, openError: String(e) } : t))
+        );
+        return false;
+      }
+    },
+    [delimiterOf, encodingChoiceOf]
+  );
+
+  /** 换取分隔符：写回 tab（随会话存档持久化）并立即用新分隔符重新解析。 */
+  const setDelimiter = useCallback(
+    (tabId: string, path: string, delimiter: string) => {
+      setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, delimiter } : t)));
+      void parseCsv(tabId, path, { delimiter });
+    },
+    [parseCsv]
+  );
+
+  /** 切「首行为表头」：纯前端状态，不重读文件（表头只是首行的另一种解读方式）。 */
+  const setHeaders = useCallback((tabId: string, headers: boolean) => {
+    setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, headers } : t)));
+  }, []);
+
+  /** 「重新解析」按钮 / 外部改过文件后手动刷新。 */
+  const reloadCsv = useCallback(
+    (tabId: string, path: string) => {
+      void parseCsv(tabId, path);
+    },
+    [parseCsv]
   );
 
   // ---- Markdown 全文（.md tab 的读取结果，key 为 tabId） ----
@@ -4138,7 +4315,7 @@ export default function App() {
     );
   }, []);
 
-  /** 为指定 tab 选择 schema；若已处于表格视图则立即重新解析。 */
+  /** 为指定 tab 选择 schema；若该 tab 正处在配置表视图（.bin）则立即重新解析。 */
   const selectTabSchema = useCallback(
     (tabId: string, slotsPath: string) => {
       setSchemaError(false);
@@ -4146,7 +4323,9 @@ export default function App() {
         prev.map((t) => (t.id === tabId ? { ...t, slotsPath } : t))
       );
       const tab = tabsRef.current.find((t) => t.id === tabId);
-      if (tab && (tab.viewMode ?? "text") === "cfg") {
+      // 只有配置表后端需要 schema：CSV 页的 tab 即使带着一个陈旧的 slotsPath，
+      // 也不该因为「选了 schema」被重新解析一遍。
+      if (tab && (tab.viewMode ?? "text") === "table" && tableKindOf(tab.path) === "cfg") {
         void parseCfg(tabId, tab.path, slotsPath);
       }
     },
@@ -4172,6 +4351,10 @@ export default function App() {
       seen.add(key);
       const id = nextTabId();
       const savedMode = saved.modes?.[i];
+      // CSV / TSV 的「模式迁移」：老存档（0.5.0 及更早，没有 version 字段）里记的
+      // "text" 是**当年的默认值**（那时表格视图只服务 .bin），不是用户的选择；
+      // 照抄会让升级后老会话里的 CSV 一直停在文本视图。判据见 isStaleDefaultMode。
+      const mode = isStaleDefaultMode(savedMode, p, saved.version) ? undefined : savedMode;
       // 编码选择：存档里存的是**用户的选择**（手动指定才有值，`auto` 存 null）。
       // 不设 `auto`，好让 `TabInfo.encoding` 的「undefined = 自动」这一条成立。
       const savedEncoding = saved.encodings?.[i] ?? undefined;
@@ -4179,10 +4362,13 @@ export default function App() {
         id,
         title: p.split(/[\\/]/).pop() || p,
         path: p,
-        // 老存档（或该 tab 没有记录模式）按扩展名推断：Markdown 文件恢复成预览。
-        viewMode: savedMode ?? defaultViewModeFor(p),
+        // 老存档（或该 tab 没有记录模式）按扩展名推断：Markdown / CSV 恢复成各自视图。
+        viewMode: mode ?? defaultViewModeFor(p),
         slotsPath: saved.schemas?.[i] ?? null,
         encoding: savedEncoding,
+        // CSV 表格的两个开关同理：存档里没有就按默认（.tsv 制表符 / 首行是表头）。
+        delimiter: saved.delims?.[i] ?? undefined,
+        headers: saved.heads?.[i] ?? undefined,
       });
     }
     setTabs(list);
@@ -4430,9 +4616,10 @@ export default function App() {
    *   已加载窗口全部随之重建），并用 `log-lines`（`reset = true`）事件让正文整体
    *   替换。失败（文件此时已被删除等）会把错误显示在弹窗里、**不关闭弹窗**，
    *   让用户能改选另一个编码或取消。
-   * - **Markdown 视图**：那份正文是 `read_text_file` 整读来的，没有 tail 会话，
-   *   带新编码重读一遍即可。读取失败沿用既有约定：错误写到 tab 上、正文区显示
-   *   错误状态页（`loadMd` 负责），因此这里照常关弹窗。
+   * - **Markdown / CSV 表格视图**：那两份正文分别由 `read_text_file` /
+   *   `parse_csv_table` 一次解出来，没有 tail 会话，带新编码重读一遍即可。
+   *   读取失败沿用既有约定：错误写到 tab 上、正文区显示对应页面的错误面板
+   *   （`loadMd` / `parseCsv` 负责），因此这里照常关弹窗。
    */
   const applyEncoding = useCallback(
     async (choice: string) => {
@@ -4446,6 +4633,11 @@ export default function App() {
         if ((tab.viewMode ?? "text") === "md") {
           // 显式把新选择传进去：`setTabs` 之下那次写入（见后）还没反映到 `tabsRef`。
           await loadMd(tab.id, tab.path, choice);
+        } else if ((tab.viewMode ?? "text") === "table" && tableKindOf(tab.path) === "csv") {
+          // CSV 表格：与 Markdown 同构 —— 那份表格是 `parse_csv_table` 解出来的，
+          // 没有 tail 会话，带新编码重新解析一遍即可。显式把新选择传进去，
+          // 理由与上面 Markdown 分支相同（`tabsRef` 还是旧的）。
+          await parseCsv(tab.id, tab.path, { encoding: choice });
         } else {
           const info = await invoke<EncodingInfo>("set_encoding", {
             tabId: tab.id,
@@ -4473,7 +4665,7 @@ export default function App() {
         setEncodingBusy(false);
       }
     },
-    [activeTabId, appT, loadMd]
+    [activeTabId, appT, loadMd, parseCsv]
   );
 
   /**
@@ -4509,15 +4701,27 @@ export default function App() {
       if (mode === "md") {
         return loadMd(tab.id, tab.path, tab.encoding);
       }
-      return mode === "cfg" && tab.slotsPath
-        ? parseCfg(tab.id, tab.path, tab.slotsPath)
-        : openTabFile(tab.id, tab.path, tab.encoding);
+      if (mode === "table") {
+        // 表格视图按后端分流：CSV 直接解析；配置表要有 schema 才能解析，
+        // 没有 schema 时退回文本会话（用户在表格页里可以再选一个 schema）。
+        if (tableKindOf(tab.path) === "csv") {
+          return parseCsv(tab.id, tab.path, {
+            delimiter: normalizeDelimiter(tab.delimiter, tab.path),
+            encoding: tab.encoding,
+          });
+        }
+        return tab.slotsPath
+          ? parseCfg(tab.id, tab.path, tab.slotsPath)
+          : openTabFile(tab.id, tab.path, tab.encoding);
+      }
+      return openTabFile(tab.id, tab.path, tab.encoding);
     },
-    [loadMd, openTabFile, parseCfg]
+    [loadMd, openTabFile, parseCfg, parseCsv]
   );
 
-  // 打开新文件：新建一个 tab。视图模式按扩展名推断（.md/.markdown 直接进 Markdown
-  // 预览），其余按文本日志打开；表格视图涉及 schema 选择，始终由用户手动切换。
+  // 打开新文件：新建一个 tab。视图模式按扩展名推断（.md/.markdown 进 Markdown 预览，
+  // .csv/.tsv 进表格视图），其余按文本日志打开；.bin 的配置表视图涉及 schema 选择，
+  // 仍由用户手动切换。
   // 同路径（Windows 大小写不敏感）已有 tab 时直接激活，不重复打开。
   /** 打开指定路径（对话框选中后 / 自动化钩子 / 会话恢复共用）。 */
   const openPath = useCallback(
@@ -4547,11 +4751,14 @@ export default function App() {
       setActiveTabId(id);
       if (viewMode === "md") {
         await loadMd(id, selected);
+      } else if (viewMode === "table") {
+        // 只有 .csv/.tsv 会因为扩展名推断落到这里（.bin 仍是文本视图起步）。
+        await parseCsv(id, selected);
       } else {
         await openTabFile(id, selected);
       }
     },
-    [loadMd, openTabFile, reopenTab]
+    [loadMd, openTabFile, parseCsv, reopenTab]
   );
 
   /** 打开另一个文档（可选锚点）：走 App 既有的 openPath，锚点写进目标 tab 的状态。 */
@@ -4575,12 +4782,12 @@ export default function App() {
   /**
    * 切换指定 tab 的视图模式。
    *
-   * 切到表格：按该 tab 选择的 schema 解析（必须手动指定）。
-   * 切到 Markdown：读取全文；从表格切走时清掉 openError（那条错误说的是 bin 解析失败，
+   * 切到表格：按文件类型分派 —— `.bin` 走配置表（必须已选 schema），其余文本走 CSV 解析。
+   * 切到 Markdown：读取全文；从表格切走时清掉 openError（那条错误说的是表格解析失败，
    * 与 Markdown 无关，留着会让新页面一进来就显示别人的错误）。
    */
   const switchViewMode = useCallback(
-    (tabId: string, mode: ViewMode, binPath: string, slotsPath: string) => {
+    (tabId: string, mode: ViewMode, filePath: string, slotsPath: string) => {
       setTabs((prev) =>
         prev.map((t) =>
           t.id === tabId
@@ -4588,20 +4795,22 @@ export default function App() {
             : t
         )
       );
-      if (mode === "cfg") {
-        void parseCfg(tabId, binPath, slotsPath);
+      if (mode === "table" && tableKindOf(filePath) === "csv") {
+        void parseCsv(tabId, filePath);
+      } else if (mode === "table") {
+        void parseCfg(tabId, filePath, slotsPath);
       } else if (mode === "md") {
-        void loadMd(tabId, binPath);
+        void loadMd(tabId, filePath);
       } else {
         // 切回文本视图：只有「从没开过文本会话」的 tab 才需要补 open_log_file
-        // （Markdown 预览直接打开的 tab 就是这种），否则会白清一次已加载内容。
+        // （Markdown 预览 / CSV 表格直接打开的 tab 就是这种），否则会白清一次已加载内容。
         const tab = tabsRef.current.find((t) => t.id === tabId);
         if (tab && !tab.textOpened) {
-          void openTabFile(tabId, binPath);
+          void openTabFile(tabId, filePath);
         }
       }
     },
-    [loadMd, openTabFile, parseCfg]
+    [loadMd, openTabFile, parseCfg, parseCsv]
   );
 
   // 文件拖拽打开：监听 Tauri 原生拖放事件（Windows 上走 WebView2 原生 DnD，
@@ -4643,7 +4852,12 @@ export default function App() {
       const selected = await open({
         multiple: false,
         // 扩展名只是给对话框的默认过滤器；`*` 一直保留（日志没有固定后缀）。
-        filters: [{ name: appT.openDialogName, extensions: ["log", "txt", "md", "markdown", "bin", "*"] }],
+        filters: [
+          {
+            name: appT.openDialogName,
+            extensions: ["log", "txt", "md", "markdown", "csv", "tsv", "bin", "*"],
+          },
+        ],
       });
       if (typeof selected === "string") {
         await openPath(selected);
@@ -4735,6 +4949,15 @@ export default function App() {
       // 无论文本、表格还是 Markdown 视图，后端会话与页面缓存都要清理。
       void invoke("close_tab", { tabId: id });
       setCfgTables((prev) => {
+        if (!(id in prev)) {
+          return prev;
+        }
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      // CSV 表格最多 20 万行，tab 关掉后必须把这份数据丢掉（否则会一直挂在内存里）。
+      setCsvTables((prev) => {
         if (!(id in prev)) {
           return prev;
         }
@@ -4989,11 +5212,13 @@ export default function App() {
   /**
    * 文本编码是否适用于当前 tab。
    *
-   * 表格视图（`client_cfg` 二进制）不按文本解码，编码对它没有意义 —— 状态栏此时
-   * 把编码显示成不可点的灰色，而不是藏起来（否则状态栏会在视图间跳动）。
-   * 没有激活 tab 时也不适用。
+   * 表格视图的**配置表后端**（`client_cfg` 二进制）不按文本解码，编码对它没有意义
+   * —— 状态栏此时把编码显示成不可点的灰色，而不是藏起来（否则状态栏会在视图间跳动）。
+   * CSV 后端是文本，编码照旧可选。没有激活 tab 时也不适用。
    */
-  const canPickEncoding = activeTab != null && (activeTab.viewMode ?? "text") !== "cfg";
+  const canPickEncoding =
+    activeTab != null &&
+    ((activeTab.viewMode ?? "text") !== "table" || tableKindOf(activeTab.path) === "csv");
 
   /**
    * 激活 tab 换了、而状态栏还没有它的编码信息时补一次。
@@ -5438,6 +5663,12 @@ export default function App() {
                   tab: t,
                   error: classifyOpenError(t.openError),
                   cfg: cfgTables[t.id] ?? null,
+                  csv: csvTables[t.id] ?? null,
+                  delimiter: normalizeDelimiter(t.delimiter, t.path),
+                  headers: headersOf(t.id),
+                  setDelimiter,
+                  setHeaders,
+                  reloadCsv,
                   pickSchema: (tabId, path) => void pickCfgSchema(tabId, path),
                   md: mdDocs[t.id] ?? null,
                   reloadMd,
@@ -5527,7 +5758,7 @@ export default function App() {
               [
                 { id: "text", name: appT.viewModeTextName, desc: appT.viewModeTextDesc },
                 { id: "md", name: appT.viewModeMdName, desc: appT.viewModeMdDesc },
-                { id: "cfg", name: appT.viewModeCfgName, desc: appT.viewModeCfgDesc },
+                { id: "table", name: appT.viewModeCfgName, desc: appT.viewModeCfgDesc },
               ] as const
             ).map((m) => {
               const current = (activeTab.viewMode ?? "text") === m.id;
@@ -5536,8 +5767,9 @@ export default function App() {
                   key={m.id}
                   className={`viewmode-item${current ? " current" : ""}`}
                   onClick={() => {
-                    // 表格视图必须已手动指定 schema 文件；未选择时提示并留在模态框。
-                    if (m.id === "cfg" && !activeTab.slotsPath) {
+                    // 配置表后端（.bin）必须已手动指定 schema 文件；未选择时提示并留在模态框。
+                    // CSV 后端（以及 .txt/.log 这类手切进来的文件）不需要 schema，直接切。
+                    if (needsSchema(activeTab) && !activeTab.slotsPath) {
                       setSchemaError(true);
                       return;
                     }
@@ -5555,6 +5787,9 @@ export default function App() {
                 </button>
               );
             })}
+            {/* schema 记录只对配置表后端有意义：给 CSV 文件显示一排 schema 单选按钮
+                会让用户以为「看 CSV 也要先选 schema」（那是 .bin 的规则）。 */}
+            {needsSchema(activeTab) ? (
             <div className="viewmode-schema">
               <div className="viewmode-schema-title">{appT.viewModeSchemaTitle}</div>
               {schemaError ? (
@@ -5609,6 +5844,7 @@ export default function App() {
                 {appT.viewModeSchemaAdd}
               </button>
             </div>
+            ) : null}
           </div>
         </div>
       ) : null}

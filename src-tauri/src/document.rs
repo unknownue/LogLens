@@ -165,7 +165,10 @@ fn read_text_file_impl(
 /// 两个命令共用同一份文案契约（前端按文案分类，措辞只能有一处定义）。目录也能
 /// `metadata()` 成功，必须先 `is_file()` 判定，否则会以「读取失败」报错，前端就会
 /// 把「传了目录」显示成权限/IO 问题而非「文件不存在」。
-fn require_file(path: &Path) -> Result<(), String> {
+///
+/// `pub(crate)`：CSV 表格解析（`crate::csv_table`）与这里读同一批文件，
+/// 错误文案必须逐字一致，不能各写一份。
+pub(crate) fn require_file(path: &Path) -> Result<(), String> {
     if !path.is_file() {
         return Err(format!("文件不存在: {}", path.display()));
     }

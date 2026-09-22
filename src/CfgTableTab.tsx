@@ -1,12 +1,17 @@
-import { useCallback, useEffect, useMemo, useRef } from "react";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import { useCallback, useMemo } from "react";
 
 import { copyTextToClipboard } from "./clipboard";
 import { computeColumnWidths } from "./cfg-columns";
 import { fmtValue } from "./cfg-types";
 import type { ClientCfgTable, CfgColumn, CfgValue } from "./cfg-types";
 import { langOfPath } from "./cfg-types";
-import { useBodyViewEffects, ViewToggleButton, type BodyViewProps, type ViewLang } from "./views";
+import {
+  TableGrid,
+  useBodyViewEffects,
+  ViewToggleButton,
+  type BodyViewProps,
+  type ViewLang,
+} from "./views";
 
 // 这些类型/纯函数已拆到 cfg-types.ts / cfg-columns.ts，此处原样再导出，
 // 保持既有 import 路径（App.tsx 等）不变。
@@ -39,32 +44,23 @@ export interface CfgTableTabProps
   onPickSchema: () => void;
 }
 
+/**
+ * 配置表页 —— 表格视图（`viewMode = "table"`）的**二进制**后端页面。
+ *
+ * 表格视图有两种后端（.bin → 本页；其它文本文件 → `CsvTableTab`），选择规则见
+ * `views/table-kind.ts`。两者共用 `TableGrid`（网格与虚拟滚动）与 `.cfg-*` 样式，
+ * 本页多出来的只有「schema 相关」的那几个入口。
+ */
 export function CfgTableTab(props: CfgTableTabProps) {
   // tabId / active / registerCopy / reportTotal 由公共生命周期 hook 直接从 props 取，
   // 这里只解构渲染真正用到的字段。
   const { path, data, error, fontSize, uiLang, onPickSchema, onSwitchViewMode } = props;
   const zh = uiLang === "zh";
-  const scrollRef = useRef<HTMLDivElement>(null);
   const rows = data?.rows ?? [];
   const columns = data?.columns ?? [];
 
   // 行高随字体调整；表头（sticky）与行等高。
   const rowHeight = Math.max(BASE_ROW_HEIGHT, fontSize + 12);
-
-  // 虚拟滚动：表格可能很大（几十万行配置），只渲染可视区。
-  const virtualizer = useVirtualizer({
-    count: rows.length,
-    getScrollElement: () => scrollRef.current,
-    estimateSize: () => rowHeight,
-    // sticky 表头占一行高度：scrollMargin 让虚拟项的 start 从表头之下开始。
-    scrollMargin: rowHeight,
-    overscan: 8,
-  });
-
-  // 行高变化（字体调整）后重新测量。
-  useEffect(() => {
-    virtualizer.measure();
-  }, [rowHeight, virtualizer]);
 
   // 复制当前表格为 TSV（首行 key + 全部数据行）；行数一起供右上角显示。
   const copyAsTsv = useCallback(async (): Promise<string> => {
@@ -99,17 +95,12 @@ export function CfgTableTab(props: CfgTableTabProps) {
     [columns, rows, data?.keys, fontSize]
   );
 
-  const gridTemplate = useMemo(() => {
-    const cols = [`${keyWidth}px`, ...colWidths.map((w) => `${w}px`)];
-    return cols.join(" ");
-  }, [keyWidth, colWidths]);
-
-  // 整表预计宽度：给 sticky 表头一个显式宽度，
-  // 保证它不会比表体窄（否则横向滚动到右侧时最后几列表头会缺失）。
-  const tableWidth = useMemo(
-    () => keyWidth + colWidths.reduce((a, b) => a + b, 0),
-    [keyWidth, colWidths]
+  // 网格的列定义与宽度（行首 key 列 + 各字段列）。
+  const gridColumns = useMemo(
+    () => columns.map((c) => ({ name: c.name, sub: c.field_type })),
+    [columns]
   );
+  const widths = useMemo(() => [keyWidth, ...colWidths], [keyWidth, colWidths]);
 
   if (error) {
     return (
@@ -161,61 +152,17 @@ export function CfgTableTab(props: CfgTableTabProps) {
           </button>
         </span>
       </div>
-      <div className="cfg-scroll" ref={scrollRef} style={{ "--log-font-size": `${fontSize}px` } as React.CSSProperties}>
-        <div className="cfg-inner" style={{ height: virtualizer.getTotalSize(), width: "max-content", minWidth: "100%" }}>
-          {/* 表头（粘在滚动容器顶部；高度与行高一致，scrollMargin 已为其预留偏移） */}
-          <div
-            className="cfg-head"
-            data-testid="cfg-head"
-            data-col-widths={colWidths.join(",")}
-            style={{
-              display: "grid",
-              gridTemplateColumns: gridTemplate,
-              position: "sticky",
-              top: 0,
-              height: rowHeight,
-              width: "max-content",
-              minWidth: tableWidth,
-            }}
-          >
-            <div className="cfg-cell cfg-head-cell">key</div>
-            {columns.map((c) => (
-              <div className="cfg-cell cfg-head-cell" key={c.name} title={`${c.name}: ${c.field_type}`}>
-                {c.name}
-                <span className="cfg-ftype">{c.field_type}</span>
-              </div>
-            ))}
-          </div>
-          {/* 表体（虚拟行） */}
-          {virtualizer.getVirtualItems().map((vi) => {
-            const row = rows[vi.index];
-            return (
-              <div
-                className="cfg-row"
-                key={vi.key}
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: gridTemplate,
-                  position: "absolute",
-                  top: 0,
-                  left: 0,
-                  width: "max-content",
-                  minWidth: "100%",
-                  height: rowHeight,
-                  transform: `translateY(${vi.start}px)`,
-                }}
-              >
-                <div className="cfg-cell cfg-key">{String(data.keys[vi.index] ?? "")}</div>
-                {columns.map((c, ci) => (
-                  <div className="cfg-cell" key={c.name} title={fmtValue(row?.[ci])}>
-                    {fmtValue(row?.[ci])}
-                  </div>
-                ))}
-              </div>
-            );
-          })}
-        </div>
-      </div>
+      <TableGrid
+        columns={gridColumns}
+        rows={rows}
+        cellText={(row, _ri, ci) => fmtValue(row?.[ci])}
+        leadingHeader="key"
+        leadingText={(_row, ri) => String(data.keys[ri] ?? "")}
+        widths={widths}
+        rowHeight={rowHeight}
+        fontSize={fontSize}
+        headTestId="cfg-head"
+      />
     </div>
   );
 }

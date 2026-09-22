@@ -15,9 +15,9 @@ Designed for large log files: follow them in real time and browse anywhere witho
 - **Session restore** — reopens the previous tabs, and reuses the last window size.
 - **Extras** — multi-tab, jump-to-line, keyword highlighting, copy-view, recent files, bilingual UI (中文 / English), custom borderless title bar.
 - **Config-table viewer** — switch a tab to a GM10 `client_cfg` (MemoryPack) table view via the icon button at the left of its toolbar; columns size themselves to their content. Format spec: [docs/client_cfg_bin_format.md](docs/client_cfg_bin_format.md).
+- **CSV / TSV table preview** — `.csv` / `.tsv` files open **straight into the table view**: RFC 4180 parsing (quoted fields, embedded commas/newlines, CRLF), header row on by default, and a delimiter switch (comma / tab / semicolon / pipe) right in the toolbar. Parsing happens in the Rust backend through the same encoding layer as the text view, so GBK / UTF-16 exports from Excel are decoded correctly, and oversized files stop at a preview limit (200k rows / 32 MiB) with a banner instead of freezing the window. `Ctrl+F` finds in the table (match count, `Enter` / `Shift+Enter` to step, jump-to-row *and* jump-to-column, match-case and whole-word), using the same hit colours as the text view. Switching to text view is one click away. Details & limits: [docs/csv-view.md](docs/csv-view.md).
 - **Markdown preview** — `.md` / `.markdown` files open straight into a rendered document view (GFM tables, task lists, footnotes, syntax-highlighted code, LaTeX math via KaTeX). A collapsible outline sits on the left, the body width is adjustable in 1% steps, `Ctrl+F` finds in the rendered page and `Ctrl+E` flips between preview and source. Local images load through the dynamically scoped asset protocol and fall back to a path chip when they cannot be loaded; remote ones stay chips on purpose. Details & limits: [docs/markdown-view.md](docs/markdown-view.md).
-- **Body pages** — the content area is a small page framework (text / table / markdown / file-missing / open-error). A tab whose file was deleted or moved (recent files, session restore) shows a one-line “File not found: <path>” notice instead of a blank body; reopening the same path re-checks it. Guide: [docs/body-views.md](docs/body-views.md).
-- **Settings & font customization** — the gear at the right of the toolbar (or “Settings…” in the app menu) opens a modal settings page: theme, UI language, body font size, and **separate non-CJK / CJK fonts**. The dropdown lists the machine's **real font set** (enumerated from DirectWrite in the Rust backend — ~270 families on a typical Windows box, searchable by English or localized name), grouped into monospace / CJK-covering / other using facts the fonts themselves declare. The two families are stacked per character (`Consolas` for Latin, your Chinese face for Han), so mixed text uses each family for its own glyphs, and the choice applies to every view at once — log rows, the table view, Markdown preview and its source — plus the UI itself. The modal previews the three views live, and a proportional face warns that column alignment becomes an estimate. Guide: [docs/settings.md](docs/settings.md).
+- **Body pages** — the content area is a small page framework (text / table / markdown / file-missing / open-error). A tab whose file was deleted or moved (recent files, session restore) shows a one-line “File not found: <path>” notice instead of a blank body; reopening the same path re-checks it. Guide: [docs/body-views.md](docs/body-views.md).- **Settings & font customization** — the gear at the right of the toolbar (or “Settings…” in the app menu) opens a modal settings page: theme, UI language, body font size, and **separate non-CJK / CJK fonts**. The dropdown lists the machine's **real font set** (enumerated from DirectWrite in the Rust backend — ~270 families on a typical Windows box, searchable by English or localized name), grouped into monospace / CJK-covering / other using facts the fonts themselves declare. The two families are stacked per character (`Consolas` for Latin, your Chinese face for Han), so mixed text uses each family for its own glyphs, and the choice applies to every view at once — log rows, the table view, Markdown preview and its source — plus the UI itself. The modal previews the three views live, and a proportional face warns that column alignment becomes an estimate. Guide: [docs/settings.md](docs/settings.md).
 
 ## Screenshot
 
@@ -38,12 +38,14 @@ make loglens-package    # build the NSIS installer
 make loglens-dev        # dev mode (Vite dev server on 5173)
 cd src-tauri && cargo test --lib   # backend tests (incl. DirectWrite system-font enumeration)
 node --test tools/verify-body-views.test.mjs   # body-page rules (no browser needed)
+node --test tools/verify-csv.test.mjs          # CSV table rules (kind/delimiter/header/TSV/width)
 node --test tools/verify-markdown.test.mjs     # markdown pipeline rules (no browser needed)
 node --test tools/verify-settings.test.mjs     # settings / font-stack rules + CSS consistency
 node --test tools/verify-md-sample.test.mjs    # markdown sample doc (repro/md-sample.md)
 node --test tools/verify-feature-test.test.mjs # feature-test docs (repro/md-feature-test*.md)
 node --test tools/verify-encoding.test.mjs     # encoding rules + front/back contract + decode guard
 node tools/e2e-file-missing.mjs --launch       # browser E2E (run `pnpm run dev` first)
+node tools/e2e-csv.mjs --launch                # CSV table-view E2E (default mode/delimiter/header/TSV)
 node tools/e2e-markdown.mjs --launch           # markdown-view E2E (sanitizing/math/find/links)
 node tools/e2e-settings.mjs --launch           # settings E2E (fonts applied to log/table/markdown)
 node tools/e2e-encoding.mjs --launch           # status bar + encoding picker E2E (line count / BOM label / preview)
@@ -60,6 +62,10 @@ notations, code, images, links, footnotes, injections…) plus a 37-item checkli
 footnote edge cases, big-delimiter math, `Ctrl+E`, `¶` copy-anchor, reading-position memory and
 auto-refresh (it carries an editable version stamp), ending with a 24-item checklist.
 
+Manual samples for the table view: [`repro/sample.csv`](repro/sample.csv) (quoted fields, embedded
+commas/newlines, `""` escapes, empty cells, mixed CJK/Latin) and [`repro/sample.tsv`](repro/sample.tsv)
+(the `.tsv` default delimiter) — see [docs/csv-view.md](docs/csv-view.md).
+
 Installer output: `src-tauri/target/release/bundle/nsis/LogLens_<version>_x64-setup.exe`.
 
 ## Architecture
@@ -74,9 +80,11 @@ Installer output: `src-tauri/target/release/bundle/nsis/LogLens_<version>_x64-se
 | State & events | `src-tauri/src/state.rs` |
 | Window size memory | `src-tauri/src/window_state.rs` |
 | Whole-file read (markdown preview) | `src-tauri/src/document.rs` |
+| CSV / TSV table parsing (streaming decode + RFC 4180 state machine) | `src-tauri/src/csv_table.rs` — see [docs/csv-view.md](docs/csv-view.md) |
 | System font enumeration (DirectWrite) | `src-tauri/src/fonts.rs` |
 | Markdown pipeline (GFM + footnotes + math + highlight + sanitize) | `src/markdown/` — see [docs/markdown-view.md](docs/markdown-view.md) |
-| Body pages (text / table / markdown / file-missing / open-error) | `src/views/` — see [docs/body-views.md](docs/body-views.md) |
+| Body pages (text / table (cfg+csv) / markdown / file-missing / open-error) | `src/views/` — see [docs/body-views.md](docs/body-views.md), [docs/csv-view.md](docs/csv-view.md) |
+| Shared table grid (sticky head + virtual rows + column widths) | `src/views/TableGrid.tsx` |
 | Settings & fonts (modal page, non-CJK/CJK font stack, CSS variables) | `src/settings/` — see [docs/settings.md](docs/settings.md) |
 | Status bar & encoding picker (line count + encoding modal with preview) | `src/statusbar/` — see [docs/encoding.md](docs/encoding.md) |
 | Rendering | `src/App.tsx` |

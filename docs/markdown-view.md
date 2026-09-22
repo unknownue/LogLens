@@ -12,7 +12,8 @@ LaTeX 公式（KaTeX），外加右侧大纲与页内查找。本文记录它的
 |-------|---------|---------|
 | 100 | `file-missing` | 文件不存在（含被删的 .md） |
 | **40** | **`md-view`** | `viewMode === "md"` |
-| 30 | `cfg-table` | `viewMode === "cfg"` |
+| 32 | `csv-table` | `viewMode === "table"` 且扩展名不是 `.bin` |
+| 30 | `cfg-table` | `viewMode === "table"` 且扩展名是 `.bin` |
 | 20 | `open-error` | 权限 / IO 等通用失败（**文本视图下**才落到这里） |
 | 0 | `text-log` | 兜底 |
 
@@ -22,9 +23,12 @@ LaTeX 公式（KaTeX），外加右侧大纲与页内查找。本文记录它的
   （被外部删掉、编码问题、权限）时留在原地重读，比被换成一行通用报错有用。
 - `file-missing` 仍在最前面：Markdown 页没有内容可渲染时，就只是「文件不存在」这一件事。
 
-视图模式三态（`text` / `md` / `cfg`）由 `TabInfo.viewMode` 表达，会话存档
+视图模式三态（`text` / `md` / `table`）由 `TabInfo.viewMode` 表达，会话存档
 （`lv-tabs` 的 `modes` 字段）会一起保存；**老存档没有 `modes`，按扩展名推断** ——
 所以升级后第一次启动，之前打开过的 .md 文件也会自动进预览。
+`table` 这个取值对应界面上的「表格视图」，它底下有两种解析后端（`.bin` 配置表 /
+CSV 文本），见 [csv-view.md](csv-view.md)；更早的存档把它写作 `"cfg"`，
+读入时会迁移成 `"table"`。
 
 ## 二、文件与职责
 

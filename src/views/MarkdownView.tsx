@@ -795,9 +795,21 @@ export function MarkdownView(props: MarkdownViewProps) {
   const openFind = useCallback(() => {
     setMode("preview");
     setFind((prev) => ({ ...prev, open: true }));
-    findInputRef.current?.focus();
-    findInputRef.current?.select();
   }, []);
+
+  /**
+   * 查找框打开后聚焦并全选。
+   *
+   * 放在 effect 里而不是 `openFind` 里顺手调 `focus()`：`setFind` 之后 DOM 还没重新
+   * 渲染，那一刻 ref 还是 null（第一次打开时输入框根本不存在），focus 会静默失效
+   * —— 表现为「按了 Ctrl+F，框出来了但光标不在里面」。
+   */
+  useEffect(() => {
+    if (find.open && mode === "preview") {
+      findInputRef.current?.focus();
+      findInputRef.current?.select();
+    }
+  }, [find.open, mode]);
 
   /**
    * 预览 ⇄ 源码（Ctrl+E）。

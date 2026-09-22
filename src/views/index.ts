@@ -1,8 +1,9 @@
 /**
  * 正文多页面框架的公共入口。
  *
- * 页面组件（FileMissingView / OpenErrorView）与框架（注册表 / 宿主 / 单行状态页外壳）
- * 都从这里导出，App 只 import 本模块，不关心文件怎么拆的。
+ * 页面组件（FileMissingView / OpenErrorView / CsvTableTab / TableGrid）与框架
+ * （注册表 / 宿主 / 单行状态页外壳）都从这里导出，App 只 import 本模块，
+ * 不关心文件怎么拆的。
  */
 
 export { BodyViewRegistry, classifyOpenError } from "./body-view";
@@ -17,6 +18,8 @@ export type {
 export { BodyViewHost } from "./BodyViewHost";
 export { useBodyViewEffects } from "./use-body-view";
 export { ViewToggleButton } from "./ViewToggleButton";
+export { TableGrid } from "./TableGrid";
+export type { TableGridColumn, TableGridProps } from "./TableGrid";
 
 export { APP_BODY_VIEWS, resolveAppBodyViewId } from "./app-body-views";
 export type {
@@ -25,6 +28,19 @@ export type {
   BodyViewState,
   ViewMode,
 } from "./app-body-views";
+
+export {
+  defaultDelimiterFor,
+  isStaleDefaultMode,
+  isTablePath,
+  normalizeDelimiter,
+  tableKindOf,
+} from "./table-kind";
+export type { DelimiterOption, TableKind } from "./table-kind";
+
+export { CsvTableTab } from "./CsvTableTab";
+export type { CsvTableTabProps } from "./CsvTableTab";
+export type { CsvTable } from "./csv-model";
 
 export { NoticeLine } from "./NoticeLine";
 export type { NoticeLineProps } from "./NoticeLine";
@@ -37,3 +53,6 @@ export type { OpenErrorViewProps } from "./OpenErrorView";
 // marked + KaTeX + highlight.js（约 600 KB JS 与全部 KaTeX 字体）拖进主 chunk，
 // 让每次启动都要解析它们。它由 App 用 `React.lazy(() => import("./views/MarkdownView"))`
 // 按需加载（本文件头部注释里的「App 只 import 本模块」规则对它是例外）。
+//
+// `CsvTableTab` 与 `TableGrid` 是本模块的常规成员：它们只依赖 react + clipboard +
+// 纯函数模块，体量在几 KB 级，没有必要为它们多付一次 chunk 加载的往返。

@@ -1,35 +1,17 @@
 // verify-search-frontend.mjs — Cross-check the frontend search matcher against the
 // backend's semantics on the real sample log, without needing a browser.
 //
-// Mirrors findSpans() from src/App.tsx (substring + whole-word, ASCII case folding,
-// overlapping matches) and reports counts that must agree with `cargo test --lib`
-// expectations for repro/sample_log.txt (159 lines, 16 ERROR, 6 standalone "pool",
-// 7 substring "pool", 2 "shutdown").
+// 直接 import 真实现（`src/search/matcher.ts`）而不是抄一份：这套语义现在被
+// 文本视图的高亮、表格视图的页内查找（`src/views/csv-search.ts`）共用，
+// 抄出来的副本一旦与真实现漂移，这个脚本就从「验证」退化成「自我安慰」。
+// 断言里的期望计数量必须与 `cargo test --lib` 对 repro/sample_log.txt 的口径一致
+// （159 行、16 ERROR、6 个独立 "pool"、7 个子串 "pool"、2 个 "shutdown"）。
 //
 // Run: node tools/verify-search-frontend.mjs
 
 import { readFileSync } from "node:fs";
 
-const WORD_CHAR_RE = /[\p{L}\p{N}_]/u;
-const isWordChar = (ch) => ch.length > 0 && WORD_CHAR_RE.test(ch);
-
-function findSpans(text, m) {
-  if (!m.term) return [];
-  const needle = m.caseSensitive ? m.term : m.term.toLowerCase();
-  const hay = m.caseSensitive ? text : text.toLowerCase();
-  const spans = [];
-  let i = 0;
-  while (i <= hay.length - needle.length) {
-    const at = hay.indexOf(needle, i);
-    if (at < 0) break;
-    const end = at + needle.length;
-    if (!m.wholeWord || (!isWordChar(text.charAt(at - 1)) && !isWordChar(text.charAt(end)))) {
-      spans.push([at, end]);
-    }
-    i = at + 1;
-  }
-  return spans;
-}
+import { findSpans } from "../src/search/matcher.ts";
 
 const raw = readFileSync(new URL("../repro/sample_log.txt", import.meta.url), "utf8");
 const lines = raw.split("\n");
